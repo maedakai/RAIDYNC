@@ -1,0 +1,45 @@
+# ---- Go ----
+# ビルド/テスト成果物
+*.exe
+*.test
+*.test.exe
+*.out
+*.prof
+coverage.out
+vendor/
+# ローカルに置いた Go インストーラ tarball（リポジトリに含めない）
+server/go*.tar.gz
+server/go*.tar.gz.*
+
+# ---- Terraform ----
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+*.tfvars.local
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# ---- 環境変数 / シークレット ----
+.env
+.env/
+.env.*
+!.env.example
+
+# ---- Claude（ローカル個人設定のみ除外、共有 settings.json は追跡） ----
+.claude/settings.local.json
+
+# ---- LocalStack ----
+docker/localstack/volume/
+.localstack/
+
+# ---- OS / エディタ ----
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.idea/
+.vscode/

@@ -1,0 +1,19 @@
+# air が生成するビルド成果物
+tmp/
+
+# ローカルでビルドしたバイナリ
+mock-auth
+*.exe
+
+# Node.js 時代の残骸（念のため）
+node_modules/
+package*.json
+
+# OS / エディタの生成物
+.DS_Store
+Thumbs.db
+*.log
+
+# Git メタデータ
+.git/
+.gitignore

@@ -1,0 +1,117 @@
+package matchmaking
+
+import (
+	"context"
+
+	"github.com/raidync/server/internal/db"
+	"github.com/raidync/server/pkg/protocol"
+)
+
+// fakeStore はテスト用のインメモリ Store 実装。
+// DynamoDB の楽観ロック挙動（version + status 条件）を再現し、Lock の競合や TIMEOUT 競合を検証可能にする。
+type fakeStore struct {
+	tickets    map[string]*protocol.Ticket
+	sessions   map[string]*protocol.Session
+	claimErr   error // 設定時は ClaimTickets が常にこのエラーを返す（競合シミュレーション）
+	timeoutErr error
+}
+
+func newFakeStore() *fakeStore {
+	return &fakeStore{
+		tickets:  map[string]*protocol.Ticket{},
+		sessions: map[string]*protocol.Session{},
+	}
+}
+
+// put はテストアレンジ用にチケットを直接投入する。
+func (f *fakeStore) put(t *protocol.Ticket) {
+	f.tickets[t.TicketID] = t
+}
+
+func (f *fakeStore) GetTicket(_ context.Context, ticketID string) (*protocol.Ticket, error) {
+	t, ok := f.tickets[ticketID]
+	if !ok {
+		return nil, nil
+	}
+	cp := *t // 防御的コピー
+	return &cp, nil
+}
+
+func (f *fakeStore) QueryWaitingByQuest(_ context.Context, questID string, _ int32) ([]protocol.Ticket, error) {
+	var out []protocol.Ticket
+	for _, t := range f.tickets {
+		if t.QuestID == questID && t.Status == protocol.StatusWaiting {
+			out = append(out, *t)
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeStore) ClaimTickets(_ context.Context, tickets []protocol.Ticket) error {
+	if f.claimErr != nil {
+		return f.claimErr
+	}
+	// 条件チェック（全件 WAITING かつ version 一致）
+	for _, t := range tickets {
+		cur, ok := f.tickets[t.TicketID]
+		if !ok || cur.Status != protocol.StatusWaiting || cur.Version != t.Version {
+			return db.ErrConflict
+		}
+	}
+	// 適用
+	for _, t := range tickets {
+		cur := f.tickets[t.TicketID]
+		cur.Status = protocol.StatusMatching
+		cur.Version = t.Version + 1
+	}
+	return nil
+}
+
+func (f *fakeStore) MarkMatched(_ context.Context, ticketID, sessionID string, conn protocol.ConnectionInfo) error {
+	cur, ok := f.tickets[ticketID]
+	if !ok {
+		return db.ErrConflict
+	}
+	cur.Status = protocol.StatusMatched
+	cur.SessionID = sessionID
+	connCopy := conn
+	cur.ConnectionInfo = &connCopy
+	return nil
+}
+
+func (f *fakeStore) PutSession(_ context.Context, s protocol.Session) error {
+	sc := s
+	f.sessions[s.SessionID] = &sc
+	return nil
+}
+
+func (f *fakeStore) TimeoutTicket(_ context.Context, ticketID string) error {
+	if f.timeoutErr != nil {
+		return f.timeoutErr
+	}
+	cur, ok := f.tickets[ticketID]
+	if !ok || cur.Status != protocol.StatusWaiting {
+		return db.ErrConflict
+	}
+	cur.Status = protocol.StatusTimeout
+	return nil
+}
+
+// fakeSessionProvider は固定の sessionId / 接続情報を返す。
+type fakeSessionProvider struct {
+	sessionID string
+	conn      protocol.ConnectionInfo
+	calls     int
+}
+
+func (f *fakeSessionProvider) CreateGameSession(_ context.Context, _ string, _ []string) (string, protocol.ConnectionInfo, error) {
+	f.calls++
+	return f.sessionID, f.conn, nil
+}
+
+func newFakeSessionProvider() *fakeSessionProvider {
+	return &fakeSessionProvider{
+		sessionID: "sess-test",
+		conn:      protocol.ConnectionInfo{IPAddress: "10.0.0.1", Port: 7777, PlayerSessionID: "ps-test"},
+	}
+}
