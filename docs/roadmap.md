@@ -10,7 +10,7 @@
 
 | # | 作業内容 | 期間 | 完了基準 |
 |---|---------|------|---------|
-| 0-1 | Docker Compose構成作成（LocalStack・GameLift Local・Mock Auth） | 3日 | `docker compose up`で全サービス起動確認 |
+| 0-1 | Docker Compose構成作成（LocalStack・Mock Auth） | 3日 | `docker compose up`で全サービス起動確認 |
 | 0-2 | LocalStack初期化スクリプト作成（DynamoDBテーブル・Lambda登録） | 2日 | スクリプト一発でテーブル作成確認 |
 | 0-3 | `.env.example`・`.gitignore`整備 | 1日 | ローカル／dev環境変数の切り替え確認 |
 | 0-4 | GitHubリポジトリ作成・ブランチ戦略策定 | 1日 | main／develop／feature運用開始 |
@@ -52,11 +52,11 @@
 
 ## Phase 3：GameLift構築 + クライアント接続確立
 
-> **方針：** ローカル（GameLift Local）で接続を確立してからAWSに移行する
+> **方針：** UDPゲームサーバーをローカル単体テストで完成させ、接続検証はGameLift Anywhere（実AWS・無料枠内）で行ってからmanagedフリートへ移行する（旧GameLift LocalはSDK 5.xで廃止）
 
 | # | 作業内容 | 期間 | 完了基準 |
 |---|---------|------|---------|
-| 3-1 | GameLift Localを使ったGoサーバー接続確認（ローカル） | 3日 | GoクライアントがローカルGameLiftに接続できる |
+| 3-1 | GameLift Anywhereを使ったGoサーバー接続確認 | 3日 | 自PCをAnywhere computeに登録し、実GameLiftのOnStartGameSessionが走る |
 | 3-2 | Goゲームサーバー基本実装（位置同期・状態同期） | 4日 | 4プレイヤーの位置がリアルタイムで同期される |
 | 3-3 | GameLift（AWS dev）構築・IaC化 | 3日 | `terraform apply`でフリート構築確認 |
 | 3-4 | GoクライアントからAWS GameLift接続確認 | 2日 | AWS上のサーバーにクライアントが接続できる |

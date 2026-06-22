@@ -14,7 +14,7 @@ type SessionProvider interface {
 	CreateGameSession(ctx context.Context, questID string, playerIDs []string) (sessionID string, conn protocol.ConnectionInfo, err error)
 }
 
-// GameLiftStub は Phase 2 用のスタブ。GameLift Local / ダミー接続先を返す。
+// GameLiftStub は Phase 2 用のスタブ。固定のダミー接続先を返す（Phase 4 で実 GameLift CreateGameSession に差し替え）。
 type GameLiftStub struct {
 	Host string
 	Port int
