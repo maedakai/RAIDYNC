@@ -14,6 +14,8 @@
 7. [意図的な割り切り](#7-意図的な割り切り)
 8. [テストの実機確認](#8-テストの実機確認)
 9. [Git / SSH 環境構築](#9-git--ssh-環境構築)
+10. [Phase 3：ゲームサーバー / トランスポート](#10-phase-3ゲームサーバー--トランスポート)
+11. [Phase 4：ローカル E2E ハーネス](#11-phase-4ローカル-e2e-ハーネス)
 
 ---
 
@@ -498,3 +500,80 @@ A. 「リアルタイムのゲーム処理（データプレーン）」を指�
 - マッチメイキング（Lambda）とゲームサーバーは現状繋がっていない。Lambda は `gamelift_stub` がダミー接続先を返すだけ、サーバーは env roster で固定起動。「マッチ成立→そのメンバーで実セッション起動」の継ぎ目は GameProperties 経由＝GameLift モードでしか流れない。これを実物で繋ぐのがプランB（Anywhere）と Phase 4。
 
 - まとめ: ゲームの**リアルタイム処理ロジックの作り込みはローカルで完結**。足りないのは「誰が・いつ・どのメンバーでセッションを立て、どう畳むか」のホスティング制御とマッチメイキング接続で、これが GameLift（Anywhere/managed）の領域。
+
+---
+
+## 11. Phase 4：ローカル E2E ハーネス
+
+### Q. Phase 4 で結局なにをする?
+A. これまでローカルで個別に作った部品（認証・マッチメイキング・ゲームサーバー）を **1 本のフローに繋いで E2E で完走を確認する**フェーズ。通すフローは:
+```
+ログイン → マッチリクエスト → マッチ成立 → ゲーム開始 → 結果保存 → 履歴取得
+（mock-auth）  （match API）              （gameserver）           （MatchHistory）
+```
+ロードマップ項目 4-1（マッチ API を動かす）/ 4-2（client と結合）/ 4-3（結果保存・履歴取得）/ 4-4（手動 E2E 完走）。**部品は揃っているので「繋ぎ方」と「結果保存」だけ新規に決めて作る**のが本質。
+
+### Q. ロードマップは「AWS dev で E2E」だが、ローカルで閉じてよい?
+A. 今回は **ローカルファースト方針を優先し、AWS を使わずローカル E2E に閉じる**判断。`mock-auth` + LocalStack（DynamoDB）+ ローカル gameserver で全フローを検証する。理由は (1) これまで Phase 0〜3 を一貫してローカルファーストで進めてきた整合性、(2) AWS コスト・手間の最小化、(3) ロジックはローカルで完成済みで、AWS 反映（Terraform 化）は別トラックとして切り出せるため。実 AWS への反映と GameLift Anywhere 接続検証は後続（Terraform 整備とまとめて）に回す。
+
+### Q. 着手前に見つかった「2 つのギャップ」とは?
+A.
+- **ギャップ① Lambda ロジックにローカル HTTP で到達する手段が無い**: `localstack-init.sh` は DynamoDB テーブルを作るだけで、Lambda も API Gateway も LocalStack に未デプロイ。さらにハンドラは全て `package main`（デプロイ前提）のため、**そのままでは client から HTTP で叩けない**。→ 解決策はトランスポート方式の選定（下記）。
+- **ギャップ② ゲーム結果を DynamoDB に保存する本番パスが無い**: `db.PutMatchResult` は実装済みだが**それを呼ぶコードがどこにも無い**。gameserver は DynamoDB 非依存で、`SESSION_END` 時に履歴を書く経路が存在しない。→ Phase 4 で「結果レポート経路」を新規実装する必要がある（誰が SESSION_END 時に MatchHistory を書くか＝設計判断が残る）。
+
+### Q. ローカル E2E で Lambda ロジックをどう駆動する? 3 案の違いと採用案は?
+A. **採用＝案 A（ローカル API バイナリ + CLI client）**。3 案はいずれも「各 Lambda の `handle` を `package main` から `internal/handlers/*` へ抽出してトランスポート非依存にする」のが共通前提。違いは抽出したハンドラを**何経由で叩くか**。
+
+| 観点 | A: localapi+CLI | B: go test E2E | C: LocalStack 実デプロイ |
+|------|----------------|----------------|-------------------------|
+| 構成 | `cmd/localapi`(net/http) + `cmd/client`(CLI) | `test/e2e`(build tag) で handler を直接呼ぶ | init を拡張し zip+API GW を LocalStack 登録 |
+| 本番構成への忠実さ | 高 | 中 | 最高 |
+| 動くデモが残る | ◎ | ✕ | ◎ |
+| CI 回帰テスト | △ | ◎ | △ |
+| 実装量 | 大 | 小 | 特大 |
+| 過剰設計リスク | 中 | 低 | 高 |
+
+- **A を選んだ理由**: 転職用ポートフォリオとして「`docker compose up` 後に**実際に動く全フロー CLI デモ**が残る」こと、**本番の API Gateway + Lambda 構成に最も忠実**（ハンドラが実際に `APIGatewayProxyRequest/Response` をやり取りする）であること。`localapi` は API Gateway proxy 統合を再現する薄い層、`client` は将来の Unity クライアント参照実装にもなる。
+- **B/C の位置づけ**: B は最軽量・CI 友好だが「動く画面デモ」が残らない。C は最も忠実だが配線が重く、本来 Terraform でやるべき API Gateway 配線を bash で二重化する懸念（過去 feedback「ローカル専用ツールを過剰設計しない」に最も抵触）。
+
+### 実装メモ（Phase 4 ステップ1：ハンドラの importable 抽出 完了）
+- `internal/handlers/` を新設し、4 つの proxy ハンドラ本体を移設（`match_request` / `match_status` / `match_cancel` / `match_history`）。各々 `New*(deps)` コンストラクタ + `Handle(ctx, req)`（API Gateway proxy signature）を公開。
+- 本番 `cmd/lambda/{match_request,match_status,match_cancel,match_history}/main.go` は、依存を組んで `lambda.Start(h.Handle)` するだけの薄い殻に変更（**挙動は不変**）。これで本番 Lambda と後続の `cmd/localapi` が**同一のハンドラ実装を共有**する。
+- `authorizer` は別統合型（TOKEN 型カスタムオーソライザ）のため未変更。`localapi` 側では `internal/auth` の Verifier を**認証ミドルウェアとして直接利用**する方針（authorizer Lambda 本体は再利用しない）。
+- 検証: `go build ./...` / `go vet ./...` 通過、ロジック系ユニットテスト（matchmaking / game）回帰なし。
+- **残**: ステップ2（`cmd/localapi`）／ギャップ②の結果保存パス設計／ステップ3（`cmd/client`）／E2E 完走確認。
+
+### Q. `cmd/client` が使う `id_token` は JWT とは別もの?
+別ものではない。**`id_token` は JWT そのもの**。「JWT」はトークンの**フォーマット**名（`ヘッダー.ペイロード.署名` を Base64URL で繋いだ文字列、署名で改ざん検知できる）、「ID トークン」はその形式で作った**用途**名（OIDC 用語で「誰がログインしたか」を表す）。レイヤーが違うだけ。
+- mock-auth の `issueTokens` は 2 種類の JWT を発行する：
+  - **id_token**（`token_use:"id"`）… sub / email / aud を含む。「誰か」を表す。
+  - **access_token**（`token_use:"access"`）… sub / scope / client_id を含む。「何ができるか」を表す。
+  - どちらも RS256 署名の JWT で、違いは**中のクレームだけ**。
+- OIDC のセオリーでは API 認可は access_token だが、本プロジェクトの `internal/auth.Verifier` は **`sub`（playerId）が取れればよい**作りのため、sub を持つ id_token でも通る。`cmd/client` は当面 id_token を「sub を運ぶ JWT」として使う。将来 access_token に寄せるなら Verifier 側で `token_use=="access"` を要求する整理になる。
+
+### Q. `POST /session/{sessionId}/end` は「GameLift でゲーム終了しプレイヤーを GameLift から切る処理」?
+半分そう、半分違う。このエンドポイントの実体（`session_end.go`）は **アプリ/ビジネス側の終了処理だけ**：①roster 各人へ `MatchHistory` を1件ずつ書く（`PutMatchResult`）／②**自前の** `Sessions` テーブルを `ENDED` に（`EndSession`）。**GameLift の制御プレーンには触れない。**
+- 「プレイヤーを GameLift から切る／枠を解放する」のは GameLift Server SDK 5.x の別呼び出し：`RemovePlayerSession(playerSessionId)`（枠解放）→ `ProcessEnding()`（プロセス終了通知）。今回は未実装（GameLift Anywhere 実接続時の範囲）。
+- 本番のプロセス終了時は **①結果報告（=今回の /session/end）と ②SDK の RemovePlayerSession→ProcessEnding の両方**を呼ぶ。今回は①だけ。
+- ローカルハーネス特有の割り切り：/session/end は DynamoDB しか触らないので、同居 Hub 上のインメモリ `game.Session` はこの呼び出しでは解除されない（Hub 自身の 20分タイムアウト/abandoned で終了）。E2E 確認は DynamoDB の結果保存が見えれば十分なので現状はこれでよい。
+
+### Q. ゲーム終了処理は GameLift 自体が行い、GameLift が session/end と RemovePlayerSession→ProcessEnding を呼ぶ?
+逆。**呼ぶのは「GameLift 上で動くあなたのゲームサーバのコード」**。GameLift（プラットフォーム）が勝手にこれらを呼ぶのではない。
+- 制御の向き（通常終了）：ゲーム終了を判断するのは**あなたのプロセス** → ①あなたの backend へ `POST /session/end`（結果を DynamoDB へ）／②同インスタンス上の GameLift Agent へ SDK 経由で `RemovePlayerSession`→`ProcessEnding`。GameLift プラットフォームは②を**受けて**プロセス/枠を回収する側で、独自 API の session/end は知らない。
+- 例外（逆向き）：Spot 回収・フリート縮退時は GameLift が `OnProcessTerminate` コールバックであなたのプロセスに「もうすぐ落とす」と通知。受けたあなたのコードが急いで片付け（結果保存・ProcessEnding）を**自分で**行う。実行主体は常にあなたのコード。
+
+### Q. サーバーロジックは GameLift 自体ではなく、GameLift 内のインスタンスにデプロイする?
+その通り。**「GameLift という箱」ではなく、GameLift が管理する EC2 インスタンス群（フリート）の各インスタンスに配置されて動く。**
+- デプロイ階層：`Go ビルド` → **Build**（GameLift に登録した成果物、まだ動かない）→ **Fleet**（この Build を EC2 タイプ/Spot/台数で動かす定義）→ GameLift が **EC2 インスタンス**をプロビジョンし Build を自動配置 → 各インスタンスの **GameLift Agent が実行ファイルをプロセスとして起動**（1 プロセス ≒ 1 ゲームセッション/最大4人）。
+- 「GameLift 自体」はマネージドな制御層（オーケストレーター）。あなたは Build を渡すだけで、EC2 の調達/パッチ/スケール/Spot 回収を GameLift が肩代わりする。だから `ProcessEnding()` は「インスタンス上のあなたのプロセス → 同インスタンスの GameLift Agent」へのローカル呼び出しになる。
+- Fleet には Build に加えランタイム設定（`runtime_configuration`）を与える：launch path（起動する実行ファイル）/同時起動プロセス数/ServerSdkVersion。Terraform は `aws_gamelift_fleet`。
+- フリート種別：**Managed EC2**（本命）／コンテナ（イメージを配る）／**Anywhere**（EC2 の代わりに自前マシン=自 PC を compute として登録）。Phase 4 の Anywhere は「EC2 の役を自 PC が担う」位置づけ。
+- 本プロジェクト対応：Build=`cmd/gameserver`（GameLift SDK 連携済み Go バイナリ）／Fleet=Terraform `modules/gamelift`（Spot 主・On-Demand 従）／ローカル代替=今回の同居ハーネス（`localapi` 内で Hub を動かし EC2/Fleet を立てずプロセスだけ再現）。
+
+### 実装メモ（Phase 4 ステップ2〜3：ローカル E2E 完走 完了・2026-06-25）
+- **ステップ2 `cmd/localapi`**: API Gateway + 各 Lambda の代役 HTTP サーバ。`internal/handlers` を本番 Lambda と共有し、`adapt`（http↔API Gateway proxy 変換）でマウント。`withAuth` ミドルウェアが Bearer JWT を `internal/auth.Verifier` で検証し sub を Authorizer Context へ注入（authorizer Lambda の代役）。
+- **案A 同居**: `cmd/localapi/gameserver.go` の `hubSessionProvider`（`matchmaking.SessionProvider`）が UDP ゲームサーバ（`GameLiftEnabled:true`）の Hub に、マッチ成立時の roster でセッションを動的登録（GameLift `OnStartGameSession` の代役）。
+- **ギャップ②解消**: `POST /session/{sessionId}/end`（`handlers.SessionEnd`）が roster 各人へ `MatchHistory` を書き（`PutMatchResult`）、自前 `Sessions` を ENDED に。server-to-server 経路のため `withAuth` の外にマウント。
+- **ステップ3 `cmd/client`**: E2E ドライバ。signup（409 許容）/login→match/request（`soloAllowed:true` で即成立）→status ポーリング→UDP play（PLAYER_MOVE×N + PLAYER_ACTION、SESSION_STATE 受信）→session/end→history。roster 照合用 playerId は id_token の sub から取り出す（`subjectFromJWT`）。
+- **E2E 完走確認**: `docs/phase4-e2e-runbook.md` の手順で実機完走（`client: E2E completed`）。AppControl ブロックは発生せず。
+- **残**: GameLift Anywhere 実接続（自 PC を compute 登録、SDK の AcceptPlayerSession/RemovePlayerSession/ProcessEnding 経路）。これは Phase 4 後半 or 別途。
