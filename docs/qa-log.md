@@ -577,3 +577,175 @@ A. **採用＝案 A（ローカル API バイナリ + CLI client）**。3 案は
 - **ステップ3 `cmd/client`**: E2E ドライバ。signup（409 許容）/login→match/request（`soloAllowed:true` で即成立）→status ポーリング→UDP play（PLAYER_MOVE×N + PLAYER_ACTION、SESSION_STATE 受信）→session/end→history。roster 照合用 playerId は id_token の sub から取り出す（`subjectFromJWT`）。
 - **E2E 完走確認**: `docs/phase4-e2e-runbook.md` の手順で実機完走（`client: E2E completed`）。AppControl ブロックは発生せず。
 - **残**: GameLift Anywhere 実接続（自 PC を compute 登録、SDK の AcceptPlayerSession/RemovePlayerSession/ProcessEnding 経路）。これは Phase 4 後半 or 別途。
+
+### Q. ローカル E2E が通っているのに、なぜ GameLift Anywhere 実接続までやる?
+ローカルハーネスは GameLift を `hubSessionProvider` で**スタブ化**しており、**GameLift SDK との結線（契約）が一度も動いていない**ため。
+- ローカル E2E が保証するのは**自分のアプリのロジック**（マッチング・UDP・結果保存）。GameLift の `InitSDK→ProcessReady→OnStartGameSession(roster)→AcceptPlayerSession→ProcessEnding`・ヘルスチェックは未実行。
+- GameLift Anywhere は**自 PC を Anywhere フリートの compute として登録**し、サーバーバイナリはローカルで動かしつつ GameLift 制御プレーンとは本物で通信する方式。これで未検証の SDK 経路を本物で通せる（署名違い・呼び忘れはここでしか出ない）。
+- ローカルで実接続する意味＝**EC2 を立てず無料枠で安く・速く**回せる。SDK 経路が Anywhere で通れば、Managed EC2 への移行はほぼ設定だけ（Build アップロード+Fleet 定義）になり、本番デプロイのリスクを先に潰せる。
+- 役割分担：**ローカル E2E=ロジック検証／Anywhere 実接続=GameLift SDK 契約検証**。
+
+### Q. AWS dev E2E では何をする?
+**Terraform（`terraform/environments/dev`）で実 AWS 上に構築した dev 環境**で、全マネージドサービスを本物にして繋ぎ、本番一歩手前の統合検証を行う。
+- 本物に置き換わるもの：認証=実 Cognito（mock-auth→）/API=実 API Gateway+Lambda（localapi→、authorizer・IAM・コールドスタート含む）/DB=実 DynamoDB（LocalStack→、IAM・GSI・TTL・スロットリング）/ゲームサーバ=実 GameLift Managed EC2 フリート（同居 Hub→、サーバ自身も GameLift 起動の EC2 上で動く）/ネットワーク=Route53・SG・実 UDP 到達性/観測=CloudWatch・X-Ray。
+- ここでしか出ない問題：**IAM の実効性**（最小権限で本当に動くか）、マネージドサービスの実挙動（結果整合性・スロットル・実 JWT/JWKS・API GW 制限・Lambda 実行環境差）、サーバが GameLift 管理 EC2 上で動く本番同等経路、全サービス間の E2E 結線。
+- 段階：ローカルE2E（ロジック）→ Anywhere（SDK 契約・サーバは自PC・無料枠）→ **AWS dev（全サービス実物・統合）** → 負荷テスト(Phase 6) → マルチリージョン/prod。
+
+### Q. 従量課金はどこから発生する?
+**実課金が始まるのは AWS dev を `terraform apply` した瞬間**。local=ゼロ、Anywhere≈ゼロ（無料枠・compute は自 PC で EC2 課金なし）、dev から実課金。ただし「従量だけ」ではない点に注意：
+- **A. 従量課金（使った分）**: API Gateway（リクエスト数）/Lambda（実行×GB秒）/DynamoDB（PAY_PER_REQUEST=読み書き回数）/Cognito（MAU）/CloudWatch・X-Ray/データ転送。叩かなければほぼ増えない（無料枠あり）。
+- **B. 立てているだけで掛かる（固定/時間課金）← 注意**: GameLift Managed EC2 フリート（**プレイヤー0でも ACTIVE な間ずっとインスタンス時間課金**。最大のコスト源）／NAT Gateway（時間課金、概算 ~$0.045/時≈月$30 強、region 依存）／Route53 ホストゾーン（月額固定 概算 $0.50/ゾーン）。※金額は概算・region/時期で変動。
+- 直結する制約：CLAUDE.md「**GameLift フリートは使わないとき必ず停止**」「Budgets 月 $200」。運用は **dev は必要時だけ apply→終わったら destroy（特にフリート/NAT）**、ローカル・Anywhere で潰せる検証は先に潰し **dev 滞在を最短化**。Anywhere を挟む価値は「課金が本格化する dev の前に無料で SDK 結線を潰す」点にもある。
+
+### Q. GameLift Anywhere 実接続と AWS dev E2E は両方必要?
+**「両方必須」ではない。** カバレッジで見ると必須は **AWS dev E2E だけ**、Anywhere は「必須ではないが強く推奨の中間ゲート」。
+- 両者の検証範囲は**入れ子**：`AWS dev E2E ⊇ Anywhere`。Anywhere が見る「GameLift SDK 契約」は Managed EC2（＝dev）でも同じコードが動くので、dev の**部分集合**。カバレッジ上は dev だけで足りる。
+- Anywhere の価値＝**同じ SDK 検証を課金前に無料枠で先に潰す**コスト/リスク最適化。GameLift フリートは「立てているだけで時間課金」される最大コスト源なので、そこに入る前に無料で SDK を通す保険は費用対効果が高い。
+- いきなり dev（Managed EC2）直行も**カバレッジ的には成立**するが、SDK 契約のデバッグを課金中のフリート上で回すことになる（遅い・高い）。
+- 帰結：local-first・$200 Budget 方針なら **Anywhere を挟む**のが整合的。手間最小化優先なら Anywhere スキップも選択肢。
+
+### Q. Anywhere と AWS dev は、どちらも「GameLift のサービス」という立ち位置?
+**違う。カテゴリが別。**
+- **GameLift Anywhere → GameLift の中の一機能**（フリート種別のひとつ）。**Yes、GameLift のサービス。**
+- **AWS dev → GameLift の機能ではなく「環境（environment）」という別軸**。Cognito・API GW・Lambda・DynamoDB・GameLift・Route53… **全部入りの箱**の名前。GameLift はその**一部品**にすぎない。**No、GameLift のサービスではない。**
+- .NET 例え：Anywhere=`IHostingProvider` の実装のひとつ（`AnywhereProvider`）／dev=`appsettings.Development.json` の「環境」。レイヤーが違う。
+- 2軸で整理：
+
+| | 環境=ローカル寄り | 環境=AWS dev |
+|---|---|---|
+| フリート種別=Anywhere | ← 今回の「Anywhere 実接続」（自 PC が compute） | 通常やらない |
+| フリート種別=Managed EC2 | 不可（EC2 は AWS 上） | ← 「AWS dev E2E」（本番同等） |
+
+### Q. Anywhere と Managed EC2 の違いは「compute を誰が用意するか」だけ?
+**違う。それは氷山の一角。** 本質は **Managed EC2=GameLift が compute のライフサイクルを丸ごと管理／Anywhere=GameLift が管理するのは制御プレーン（セッション配置・マッチメイキング・SDK 契約）だけで、compute 周りは全部あなたの責任**。
+
+| 観点 | Managed EC2 | Anywhere |
+|------|-------------|----------|
+| compute 調達 | GameLift が EC2 自動プロビジョン | 自分で用意・登録（`RegisterCompute`） |
+| Build 配布 | zip アップロードで各 EC2 に**自動配置** | **アップロード無し**。バイナリを自分で置いて起動 |
+| オートスケール | 需要で**自動増減** | ハードのスケール無し。台数は自分で管理 |
+| Spot/コスト | **Spot で約70%減**・時間課金 | 自前ハード（自 PC ≒無料）。GameLift 課金は極小 |
+| OS/パッチ/ヘルス | GameLift が管理・不健全機を**自動置換** | 自分で管理。GameLift は unhealthy 判定のみ・ハード置換なし |
+| ネットワーク | SG/inbound・TLS 証明書を管理 | 自分で IP・ポート開放・到達性 |
+| 可用性 | AZ 分散・冗長を GameLift が担保 | 自 PC が落ちたら終わり |
+
+- **共通は「制御プレーン」だけ**：どちらも SDK ライフサイクルは同一 → Anywhere で通せば Managed EC2 でも通る（＝入れ子の根拠）。
+- .NET 例え：Managed EC2=Azure App Service（PaaS 丸投げ）／Anywhere=自前サーバーに自分でデプロイしつつ司令塔だけ GameLift に委任するハイブリッド。
+
+### Q. Anywhere は「ローカルサーバーのため」より「本番想定 GameLift が問題なくデプロイ・機能するかのテスト」のため?
+**方向性は正しい**（＝ローカルでゲームを動かすこと自体が目的ではなく、本番で使う GameLift と自サーバーの統合検証が目的）。ただし**「デプロイ」まで含めると不正確**。
+- Anywhere が検証するのは **SDK 契約＝制御プレーンとの会話**。**Managed EC2 のデプロイ経路そのものは検証しない**。
+
+| 本番 GameLift の要素 | Anywhere で検証 | 
+|---|---|
+| SDK ライフサイクル（InitSDK→ProcessReady→OnStartGameSession→AcceptPlayerSession→RemovePlayerSession→ProcessEnding）/ヘルスチェック/マッチ→配置結線 | ✅ できる（本命） |
+| Build アップロード＆自動配置 | ❌ できない（自 PC で直接起動、zip 経路なし） |
+| Fleet プロビジョニング（EC2 調達）/オートスケール/Spot 回収/OS・AZ 冗長 | ❌ できない（dev の担当） |
+
+- 正確な言い方：**「本番 GameLift が“機能する”か＝Yes（SDK 契約の部分）／“デプロイ”できるか＝それは AWS dev（Managed EC2）で初めて検証」**。
+```
+Anywhere    : サーバーコード ↔ GameLift SDK契約（デプロイ経路は含まない）
+AWS dev E2E : 上記 ＋ Build/Fleet/EC2 デプロイ経路 ＋ 全マネージドサービス統合
+```
+
+### Q. ローカルのセッション作成 Lambda が実 GameLift 疎通と違い、playerId でなく playerSessionId で判断が必要＝そのために作る、で合ってる?
+**大筋合っているが 2 点補正。** 指摘には**軸の違う2つのギャップ**が混ざっている。両方 Anywhere に要るが担当が別。
+
+| 違い | 内容 | ギャップ |
+|---|---|---|
+| セッション作成の**経路**が違う | ローカルは `GameLiftStub`（固定接続先）+ `hubSessionProvider` が roster を同居 Hub に直接 Register。実 GameLift は Lambda が `CreateGameSession`→GameLift が配置→サーバの `OnStartGameSession` 発火 | **G2** |
+| 識別子の**判断**が違う | roster 判定を `playerId` でやっているが GameLift の受け入れは `playerSessionId` | **G1** |
+
+**補正1**：「セッション作成 Lambda が実疎通と異なる」＝G2、「playerId でなく playerSessionId」＝G1。別の話。今回の G1-min は後者（識別子の配線）が対象、Lambda の実 CreateGameSession 化（G2）は別途。
+
+**補正2**：playerId を playerSessionId に**置き換えるのではない**。**playerSessionId の受け入れ層を“追加”し、対応表で playerId と結ぶ**（両者は役割が違い共存）。
+```
+playerSessionId … GameLift がコネクション毎に発行する入場チケット
+                  → AcceptPlayerSession(psid) で検証 / RemovePlayerSession(psid) で返却（GameLift 契約レイヤ）
+playerId        … ゲームドメイン identity。roster 判定・ゲーム状態・履歴保存はこのまま（アプリロジックレイヤ）
+対応表 psid→playerId … 2 層を橋渡し（G1 で新設）
+```
+- 具体：クライアントは接続時に playerSessionId を提示 → サーバが `AcceptPlayerSession(psid)` で GameLift に検証させ、対応表から playerId を確定 → 以降のゲーム処理は従来通り playerId。`session.go` の roster(playerId) 判定は**残し**、その手前に「psid を受理して playerId に解決する段」を**足す**。
+- 帰結：**G1=playerSessionId 受け入れ層を足し playerId と繋ぐ／G2=セッション作成を実 GameLift に差替**の二本立て。G1-min は前者をローカル no-op 込みで配線し、実 GameLift 成功確認は G2 と同時に後段。
+
+### Q. なぜ playerId と playerSessionId が 1:1 になる? マッチ→同一セッション接続までの流れは?
+**playerSessionId は「そのセッションにおける、その人の座席予約」**だから。1 セッションに 4 人いれば座席予約も 4 つ、各予約はちょうど 1 人に対応 → **同一セッション内で playerId ↔ psid は 1:1**。
+
+**流れ（4人がマッチして同一セッションへ）**:
+```
+各自 login → playerId = JWT sub（人ごと固有・不変）
+各自 match/request → ticket（人ごと）
+マッチ成立（4枚を1グループ）→ Lambda finalize:
+  (1) CreateGameSession(questId,[p1..p4]) → 【1つ】の gameSessionId ＋ IP:Port  ★全員共通
+  (2) CreatePlayerSession(GS, playerId) を人数分 → psid_1..psid_4              ★人ごと=ここで1:1が生まれる
+各自 match/status で受取：IP:Port（共通）＋ 本人の psid
+全員が同じ IP:Port へ UDP 接続 → 各自 psid を提示 → server.AcceptPlayerSession(psid) で座席確定
+```
+
+**1:1 が生まれる場所**: (2) の `CreatePlayerSession` を「1 人 1 回」呼ぶから。1 セッション内に人数分の座席ができ、各 psid はちょうど 1 人分の枠を指す。時間をまたぐと同じ playerId が別セッションで別 psid をもらう＝通時的には 1:多。**「1 セッション内でだけ 1:1」**が正確。
+
+**飛行機の例え**:
+| GameLift | 飛行機 | 性質 |
+|---|---|---|
+| playerId(JWT sub) | パスポート番号 | 人に固有・不変。どの便でも同じ |
+| gameSessionId＋IP:Port | 便名＋搭乗ゲート | その便の全員で共通 |
+| playerSessionId | 搭乗券＋座席番号 | 1便1人1枚。次の便では別の券 |
+| AcceptPlayerSession(psid) | ゲートで搭乗券スキャン | 提示券が本物か検証 |
+
+**ユーザーごと（4人なら4つ）**: playerId／ticket／**playerSessionId(psid)**／match/status で配る psid 部分。
+**セッション共通（1つ）**: gameSessionId／**接続先 IP:Port**／questId・roster／サーバープロセス（1セッション=1プロセス）／Sessions レコード。
+
+**なぜ共通 IP:Port だけでは足りず psid が要るか**: 全員が同じ IP:Port に来るので、サーバーは「今 UDP してきた接続が誰で正規参加者か」を判別する手段が必要。playerId 自己申告は詐称可能。GameLift 発行の psid を `AcceptPlayerSession` で検証してこそ「正規に予約された座席の持ち主だけ」を通せる。→ マッチャー側(供給=人数分 psid 配布)とサーバー側(検証=AcceptPlayerSession)が **供給1つ:検証1つ** で対応する必要がある（= per-player psid 実装 [[project_phase4_anywhere_plan]] G1/G2 の接点）。
+
+### Q. goroutine と channel の違いは?（C#/.NET 視点）
+混同しやすいが役割は別物。**goroutine = 並行に走る実行の流れ（働く人）**、**channel = goroutine 間でデータを受け渡す型付きパイプ（人と人をつなぐ通信路）**。channel は「実行グループ」ではない。
+- **goroutine**: 関数の前に `go` を付けるだけで別の流れで動き出し、呼び出し元はブロックされず次へ進む（C# の `Task.Run(...)` を await しない感覚）。OS スレッド（C# `Thread` ≒ 1MB/本）と違い初期スタック ~2KB で、Go ランタイムが少数の OS スレッド上に大量の goroutine を M:N 多重化する（.NET の `ThreadPool`+`async/await` に思想が近い）。Go はコードを**見た目同期的**に書くだけで I/O ブロック時にランタイムが裏でスレッドを融通するため、`async`/`await` キーワードが存在しない（function coloring が起きない）。
+- **channel**: 何本でも独立に作れ、`<-ch` で受信。重要ルール「**`<-ch` はその行を書いた場所を実行している goroutine を待機させる**」。待つ主体は常に goroutine、channel は待たれる対象。
+- **`select`**: 複数 channel を**同時に見張り**、最初に動いた 1 本で進む構文（C# の `Task.WhenAny` 相当。単発 `<-ch` が `await task`）。1 goroutine が複数 channel を順に `<-` すると直列待ちになるので、同時待ちは `select`。
+- **main goroutine の特例**: `main()` も 1 つの goroutine。**main が return すると走行中の他 goroutine ごとプロセスが即終了**する。だからサーバを `go` で裏に回したら main を別途待機させないと、起動直後に終わってしまう。
+
+### Q. `localapi` の goroutine / channel 構成は?（グレースフルシャットダウン）
+`main.go` は **3 系統の goroutine** を、**1 つの context キャンセルを起点に**自律的に畳む構成。
+```
+main goroutine            … <-shutdownCtx.Done() で待機（OS シグナルの番人）
+├ goroutine A: go srv.Serve(ctx)        … UDP 受信ループ（gameserver.go:52）
+│   └ goroutine A': go broadcastLoop(ctx)  … 50ms 周期で状態配信（Serve がさらに産む）
+└ goroutine B: go func(){ ListenAndServe }()  … HTTP（main.go:101）
+```
+- **channel の中心は `signal.NotifyContext`**（main.go:56）。内部で OS シグナル用 channel を作り、SIGINT(Ctrl+C)/SIGTERM で `shutdownCtx` をキャンセル。context のキャンセルは内部的に **`Done()` が返す channel を close** することで表現される（C# の `CancellationToken`、`Done()`≒`token.WaitHandle`）。
+- **`<-shutdownCtx.Done()`（main.go:108）が待たせるのは main goroutine**、待つ対象は **OS シグナル**（サーバ処理でも他 goroutine でもない）。ここで main を眠らせておくのが、上記「main が終わると全部死ぬ」への対処＝**停止処理を正常に走らせるための門**。
+- **HTTP と UDP の停止は連鎖ではなく独立**。同じ `shutdownCtx` キャンセルを各自が受けて別々に止まる：UDP は `Serve(ctx)` が `ctx.Done()` を見て**自律停止**、HTTP は `ctx` を見ないので**main が目覚めてから `srv.Shutdown(timeout)` で明示停止**（処理中リクエストをドレイン）。`ListenAndServe` は正常停止時 `http.ErrServerClosed` を返すので、それだけは正常系として無視する。
+- 「1 つの close を、見ている全員が同時に受け取る」= **close をブロードキャストに使う**Go 定番パターン。グレースフルシャットダウンはその典型。
+
+### Q. UDP の `receiveLoop` はなぜ `select` だけで止められない?
+**ソケットの read（`ReadFromUDP`）は channel ではないので `select` に混ぜられない**ため。2 つのループで停止検知の作りが違う。
+- **broadcastLoop（教科書どおりの select）**: `select { case <-ctx.Done(): return; case <-ticker.C: Tick() }`。channel 2 本（`ctx.Done()` とタイマー `ticker.C`）の**ブロッキング同時待ち**。停止は最大 50ms 以内に検知。
+- **receiveLoop（締切ポーリング）**: 先頭の `select` は `default` 付き＝**ノンブロッキング**で「`ctx.Done()` が**もう**閉じてるか」だけ即チェック（C# の `token.IsCancellationRequested` 相当）。本体の `ReadFromUDP` はパケットが来るまでブロックするので、`SetReadDeadline(500ms)` で締切を付け、**最大 500ms ごとに必ずループ先頭へ戻して** `ctx` を再チェックする。タイムアウトエラーは `ne.Timeout()` で握りつぶして `continue`（＝ctx を見直す口実）。締切が無いと受信行で固まり、停止指示に気づけない。
+- 一般化：**channel は `select` で待てるが、ソケット read は待てない。だから締切でポーリング周期を作り、その隙間で ctx を覗く**——ネットワークサーバ頻出のパターン。
+
+### Q. `localapi` の実行方法は?
+依存（DynamoDB=LocalStack / JWT 発行=mock-auth）が要るので**単体では動かない**。手順の正は `docs/phase4-e2e-runbook.md`。要点:
+```powershell
+# 1) 依存スタック起動（DynamoDB テーブルは init が自動作成）
+cd C:\work\RAIDYNC
+docker compose -f docker/docker-compose.yml up -d
+# 2) ビルド
+cd C:\work\RAIDYNC\server
+go build -o ..\bin\localapi.exe .\cmd\localapi
+# 3) 環境変数をセットして起動（このターミナルは起動しっぱなし＝<-shutdownCtx.Done() で待機する状態）
+cd C:\work\RAIDYNC
+$env:DYNAMODB_ENDPOINT="http://localhost:4566"; $env:AWS_REGION="ap-northeast-1"
+$env:AWS_ACCESS_KEY_ID="test"; $env:AWS_SECRET_ACCESS_KEY="test"   # LocalStack 用ダミー
+$env:AUTH_JWKS_URL="http://localhost:9229/.well-known/jwks.json"
+$env:AUTH_ISSUER="http://localhost:9229"; $env:AUTH_CLIENT_ID="raidync-local-client"
+.\bin\localapi.exe
+```
+- 起動成功ログ＝`gameserver(udp) listening on 127.0.0.1:7777` と `listening on :8080`（前述 2 系統の goroutine）。
+- 停止は **Ctrl+C**（SIGINT→`signal.NotifyContext`→`shutdownCtx` キャンセル→3 goroutine が自律的に畳まれグレースフル終了）。
+- AppControl(WDAC) で `.exe` が弾かれたら `server` ディレクトリから `go run .\cmd\localapi`（同じ環境変数を設定の上）。E2E 完走は別ウィンドウで `client.exe` を実行し `client: E2E completed` を確認。
+
+### Q. GameLift Anywhere Runbook（phase4-anywhere-runbook.md）は AWS の GUI 操作でも行える?
+**一部のみ可能。中核ステップは実質 CLI/SDK 専用**で、GUI だけでは完結しない。
+- **GUI で代替可**: ①`create-location`（カスタムロケーション）と ②`create-fleet`（Anywhere フリート）は GameLift コンソールの「Create fleet」ウィザードから作成できる。
+- **CLI/SDK が必須**: ③`register-compute`（コンソールは実行コマンドを案内表示するだけで GUI 登録フォームは無い。返り値 `GameLiftServiceSdkEndpoint` は API で取得）、④`get-compute-auth-token`（**短命トークン**・起動ごとに取り直し＝GUI 非現実的）、⑥`create-game-session`（コンソールに手動起動ボタン無し）。⑤は自 PC でのプロセス起動で AWS 操作ではない。
+- **結論**: フリート/ロケーション作成だけは GUI で一度作って構造把握するのはアリ。ただし Runbook 全体の GUI 置換は不可。狙いは「動いた構成を後で Terraform 化」（IaC 徹底）なので、手作業 GUI より CLI のままの方が移植しやすい。
