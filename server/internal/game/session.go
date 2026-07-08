@@ -12,6 +12,37 @@ import (
 // maxSessionMs は 1 セッションの最大継続時間（ms）。
 const maxSessionMs = protocol.MaxSessionMinutes * 60 * 1000
 
+// PlayerObserver はセッションへのプレイヤー参加/離脱を受け取る。GameLift Bridge が
+// AcceptPlayerSession(psid) / RemovePlayerSession(psid) を呼ぶために実装する。
+// 各コールバックは Session の Mutex を保持していない状態で呼ばれる（実装側が
+// ネットワーク I/O を行っても受信/ブロードキャストのホットパスを止めない）。
+// ローカル検証では注入しない（nil=通知しない）ので既存の E2E 挙動は不変。
+type PlayerObserver interface {
+	OnPlayerJoin(sessionID, playerID, playerSessionID string)
+	OnPlayerLeave(sessionID, playerID, playerSessionID string)
+}
+
+// SessionOption は NewSession の任意設定。既存呼び出し（オプション無し）は挙動不変。
+type SessionOption func(*Session)
+
+// WithPlayerObserver は参加/離脱の通知先を設定する（GameLift モードで Bridge を渡す）。
+func WithPlayerObserver(obs PlayerObserver) SessionOption {
+	return func(s *Session) { s.observer = obs }
+}
+
+// WithPlayerSessions は playerId→playerSessionId の対応表を設定する。
+// GameLift の Accept/RemovePlayerSession は playerSessionId を要求するため、roster(playerId)
+// とこの表で橋渡しする。ローカルは空（psid 不明時は Bridge 側が SDK 呼び出しをスキップ）。
+func WithPlayerSessions(m map[string]string) SessionOption {
+	return func(s *Session) { s.playerSessions = m }
+}
+
+// playerRef は参加/離脱通知に必要な最小情報（ロック外へ持ち出す用）。
+type playerRef struct {
+	playerID        string
+	playerSessionID string
+}
+
 // Session は 1 ゲームセッション（最大 4 人）の実行時状態を保持する。
 // 受信メッセージの取り込み（Ingest）とブロードキャスト用スナップショット生成（Snapshot）が
 // 主な責務。送信そのものは行わず、宛先（*net.UDPAddr）の一覧だけを呼び出し側に渡す。
@@ -21,30 +52,38 @@ type Session struct {
 	ID      string
 	QuestID string
 
-	mu        sync.Mutex
-	roster    map[string]struct{} // マッチメイキングで確定した参加許可 playerId 集合
-	players   map[string]*player
-	outSeq    uint32 // SESSION_STATE の送信シーケンス（サーバー採番）
-	createdAt int64  // UnixTime ms
-	endsAt    int64  // createdAt + 20 分。これを過ぎたら timeout 終了
-	ended     bool
+	mu             sync.Mutex
+	roster         map[string]struct{} // マッチメイキングで確定した参加許可 playerId 集合
+	players        map[string]*player
+	playerSessions map[string]string // playerId → playerSessionId（GameLift 契約用。ローカルは空）
+	outSeq         uint32            // SESSION_STATE の送信シーケンス（サーバー採番）
+	createdAt      int64             // UnixTime ms
+	endsAt         int64             // createdAt + 20 分。これを過ぎたら timeout 終了
+	ended          bool
+
+	observer PlayerObserver // 参加/離脱通知先。nil=通知しない（ローカル既定）
 }
 
 // NewSession は roster（参加許可プレイヤー）を持つ新規セッションを生成する。
 // roster は Lambda 側のマッチメイキング結果（protocol.Session.PlayerIDs）と一致させる。
-func NewSession(id, questID string, roster []string, now int64) *Session {
+func NewSession(id, questID string, roster []string, now int64, opts ...SessionOption) *Session {
 	set := make(map[string]struct{}, len(roster))
 	for _, pid := range roster {
 		set[pid] = struct{}{}
 	}
-	return &Session{
-		ID:        id,
-		QuestID:   questID,
-		roster:    set,
-		players:   make(map[string]*player, len(roster)),
-		createdAt: now,
-		endsAt:    now + maxSessionMs,
+	s := &Session{
+		ID:             id,
+		QuestID:        questID,
+		roster:         set,
+		players:        make(map[string]*player, len(roster)),
+		playerSessions: make(map[string]string, len(roster)),
+		createdAt:      now,
+		endsAt:         now + maxSessionMs,
 	}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
 }
 
 // Ingest は受信した 1 メッセージをセッション状態へ反映する。
@@ -52,6 +91,14 @@ func NewSession(id, questID string, roster []string, now int64) *Session {
 //   - seq が受理済み最大値以下なら古い/重複として黙って破棄（nil を返す）
 //   - 正常に処理できた場合は送信元 addr と lastSeen を更新する
 func (s *Session) Ingest(msg *protocol.GameMessage, addr *net.UDPAddr, now int64) error {
+	// 参加通知はロック解放後に行う。この defer を先に積む＝LIFO で s.mu.Unlock() の後に走る。
+	var joined *playerRef
+	defer func() {
+		if joined != nil && s.observer != nil {
+			s.observer.OnPlayerJoin(s.ID, joined.playerID, joined.playerSessionID)
+		}
+	}()
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -66,6 +113,7 @@ func (s *Session) Ingest(msg *protocol.GameMessage, addr *net.UDPAddr, now int64
 	if p == nil {
 		p = newPlayer(msg.PlayerID, now)
 		s.players[msg.PlayerID] = p
+		joined = &playerRef{playerID: msg.PlayerID, playerSessionID: s.playerSessions[msg.PlayerID]}
 	}
 
 	// シーケンスゲート: UDP は順序保証がないため、古い/重複パケットを捨てる。
@@ -149,6 +197,16 @@ func (s *Session) Snapshot(now int64) (msg protocol.GameMessage, recipients []*n
 // PruneIdle は最終受信から PlayerIdleTimeoutMs を超えたプレイヤーを取り除く。
 // 取り除いた人数を返す。
 func (s *Session) PruneIdle(now int64) int {
+	// 離脱通知はロック解放後に行う（LIFO で s.mu.Unlock() の後に走る）。
+	var left []playerRef
+	defer func() {
+		if s.observer != nil {
+			for _, r := range left {
+				s.observer.OnPlayerLeave(s.ID, r.playerID, r.playerSessionID)
+			}
+		}
+	}()
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -156,6 +214,7 @@ func (s *Session) PruneIdle(now int64) int {
 	for id, p := range s.players {
 		if now-p.lastSeen > protocol.PlayerIdleTimeoutMs {
 			delete(s.players, id)
+			left = append(left, playerRef{playerID: id, playerSessionID: s.playerSessions[id]})
 			removed++
 		}
 	}
@@ -183,6 +242,16 @@ func (s *Session) EndReason(now int64) (protocol.SessionEndReason, bool) {
 // EndMessage はセッションを終了状態にし、SESSION_END メッセージと送信先を返す。
 // 多重呼び出しは ok=false（冪等）。
 func (s *Session) EndMessage(reason protocol.SessionEndReason, now int64) (msg protocol.GameMessage, recipients []*net.UDPAddr, ok bool) {
+	// セッション終了時、接続中の全員を離脱扱いにして枠を返す（ロック解放後に通知）。
+	var left []playerRef
+	defer func() {
+		if s.observer != nil {
+			for _, r := range left {
+				s.observer.OnPlayerLeave(s.ID, r.playerID, r.playerSessionID)
+			}
+		}
+	}()
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -192,10 +261,11 @@ func (s *Session) EndMessage(reason protocol.SessionEndReason, now int64) (msg p
 	s.ended = true
 
 	recipients = make([]*net.UDPAddr, 0, len(s.players))
-	for _, p := range s.players {
+	for id, p := range s.players {
 		if p.addr != nil {
 			recipients = append(recipients, p.addr)
 		}
+		left = append(left, playerRef{playerID: id, playerSessionID: s.playerSessions[id]})
 	}
 	s.outSeq++
 	payload, _ := json.Marshal(protocol.SessionEndPayload{Reason: reason})

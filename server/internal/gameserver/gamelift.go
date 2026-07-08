@@ -22,11 +22,31 @@ type GameLiftBridge struct {
 	hub  *game.Hub
 	port int
 	stop context.CancelFunc // OnProcessTerminate で受信ループを止める
+
+	// events は参加/離脱イベントを 1 本のワーカーに直列化して渡す。SDK の
+	// AcceptPlayerSession/RemovePlayerSession はネットワーク I/O なので、UDP 受信や
+	// Tick のホットパスで直接呼ばず、ここに積んでワーカー側で順序どおり実行する。
+	events chan playerEvent
+	done   chan struct{}
+}
+
+// playerEvent は 1 プレイヤーの参加(join=true)/離脱(join=false)を表す。
+type playerEvent struct {
+	join            bool
+	sessionID       string
+	playerID        string
+	playerSessionID string
 }
 
 // NewGameLiftBridge は Bridge を生成する。stop は Serve のコンテキストを止める CancelFunc。
 func NewGameLiftBridge(hub *game.Hub, port int, stop context.CancelFunc) *GameLiftBridge {
-	return &GameLiftBridge{hub: hub, port: port, stop: stop}
+	return &GameLiftBridge{
+		hub:    hub,
+		port:   port,
+		stop:   stop,
+		events: make(chan playerEvent, 64),
+		done:   make(chan struct{}),
+	}
 }
 
 // Activate は SDK を初期化し、GameLift にプロセス準備完了（ProcessReady）を通知する。
@@ -35,6 +55,7 @@ func (b *GameLiftBridge) Activate() error {
 	if err := server.InitSDKFromEnvironment(); err != nil {
 		return err
 	}
+	go b.processEvents()
 	return server.ProcessReady(server.ProcessParameters{
 		OnStartGameSession: b.onStartGameSession,
 		OnProcessTerminate: b.onProcessTerminate,
@@ -43,19 +64,66 @@ func (b *GameLiftBridge) Activate() error {
 	})
 }
 
-// End は全クリーンアップ後に GameLift へプロセス終了（ProcessEnding）を通知する。
-func (b *GameLiftBridge) End() error { return server.ProcessEnding() }
+// End はイベントワーカーを止め、クリーンアップ後に GameLift へプロセス終了（ProcessEnding）を通知する。
+func (b *GameLiftBridge) End() error {
+	close(b.events)
+	<-b.done
+	return server.ProcessEnding()
+}
+
+// processEvents は参加/離脱イベントを 1 件ずつ SDK 呼び出しに変換する（順序保証）。
+// playerSessionId が未確定（ローカル/G2 未結線）の場合はスキップする。
+func (b *GameLiftBridge) processEvents() {
+	defer close(b.done)
+	for e := range b.events {
+		if e.playerSessionID == "" {
+			log.Printf("skip SDK call: playerSessionId 未確定 (session=%s player=%s join=%v)", e.sessionID, e.playerID, e.join)
+			continue
+		}
+		if e.join {
+			if err := server.AcceptPlayerSession(e.playerSessionID); err != nil {
+				log.Printf("AcceptPlayerSession %s (player=%s): %v", e.playerSessionID, e.playerID, err)
+			}
+		} else {
+			if err := server.RemovePlayerSession(e.playerSessionID); err != nil {
+				log.Printf("RemovePlayerSession %s (player=%s): %v", e.playerSessionID, e.playerID, err)
+			}
+		}
+	}
+}
+
+// OnPlayerJoin / OnPlayerLeave は game.PlayerObserver を満たす。Session の Mutex 外で
+// 呼ばれる前提。ここではキューに積むだけで即座に返し、ホットパスを止めない。
+func (b *GameLiftBridge) OnPlayerJoin(sessionID, playerID, playerSessionID string) {
+	b.enqueue(playerEvent{join: true, sessionID: sessionID, playerID: playerID, playerSessionID: playerSessionID})
+}
+
+func (b *GameLiftBridge) OnPlayerLeave(sessionID, playerID, playerSessionID string) {
+	b.enqueue(playerEvent{join: false, sessionID: sessionID, playerID: playerID, playerSessionID: playerSessionID})
+}
+
+// enqueue はイベントを積む。キュー満杯時は落とす（ゲーム進行を止めないことを優先）。
+func (b *GameLiftBridge) enqueue(e playerEvent) {
+	select {
+	case b.events <- e:
+	default:
+		log.Printf("player event dropped (queue full): session=%s player=%s join=%v", e.sessionID, e.playerID, e.join)
+	}
+}
 
 // onStartGameSession は GameLift からの新規セッション要求を Hub に反映し、
 // プレイヤー接続受け入れ可能（ActivateGameSession）を通知する。
 func (b *GameLiftBridge) onStartGameSession(gs model.GameSession) {
-	questID, roster := parseSessionConfig(gs)
-	b.hub.Register(game.NewSession(gs.GameSessionID, questID, roster, nowMs()))
+	questID, roster, playerSessions := parseSessionConfig(gs)
+	b.hub.Register(game.NewSession(gs.GameSessionID, questID, roster, nowMs(),
+		game.WithPlayerObserver(b),
+		game.WithPlayerSessions(playerSessions),
+	))
 	if err := server.ActivateGameSession(); err != nil {
 		log.Printf("ActivateGameSession %s: %v", gs.GameSessionID, err)
 		return
 	}
-	log.Printf("game session started: %s (quest=%s roster=%v)", gs.GameSessionID, questID, roster)
+	log.Printf("game session started: %s (quest=%s roster=%v psids=%d)", gs.GameSessionID, questID, roster, len(playerSessions))
 }
 
 // onProcessTerminate は GameLift からの停止要求（Spot 中断/スケールダウン）で呼ばれる。
@@ -68,9 +136,15 @@ func (b *GameLiftBridge) onProcessTerminate() {
 // onHealthCheck は 60 秒ごとの死活監視。現状は常に健全を返す。
 func (b *GameLiftBridge) onHealthCheck() bool { return true }
 
-// parseSessionConfig は GameProperties から questId と roster を取り出す純関数。
-// SDK の型に依存するが副作用がないのでユニットテスト可能。
-func parseSessionConfig(gs model.GameSession) (questID string, roster []string) {
+// parseSessionConfig は GameProperties から questId / roster / playerId→psid 対応表を
+// 取り出す純関数。SDK の型に依存するが副作用がないのでユニットテスト可能。
+//
+// GameProperties の想定:
+//   - questId       : "quest-rathalos"
+//   - playerIds     : "p1,p2,p3,p4"（カンマ区切り。roster=参加許可 playerId）
+//   - playerSessions : "p1=psess-1,p2=psess-2"（任意。Accept/RemovePlayerSession 用の
+//     playerId→playerSessionId。実 PlayerSession 発行(G2)まではローカルで空になり得る）
+func parseSessionConfig(gs model.GameSession) (questID string, roster []string, playerSessions map[string]string) {
 	questID = gs.GameProperties["questId"]
 	if questID == "" {
 		questID = "unknown"
@@ -80,5 +154,17 @@ func parseSessionConfig(gs model.GameSession) (questID string, roster []string) 
 			roster = append(roster, p)
 		}
 	}
-	return questID, roster
+	playerSessions = make(map[string]string)
+	for _, pair := range strings.Split(gs.GameProperties["playerSessions"], ",") {
+		pair = strings.TrimSpace(pair)
+		if pair == "" {
+			continue
+		}
+		pid, psid, ok := strings.Cut(pair, "=")
+		pid, psid = strings.TrimSpace(pid), strings.TrimSpace(psid)
+		if ok && pid != "" && psid != "" {
+			playerSessions[pid] = psid
+		}
+	}
+	return questID, roster, playerSessions
 }
