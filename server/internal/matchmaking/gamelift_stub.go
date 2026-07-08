@@ -9,12 +9,17 @@ import (
 )
 
 // SessionProvider はゲームセッション生成を抽象化する。
-// Phase 2 は GameLiftStub が固定接続先を返し、Phase 3 で本物の GameLift クライアントに差し替える。
+// 返り値の conn は全プレイヤー共通の接続先（IP/Port）で PlayerSessionID は空。
+// playerSessions は playerId→playerSessionId の対応表で、GameLift の 1 プレイヤー 1 枠
+// （CreatePlayerSession でプレイヤー毎に発行される playerSessionId）を表す。呼び出し側は
+// 各プレイヤーへ「共通 conn ＋ 自分の psid」を配る。
+//
+// 実装: ローカルは GameLiftStub / hubSessionProvider が、本番は実 GameLift クライアント（G2 後半）。
 type SessionProvider interface {
-	CreateGameSession(ctx context.Context, questID string, playerIDs []string) (sessionID string, conn protocol.ConnectionInfo, err error)
+	CreateGameSession(ctx context.Context, questID string, playerIDs []string) (sessionID string, conn protocol.ConnectionInfo, playerSessions map[string]string, err error)
 }
 
-// GameLiftStub は Phase 2 用のスタブ。固定のダミー接続先を返す（Phase 4 で実 GameLift CreateGameSession に差し替え）。
+// GameLiftStub は固定接続先を返すスタブ（実 GameLift クライアント未結線時のローカル用）。
 type GameLiftStub struct {
 	Host string
 	Port int
@@ -26,13 +31,13 @@ func NewGameLiftStub() *GameLiftStub {
 }
 
 // CreateGameSession は固定ホストと採番した ID で接続情報を返す。
-// 本物の GameLift は playerSessionId をプレイヤー毎に発行するが、スタブでは 1 つで代用する。
-func (s *GameLiftStub) CreateGameSession(_ context.Context, _ string, _ []string) (string, protocol.ConnectionInfo, error) {
+// 本物の GameLift 同様、プレイヤー毎に別々の playerSessionId を採番する。
+func (s *GameLiftStub) CreateGameSession(_ context.Context, _ string, playerIDs []string) (string, protocol.ConnectionInfo, map[string]string, error) {
 	sessionID := "sess-" + uuid.NewString()
-	conn := protocol.ConnectionInfo{
-		IPAddress:       s.Host,
-		Port:            s.Port,
-		PlayerSessionID: "psess-" + uuid.NewString(),
+	conn := protocol.ConnectionInfo{IPAddress: s.Host, Port: s.Port}
+	playerSessions := make(map[string]string, len(playerIDs))
+	for _, pid := range playerIDs {
+		playerSessions[pid] = "psess-" + uuid.NewString()
 	}
-	return sessionID, conn, nil
+	return sessionID, conn, playerSessions, nil
 }

@@ -26,15 +26,17 @@ type hubSessionProvider struct {
 
 // CreateGameSession は本番 GameLift CreateGameSession の代役。
 // sessionID を採番し、roster 付きセッションを Hub に登録して接続先を返す。
-func (p *hubSessionProvider) CreateGameSession(_ context.Context, questID string, playerIDs []string) (string, protocol.ConnectionInfo, error) {
+// プレイヤー毎に psid を採番するが、ローカル Hub は observer 未設定のため psid は
+// 検証に使われない（各クライアントへ配る接続情報の一貫性のためだけに持つ）。
+func (p *hubSessionProvider) CreateGameSession(_ context.Context, questID string, playerIDs []string) (string, protocol.ConnectionInfo, map[string]string, error) {
 	sessionID := "sess-" + uuid.NewString()
 	p.hub.Register(game.NewSession(sessionID, questID, playerIDs, time.Now().UnixMilli()))
-	conn := protocol.ConnectionInfo{
-		IPAddress:       p.host,
-		Port:            p.port,
-		PlayerSessionID: "psess-" + uuid.NewString(),
+	conn := protocol.ConnectionInfo{IPAddress: p.host, Port: p.port}
+	playerSessions := make(map[string]string, len(playerIDs))
+	for _, pid := range playerIDs {
+		playerSessions[pid] = "psess-" + uuid.NewString()
 	}
-	return sessionID, conn, nil
+	return sessionID, conn, playerSessions, nil
 }
 
 // startGameServer は GameLift モード（固定セッションを作らない）で UDP ゲームサーバを
