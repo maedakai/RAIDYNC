@@ -749,3 +749,36 @@ $env:AUTH_ISSUER="http://localhost:9229"; $env:AUTH_CLIENT_ID="raidync-local-cli
 - **GUI で代替可**: ①`create-location`（カスタムロケーション）と ②`create-fleet`（Anywhere フリート）は GameLift コンソールの「Create fleet」ウィザードから作成できる。
 - **CLI/SDK が必須**: ③`register-compute`（コンソールは実行コマンドを案内表示するだけで GUI 登録フォームは無い。返り値 `GameLiftServiceSdkEndpoint` は API で取得）、④`get-compute-auth-token`（**短命トークン**・起動ごとに取り直し＝GUI 非現実的）、⑥`create-game-session`（コンソールに手動起動ボタン無し）。⑤は自 PC でのプロセス起動で AWS 操作ではない。
 - **結論**: フリート/ロケーション作成だけは GUI で一度作って構造把握するのはアリ。ただし Runbook 全体の GUI 置換は不可。狙いは「動いた構成を後で Terraform 化」（IaC 徹底）なので、手作業 GUI より CLI のままの方が移植しやすい。
+
+### Q. psid の「上り」配管とは? G1-full で何を通した?
+psid には **下り（配布）** と **上り（提示→検証）** の 2 経路があり、G1-full は空白だった上りを埋めた。
+
+**下り（マッチ API → クライアント）＝ 既に開通済み**:
+```
+Lambda finalize: CreateGameSession + CreatePlayerSessions で psid 生成
+  → ticket.ConnectionInfo.PlayerSessionID に格納（人ごと）
+  → GET /match/status で各クライアントへ配布
+```
+ここに **UDP ゲームサーバは一切登場しない**（psid は REST の制御プレーンだけを通る）。
+
+**上り（クライアント → ゲームサーバ → GameLift）＝ G1-full で開通**:
+```
+client sendUDP: 受け取った psid を毎パケットの GameMessage.PlayerSessionID に載せて提示
+  → server.Ingest: 参加時（最初のパケット）に提示 psid を採用し対応表へ書き戻し
+  → OnPlayerJoin(psid) → observer → （実 AWS）AcceptPlayerSession(psid) で座席承認
+```
+
+**なぜ一度クライアントに戻すのか**: ①Lambda は短命 HTTP でリアルタイム UDP を中継できない、②ゲーム接続は NAT 内のクライアント発でしか張れない、③マッチ API とゲームサーバは直接会話しない（両者を繋ぐのはクライアントだけ）。飛行機の搭乗券モデルそのもの＝代理店(制御)が券を発行し、本人が持ち歩き、ゲート(データ)で提示・照合。[[Q. なぜ playerId と playerSessionId が 1:1 になる?]] の続き。
+
+**実装（3 ステップ）**: (1) `protocol.GameMessage` に `PlayerSessionID` 追加（毎パケット提示・採用は参加時のみ＝UDP で JOIN 欠落しても後続で再確立）、(2) `cmd/client.sendUDP` が psid を提示、(3) `cmd/localapi` に `loggingObserver` を注入し psid の到達をローカル可視化。**新メッセージ種別は足さず既存の暗黙参加モデルに 1 フィールドで載せた**。
+
+### Q. observer と WithPlayerSessions は何をする? ローカル observer は実 AWS で何?
+- **PlayerObserver**: セッションの参加/離脱を外部へ通知する口（C# の interface コールバック/event 相当）。`Session` は宛先を知らず「入った/出た」と叫ぶだけ＝依存性の逆転。実装を差し替えるだけで振る舞いが変わる。
+- **WithPlayerSessions**: `playerId→psid` 対応表の初期値注入（関数型オプション）。G1-full で位置づけ格下げ＝**提示 psid が優先、これは fallback**。実フローでは psid がセッション作成後発行で GameProperties に載らないため、対応表は空で始まりクライアント提示で埋まる。
+- **ローカル軽量 observer ＝ 実 AWS の `GameLiftBridge` の代役**。同じ `PlayerObserver` の別実装で、ローカルはログ出力（No-op）、本番は `OnPlayerJoin→AcceptPlayerSession(psid)` / `OnPlayerLeave→RemovePlayerSession(psid)` を実 GameLift へ送信。**Session 側コードは同一**、G4 では「ログ実装 → Bridge」に挿し替わるだけ。
+
+### Q. Anywhere で作った G1-full は実 GameLift(Managed EC2)へ移すとき作り直しになる?
+**ならない。** Anywhere と Managed EC2 は**フリート種別が違うだけで、ゲームサーバが使う Server SDK 契約（InitSDK→ProcessReady→OnStartGameSession→AcceptPlayerSession→RemovePlayerSession→ProcessEnding）は完全同一**。G1-full が触るのは全部この層なので Anywhere で通れば Managed EC2 でもそのまま動く。違いは compute 提供元・デプロイ方法・SDK 認証情報の入手経路（Anywhere は手で env 設定 / Managed EC2 は GameLift が自動注入、ただし読む側は同じ `InitSDKFromEnvironment`）で、いずれもコード外。唯一分岐する管理側 `CreateGameSession` の Location は G2 の `locationPtr()` で吸収済み。**「1 回書けば Anywhere でも AWS dev でも使える」**投資。
+
+### 実装メモ（Phase 4 G1-full：psid 上り配管 完了・2026-07-13）
+`GameMessage.PlayerSessionID` 追加 → `session.Ingest` で提示 psid 採用・書き戻し → `cmd/client` 提示 → `cmd/localapi` に `loggingObserver` 注入。ローカル E2E（LocalStack + mock-auth + localapi + client）で `gameserver: player join ... psid=psess-...` / `player leave ...（同一 psid）` を実パケット往復で確認。psid が「発行→配布→提示→採用→observer 到達」まで一気通貫。残り [[project_phase4_anywhere_plan]]: G4（実 Anywhere で observer→Bridge に替え AcceptPlayerSession 承認）／G3（Terraform 化）／AWS dev E2E。
