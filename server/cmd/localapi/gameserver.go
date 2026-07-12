@@ -6,6 +6,7 @@ package main
 
 import (
 	"context"
+	"log"
 	"time"
 
 	"github.com/google/uuid"
@@ -14,6 +15,30 @@ import (
 	"github.com/raidync/server/internal/gameserver"
 	"github.com/raidync/server/pkg/protocol"
 )
+
+// loggingObserver は game.PlayerObserver のローカル実装。実 AWS の GameLiftBridge
+// （OnPlayerJoin→AcceptPlayerSession / OnPlayerLeave→RemovePlayerSession を実 GameLift へ
+// 送る）の代役として、参加/離脱と提示された psid をログに出すだけの No-op。これにより
+// 「クライアント提示 psid → サーバ採用 → observer 到達」の一気通貫を実 AWS 無しで確認できる。
+type loggingObserver struct{}
+
+func (loggingObserver) OnPlayerJoin(sessionID, playerID, playerSessionID string) {
+	log.Printf("gameserver: player join session=%s player=%s psid=%s (local: AcceptPlayerSession 相当)",
+		sessionID, playerID, orNone(playerSessionID))
+}
+
+func (loggingObserver) OnPlayerLeave(sessionID, playerID, playerSessionID string) {
+	log.Printf("gameserver: player leave session=%s player=%s psid=%s (local: RemovePlayerSession 相当)",
+		sessionID, playerID, orNone(playerSessionID))
+}
+
+// orNone は空 psid を可読な "(none)" に置き換える（提示漏れをログで見つけやすくする）。
+func orNone(s string) string {
+	if s == "" {
+		return "(none)"
+	}
+	return s
+}
 
 // hubSessionProvider は matchmaking.SessionProvider を満たす。マッチ成立時に確定した
 // playerIDs を roster とする game.Session を生成し、同一プロセスで動く Hub に登録する。
@@ -24,13 +49,16 @@ type hubSessionProvider struct {
 	port int    // UDP ポート
 }
 
-// CreateGameSession は本番 GameLift CreateGameSession の代役。
-// sessionID を採番し、roster 付きセッションを Hub に登録して接続先を返す。
-// プレイヤー毎に psid を採番するが、ローカル Hub は observer 未設定のため psid は
-// 検証に使われない（各クライアントへ配る接続情報の一貫性のためだけに持つ）。
+// CreateGameSession は本番 GameLift CreateGameSession + CreatePlayerSessions の代役。
+// sessionID を採番し、roster 付きセッションを Hub に登録して接続先を返す。プレイヤー毎に
+// psid を採番して返す（本番の CreatePlayerSessions 相当）。各クライアントはこの psid を
+// match/status で受け取り、UDP 接続時に提示する。セッションには loggingObserver を注入し、
+// 提示 psid が参加/離脱で observer まで到達する様子をローカルで観測できるようにする。
+// 対応表(WithPlayerSessions)は事前投入しない＝実フロー同様、psid はクライアント提示で埋まる。
 func (p *hubSessionProvider) CreateGameSession(_ context.Context, questID string, playerIDs []string) (string, protocol.ConnectionInfo, map[string]string, error) {
 	sessionID := "sess-" + uuid.NewString()
-	p.hub.Register(game.NewSession(sessionID, questID, playerIDs, time.Now().UnixMilli()))
+	p.hub.Register(game.NewSession(sessionID, questID, playerIDs, time.Now().UnixMilli(),
+		game.WithPlayerObserver(loggingObserver{})))
 	conn := protocol.ConnectionInfo{IPAddress: p.host, Port: p.port}
 	playerSessions := make(map[string]string, len(playerIDs))
 	for _, pid := range playerIDs {

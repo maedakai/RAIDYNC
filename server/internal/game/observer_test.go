@@ -77,6 +77,26 @@ func TestObserver_NoFireForNonRoster(t *testing.T) {
 	assert.Empty(t, obs.joins, "roster 外は join を発火しない")
 }
 
+func TestObserver_ClientPresentedPsidTakesEffect(t *testing.T) {
+	obs := &recordingObserver{}
+	// WithPlayerSessions は投入しない。実フローでは psid がセッション作成後に発行され
+	// GameProperties に載らないため対応表は空で、クライアントが UDP で提示する。
+	s := NewSession("sess-1", "quest-001", []string{"p1"}, 0, WithPlayerObserver(obs))
+
+	// p1 が自分の psid を提示して参加。
+	m := moveMsg("sess-1", "p1", 1, protocol.Vector3{}, protocol.ActorIdle)
+	m.PlayerSessionID = "psess-client-1"
+	require.NoError(t, s.Ingest(m, addr(5001), 0))
+
+	require.Len(t, obs.joins, 1)
+	assert.Equal(t, "psess-client-1", obs.joins[0].playerSessionID, "提示 psid が採用される")
+
+	// 離脱でも同じ psid が返る（対応表へ書き戻されているため参加/離脱で一致）。
+	s.PruneIdle(11_000)
+	require.Len(t, obs.leaves, 1)
+	assert.Equal(t, "psess-client-1", obs.leaves[0].playerSessionID, "離脱でも同じ psid")
+}
+
 func TestObserver_EmptyPsidWhenUnmapped(t *testing.T) {
 	obs := &recordingObserver{}
 	// WithPlayerSessions 未指定（ローカル相当）→ psid は空。Bridge 側が SDK 呼び出しをスキップする。

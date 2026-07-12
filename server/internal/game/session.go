@@ -113,6 +113,12 @@ func (s *Session) Ingest(msg *protocol.GameMessage, addr *net.UDPAddr, now int64
 	if p == nil {
 		p = newPlayer(msg.PlayerID, now)
 		s.players[msg.PlayerID] = p
+		// クライアントが提示した psid を優先採用し、対応表に書き戻す。以降の離脱通知
+		// （PruneIdle/EndMessage）もこの表を引くため、参加/離脱で同じ psid が使われる。
+		// 提示が無い経路（ローカル）は WithPlayerSessions で事前投入された値をそのまま使う。
+		if msg.PlayerSessionID != "" {
+			s.playerSessions[msg.PlayerID] = msg.PlayerSessionID
+		}
 		joined = &playerRef{playerID: msg.PlayerID, playerSessionID: s.playerSessions[msg.PlayerID]}
 	}
 

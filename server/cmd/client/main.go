@@ -68,7 +68,8 @@ func main() {
 	if err := c.pollMatch(ctx); err != nil {
 		log.Fatalf("client: pollMatch: %v", err)
 	}
-	log.Printf("client: matched sessionId=%s connect=%s:%d", c.sessionID, c.conn.IPAddress, c.conn.Port)
+	log.Printf("client: matched sessionId=%s connect=%s:%d psid=%s",
+		c.sessionID, c.conn.IPAddress, c.conn.Port, truncate(c.conn.PlayerSessionID, 20))
 
 	// 3-4: UDP でゲームサーバに接続し、PLAYER_MOVE/PLAYER_ACTION を送って SESSION_STATE を受ける。
 	if err := c.playSession(ctx); err != nil {
@@ -371,14 +372,18 @@ func (c *client) playSession(ctx context.Context) error {
 }
 
 // sendUDP は GameMessage エンベロープを組んで 1 データグラム送る。
+// PlayerSessionID（GameLift の座席予約の証）を毎パケットに載せて提示する。サーバーは
+// 参加時にこれを採用して AcceptPlayerSession で座席を承認する。ローカル/ローストで
+// psid が無い場合は空のまま（サーバー側は空を無視する）。
 func (c *client) sendUDP(conn *net.UDPConn, seq uint32, t protocol.GameMessageType, payload json.RawMessage) error {
 	msg := protocol.GameMessage{
-		Type:      t,
-		SessionID: c.sessionID,
-		PlayerID:  c.playerID,
-		Timestamp: time.Now().UnixMilli(),
-		Seq:       seq,
-		Payload:   payload,
+		Type:            t,
+		SessionID:       c.sessionID,
+		PlayerID:        c.playerID,
+		PlayerSessionID: c.conn.PlayerSessionID,
+		Timestamp:       time.Now().UnixMilli(),
+		Seq:             seq,
+		Payload:         payload,
 	}
 	data, err := json.Marshal(msg)
 	if err != nil {

@@ -7,10 +7,10 @@ import "encoding/json"
 // ---------------------------------------------------------------------------
 
 const (
-	StateSyncHz         = 20            // SESSION_STATE のブロードキャスト頻度（回/秒）
+	StateSyncHz         = 20                 // SESSION_STATE のブロードキャスト頻度（回/秒）
 	StateSyncIntervalMs = 1000 / StateSyncHz // 50ms
-	MaxSessionMinutes   = 20            // 1 セッションの最大時間
-	PlayerIdleTimeoutMs = 10_000        // この時間パケットが来なければ離脱とみなす
+	MaxSessionMinutes   = 20                 // 1 セッションの最大時間
+	PlayerIdleTimeoutMs = 10_000             // この時間パケットが来なければ離脱とみなす
 )
 
 // ---------------------------------------------------------------------------
@@ -40,6 +40,12 @@ type GameMessage struct {
 	Timestamp int64           `json:"timestamp"` // UnixTime ms
 	Seq       uint32          `json:"seq"`       // クライアント採番のシーケンス番号
 	Payload   json.RawMessage `json:"payload"`
+
+	// PlayerSessionID はクライアントが提示する GameLift プレイヤーセッション ID（座席予約の証）。
+	// マッチメイキング API 経由で各自が受け取った値を、UDP 接続の各パケットに載せて提示する。
+	// サーバーは参加時（最初のパケット）にこれを採用し、GameLift の AcceptPlayerSession で
+	// 座席を承認させる。ローカル/ローストで psid を持たない経路では空（omitempty）。
+	PlayerSessionID string `json:"playerSessionId,omitempty"`
 }
 
 // ---------------------------------------------------------------------------
