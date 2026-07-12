@@ -19,8 +19,11 @@ AWSへの毎回デプロイによる開発コスト・時間ロスを防ぐた�
   │    ├── DynamoDB
   │    ├── API Gateway
   │    └── Lambda
-  ├── Amazon GameLift Local ← GameLiftのローカルエミュレーター（AWS公式）
-  └── Mock Server           ← Cognito認証のモック
+  └── Mock Server           ← Cognito認証のモック（Go製）
+
+[ GameLift（Docker外）]
+  └── GameLift Anywhere     ← 自PCをAnywhereフリートのcomputeとして実AWSに登録（無料枠内）
+                               ※旧 GameLift Local（Javaエミュレータ）はSDK 5.xで廃止
 ```
 
 ### 1.3 使用ツール一覧
@@ -29,7 +32,7 @@ AWSへの毎回デプロイによる開発コスト・時間ロスを防ぐた�
 |-------|------|------|
 | **Docker / Docker Compose** | 環境構築の統一 | `docker compose up`で全サービス起動 |
 | **LocalStack** | AWSサービスのローカル再現 | DynamoDB・Lambda・API Gatewayをオフラインで動かす |
-| **Amazon GameLift Local** | GameLiftのローカルエミュレーター | AWS公式提供ツール |
+| **Amazon GameLift Anywhere** | 自PCをGameLiftフリートのcomputeとして登録し実AWSで接続検証 | 旧GameLift Local（Javaエミュレータ）はSDK 5.xで廃止された後継。無料枠内 |
 | **k6** | 負荷テスト | ローカル接続テストにも使用 |
 
 ### 1.4 Docker Compose構成
@@ -48,15 +51,10 @@ services:
     volumes:
       - ./localstack/init:/etc/localstack/init/ready.d
 
-  gamelift-local:
-    image: amazonlinux:2
-    ports:
-      - "7777:7777"   # ゲームポート（UDP）
-      - "8080:8080"   # GameLift Local管理ポート
-    volumes:
-      - ./gamelift-local:/gamelift
-    command: >
-      java -jar GameLiftLocal.jar -p 8080
+  # GameLift は Docker に含めない。旧 gamelift-local（java -jar GameLiftLocal.jar）は
+  # Server SDK 5.x 非対応で廃止。SDK 5.x の接続検証は GameLift Anywhere（実 AWS・無料枠内）で
+  # 行い、自 PC を Anywhere フリートの compute として登録する。ゲームサーバー自体は
+  # docker 外で `go run ./cmd/gameserver`（UDP 7777）として起動する。
 
   mock-auth:
     image: node:20-alpine
@@ -97,7 +95,8 @@ COGNITO_USER_POOL_ID=ap-northeast-1_xxxxxxxx
 |---------|---------|
 | Lambdaのロジック修正・デバッグ | ローカル |
 | DynamoDBのCRUD確認 | ローカル（LocalStack） |
-| Unity ↔ サーバー間の接続確認 | ローカル（GameLift Local） |
+| Unity ↔ サーバー間のUDP通信確認 | ローカル（Go単体テスト、GameLift非依存） |
+| GameLiftライフサイクル接続確認 | GameLift Anywhere（実AWS・無料枠内） |
 | マッチメイキングAPIの動作確認 | ローカル |
 | マルチリージョン動作確認 | AWS dev |
 | 大規模負荷テスト（1,000接続） | AWS dev |
@@ -109,7 +108,8 @@ COGNITO_USER_POOL_ID=ap-northeast-1_xxxxxxxx
 |-----------|---------|--------|------|
 | **単体テスト** | ローカル | Go test | Lambdaのロジック・DynamoDB操作 |
 | **結合テスト** | ローカル（LocalStack） | Go test | API Gateway → Lambda → DynamoDB |
-| **接続テスト** | ローカル（GameLift Local） | Goテストクライアント | クライアント ↔ GameLiftサーバー間通信 |
+| **UDP通信テスト** | ローカル（GameLift非依存） | Go test（ループバックUDP） | クライアント ↔ サーバー間のゲーム通信 |
+| **接続テスト** | GameLift Anywhere（実AWS） | AWS CLI + Goサーバー | GameLiftライフサイクル（OnStartGameSession等） |
 | **負荷テスト（小）** | ローカル | k6 | 10〜50接続の動作確認 |
 | **負荷テスト（大）** | AWS dev | k6 | 1,000接続の本番想定テスト |
 | **E2Eテスト** | AWS dev | 手動 + k6 | 全フロー（ログイン〜マッチ〜ゲーム終了） |
@@ -143,7 +143,7 @@ cd server && go test ./...
 ├── .gitignore                   # .env.local等を除外
 ├── scripts/
 │   ├── localstack-init.sh       # LocalStack初期化スクリプト
-│   └── gamelift-local-start.sh  # GameLift Local起動スクリプト
+│   └── gamelift-anywhere-register.sh  # Anywhere compute登録＋authToken取得スクリプト
 ├── mock-auth/
 │   └── server.js                # Cognito認証モックサーバー
 └── localstack/

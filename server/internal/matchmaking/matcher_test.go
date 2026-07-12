@@ -70,10 +70,17 @@ func TestTryMatch_FullPartyOf4(t *testing.T) {
 	assert.Equal(t, protocol.StatusMatched, got.Status)
 	assert.Equal(t, sessions.sessionID, got.SessionID)
 	assert.Equal(t, 1, sessions.calls)
-	// 4 件すべてが MATCHED であること
+	// 4 件すべてが MATCHED で、各自「共通 IP/Port ＋ 本人だけの psid」を受け取ること
+	seen := map[string]bool{}
 	for _, id := range []string{"t1", "t2", "t3", "t4"} {
 		stored, _ := store.GetTicket(context.Background(), id)
 		assert.Equal(t, protocol.StatusMatched, stored.Status, "ticket %s should be MATCHED", id)
+		require.NotNil(t, stored.ConnectionInfo, "ticket %s should carry connection info", id)
+		assert.Equal(t, sessions.conn.IPAddress, stored.ConnectionInfo.IPAddress, "全員が共通の接続先 IP")
+		assert.Equal(t, sessions.conn.Port, stored.ConnectionInfo.Port, "全員が共通の接続先 Port")
+		assert.Equal(t, "ps-"+stored.PlayerID, stored.ConnectionInfo.PlayerSessionID, "本人の psid が配られる")
+		assert.False(t, seen[stored.ConnectionInfo.PlayerSessionID], "psid はプレイヤー毎に一意")
+		seen[stored.ConnectionInfo.PlayerSessionID] = true
 	}
 	// セッションが 1 件登録されていること
 	assert.Len(t, store.sessions, 1)
@@ -158,11 +165,11 @@ func TestTryMatch_ClaimConflictKeepsWaiting(t *testing.T) {
 func TestTryMatch_PartyPreserved(t *testing.T) {
 	store := newFakeStore()
 	// self はソロ。同じクエストにパーティ 3 + ソロが居る。
-	store.put(makeWaiting("t1", "p1", "", 1000))      // self（ソロ）
-	store.put(makeWaiting("t2", "p2", "PA", 1100))    // パーティ PA (3 人)
+	store.put(makeWaiting("t1", "p1", "", 1000))   // self（ソロ）
+	store.put(makeWaiting("t2", "p2", "PA", 1100)) // パーティ PA (3 人)
 	store.put(makeWaiting("t3", "p3", "PA", 1101))
 	store.put(makeWaiting("t4", "p4", "PA", 1102))
-	store.put(makeWaiting("t5", "p5", "", 1200))      // 別のソロ
+	store.put(makeWaiting("t5", "p5", "", 1200)) // 別のソロ
 
 	m := newMatcherFor(store, newFakeSessionProvider(), 1500)
 	got, err := m.TryMatch(context.Background(), "t1")

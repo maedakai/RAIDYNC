@@ -16,9 +16,9 @@ services:
       # ready.d に置いたスクリプトは LocalStack の API が応答可能になった直後に自動実行される
       - ./localstack/scripts/localstack-init.sh:/etc/localstack/init/ready.d/init-tables.sh:ro
 
-  # gamelift:
-  #   build: ./gamelift
-  #   container_name: gameserver
+  # GameLift は Docker スタックに含めない。旧 GameLift Local（Java エミュレータ）は
+  # Server SDK 5.x 非対応で廃止。SDK 5.x の接続検証は GameLift Anywhere（実 AWS・無料枠内）で行う。
+  # ゲームサーバーの UDP 通信は GameLift 非依存でローカル単体テスト可能。詳細は docs/qa-log.md §10。
 
   mock-auth:
     build:

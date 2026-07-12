@@ -140,3 +140,17 @@ type MatchHistoryOutput struct {
 	PlayerID string              `json:"playerId"`
 	Entries  []MatchHistoryEntry `json:"entries"`
 }
+
+// SessionEndInput は POST /session/{sessionId}/end のリクエストボディ。
+// ゲームサーバ（本番では GameLift プロセス）がセッション終了時に結果を報告する。
+type SessionEndInput struct {
+	Result      MatchResult `json:"result"`
+	DurationSec int         `json:"durationSec"`
+}
+
+// SessionEndOutput は結果保存の要約。playersSaved は履歴を書いた人数。
+type SessionEndOutput struct {
+	SessionID    string        `json:"sessionId"`
+	Status       SessionStatus `json:"status"`
+	PlayersSaved int           `json:"playersSaved"`
+}
