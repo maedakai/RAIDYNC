@@ -7,6 +7,10 @@
 *.prof
 coverage.out
 vendor/
+# ローカルビルド exe / 一時生成物置き場（gameprops.json 等）
+bin/
+# GameLift Server SDK ランタイムログ
+server/logs/
 # ローカルに置いた Go インストーラ tarball（リポジトリに含めない）
 server/go*.tar.gz
 server/go*.tar.gz.*
