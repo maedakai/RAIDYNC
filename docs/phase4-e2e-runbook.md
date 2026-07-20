@@ -104,7 +104,7 @@ cd C:\work\RAIDYNC
 ```
 client: authenticated playerId=... token=...
 client: match requested ticketId=tkt-...
-client: matched sessionId=sess-... connect=127.0.0.1:7777
+client: matched sessionId=sess-... connect=127.0.0.1:7777 psid=psess-...
 client: udp connected to 127.0.0.1:7777
 client: <- SESSION_STATE seq=1 players=1 self.health=100
 ...
@@ -116,6 +116,13 @@ client: E2E completed
 ```
 
 **`client: E2E completed`** が出れば成功（report→history が DynamoDB を介してつながったことの確証）。
+
+> **psid 配管の確認（G1-full）**：client は match/status で受け取った `psid=psess-...` を UDP 毎パケットに提示する。ターミナルA（localapi）側には参加/離脱時に次のログが出る（`loggingObserver` が実 AWS の `GameLiftBridge` の代役で、`AcceptPlayerSession`/`RemovePlayerSession` 呼び出しに相当）:
+> ```
+> gameserver: player join session=sess-... player=... psid=psess-... (local: AcceptPlayerSession 相当)
+> gameserver: player leave session=sess-... player=... psid=psess-... (local: RemovePlayerSession 相当)
+> ```
+> 実 GameLift での psid 承認確認は AWS dev E2E の担当（docs/phase4-anywhere-runbook.md 末尾フォローアップ参照）。
 
 ---
 
