@@ -71,17 +71,23 @@ Unity クライアント (PC/Windows)
 
 ```
 terraform/
-├── environments/dev/   # dev tfvars + main.tf
-├── environments/prod/  # prod tfvars + main.tf
+├── environments/
+│   ├── dev/                 # AWS dev（本番同等構成）。aws provider 単独
+│   ├── anywhere/            # GameLift Anywhere 検証用（開発専用）。awscc provider 単独
+│   └── prod/                # 未着手
 └── modules/
-    ├── vpc/            # VPC 10.0.0.0/16、パブリック/プライベートサブネット
-    ├── cognito/
-    ├── api_gateway/
-    ├── lambda/
-    ├── gamelift/
-    ├── dynamodb/
-    └── monitoring/
+    ├── dynamodb/            # 実装済
+    ├── iam/                 # 実装済（Lambda 実行ロールを用途別に2分割）
+    ├── gamelift_anywhere/   # 実装済（Anywhere 専用・awscc。開発検証用）
+    ├── lambda/              # 予定
+    ├── cognito/             # 予定
+    ├── api_gateway/         # 予定
+    ├── gamelift_ec2/        # 予定（本番同等の Managed EC2 フリート）
+    └── monitoring/          # 予定（Phase 6）
 ```
+
+- **`anywhere` 環境を分けている理由**: Anywhere は「自 PC を compute にする開発時の検証手段」で本番構成の部品ではない（本番は Managed EC2 + Spot）。dev の apply/destroy に検証用フリートを巻き込まないよう state を分離している。詳細は docs/qa-log.md §12。
+- **VPC モジュールは作らない**: Lambda は DynamoDB・GameLift をパブリックエンドポイントで呼べ、GameLift Managed EC2 は GameLift 管理の VPC で動くため、自前 VPC の使い所が無い。VPC に入れると NAT Gateway の時間課金（概算 月$60）が乗るだけになる。計画（docs/spec-architecture.md §2.1）からの変更点。判断の詳細は docs/qa-log.md §12。
 
 ### ローカル開発スタック (Docker Compose)
 
