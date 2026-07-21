@@ -1,9 +1,9 @@
-output "location_name" {
-  description = "カスタムロケーション名。"
-  value       = module.gamelift_anywhere.location_name
+output "dynamodb_table_names" {
+  description = "DynamoDB 論理名 => 実テーブル名。"
+  value       = module.dynamodb.table_names
 }
 
-output "fleet_id" {
-  description = "Anywhere フリート ID。"
-  value       = module.gamelift_anywhere.fleet_id
+output "dynamodb_table_arns" {
+  description = "DynamoDB 論理名 => テーブル ARN。"
+  value       = module.dynamodb.table_arns
 }

@@ -204,7 +204,8 @@ game session started: <gameSessionId> (quest=quest-rathalos roster=[p1 p2] psids
   - **G1 / G1-full**：`AcceptPlayerSession(psid)` / `RemovePlayerSession` を `GameLiftBridge` に配線済（commit 95c4ad5 / fb4b2f7）。psid の発行→提示→採用→observer 到達はローカル E2E で実パケット往復まで検証済。残るは実 GameLift による psid 承認（RESERVED→ACTIVE）の確認のみ。
   - **G2**：`matchmaking` の `GameLiftProvider`（実 `CreateGameSession` + `CreatePlayerSessions`）実装済（commit 9e8e6c4）。`match_status` Lambda が `GAMELIFT_FLEET_ID` 有無で実 Provider↔Stub を切替。
 - ⏭ **AWS dev E2E（次段）**：Lambda を実 AWS デプロイ→`GAMELIFT_FLEET_ID` を実フリートへ向け、マッチ成立で Lambda が自動 `CreateGameSession`＋`CreatePlayerSessions`→client が実 psid を提示して join→**`AcceptPlayerSession` が実 GameLift で承認される**まで通す（＝Phase 4 完了、psid 承認の実確認はここ）。
-- ✅ **Terraform 化（G3・2026-07-18 完了）**：location/fleet を `terraform/modules/gamelift` + `environments/dev` に **awscc(Cloud Control) provider** で IaC 化。classic `aws` provider は Anywhere 非対応（`aws_gamelift_location` 無し・`aws_gamelift_fleet` は EC2 専用）のため `awscc_gamelift_location` / `awscc_gamelift_fleet`(`compute_type=ANYWHERE`) を採用。`init`/`validate`/`fmt` 済＝**コード資産化・validate 止まり**（実 `apply` は AWS dev E2E 直前）。詳細は qa-log §11 実施メモ。
+- ✅ **Terraform 化（G3・2026-07-18 完了 / 2026-07-22 配置変更）**：location/fleet を `terraform/modules/gamelift_anywhere` + **`environments/anywhere`** に **awscc(Cloud Control) provider** で IaC 化。
+  当初 `environments/dev` に置いていたが、Anywhere は「環境=ローカル寄り × フリート種別=Anywhere」（§11 の2軸整理）に属する**開発用の検証手段**で本番構成の部品ではないため、本番同等を担う `environments/dev`（Managed EC2）から分離した。dev の apply/destroy に検証用フリートを巻き込まないことが分離の主目的。classic `aws` provider は Anywhere 非対応（`aws_gamelift_location` 無し・`aws_gamelift_fleet` は EC2 専用）のため `awscc_gamelift_location` / `awscc_gamelift_fleet`(`compute_type=ANYWHERE`) を採用。`init`/`validate`/`fmt` 済＝**コード資産化・validate 止まり**（実 `apply` は AWS dev E2E 直前）。詳細は qa-log §11 実施メモ。
 
 ---
 
