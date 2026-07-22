@@ -27,6 +27,17 @@ module "cognito" {
   tags        = var.tags
 }
 
+# ⚠ 唯一「立てているだけで時間課金」されるモジュール。E2E 後は必ず destroy すること。
+module "gamelift_ec2" {
+  source = "../../modules/gamelift_ec2"
+
+  name_prefix = "raidync-dev"
+  # scripts/build-gameserver.sh の出力先。apply 前に必ずビルドしておくこと。
+  build_dir = "${path.root}/../../../build/gameserver"
+
+  tags = var.tags
+}
+
 module "lambda" {
   source = "../../modules/lambda"
 
@@ -42,10 +53,10 @@ module "lambda" {
   auth_issuer    = module.cognito.issuer
   auth_client_id = module.cognito.client_id
 
-  # GameLift Managed EC2（ステップ6）を作ったら fleet_id を配線する。
-  # 空の間は match_status が GameLiftStub にフォールバックする。
-  # gamelift_fleet_id = module.gamelift_ec2.fleet_id
-  # GAMELIFT_LOCATION は Managed EC2 では空のままにする（Anywhere 用の値のため）。
+  # マッチ成立時に実 GameLift へセッションを作らせる。
+  # GAMELIFT_LOCATION は Managed EC2 では空のままにする（Anywhere 用の値のため。
+  # gamelift_provider.go の locationPtr が空なら Location を省略する）。
+  gamelift_fleet_id = module.gamelift_ec2.fleet_id
 
   tags = var.tags
 }
