@@ -49,3 +49,15 @@ module "lambda" {
 
   tags = var.tags
 }
+
+module "api_gateway" {
+  source = "../../modules/api_gateway"
+
+  name_prefix = "raidync-dev"
+  stage_name  = "dev"
+
+  lambda_invoke_arns    = module.lambda.invoke_arns
+  lambda_function_names = module.lambda.function_names
+
+  tags = var.tags
+}

@@ -13,6 +13,11 @@ output "lambda_function_names" {
   value       = module.lambda.function_names
 }
 
+output "api_invoke_url" {
+  description = "API のベース URL。E2E クライアントの接続先。"
+  value       = module.api_gateway.invoke_url
+}
+
 output "cognito_user_pool_id" {
   description = "Cognito User Pool ID。"
   value       = module.cognito.user_pool_id
