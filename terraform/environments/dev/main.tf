@@ -20,6 +20,13 @@ module "iam" {
   tags                = var.tags
 }
 
+module "cognito" {
+  source = "../../modules/cognito"
+
+  name_prefix = "raidync-dev"
+  tags        = var.tags
+}
+
 module "lambda" {
   source = "../../modules/lambda"
 
@@ -30,12 +37,13 @@ module "lambda" {
   authorizer_role_arn  = module.iam.authorizer_role_arn
   matchmaking_role_arn = module.iam.matchmaking_role_arn
 
-  # Cognito（ステップ4）と GameLift Managed EC2（ステップ6）を作ったら、
-  # それぞれの output をここに配線する。それまでは空＝authorizer は起動不可、
-  # match_status は GameLiftStub にフォールバックする。
-  # auth_jwks_url     = module.cognito.jwks_url
-  # auth_issuer       = module.cognito.issuer
-  # auth_client_id    = module.cognito.client_id
+  # authorizer の JWT 検証先を実 Cognito に向ける（mock-auth の置き換え）。
+  auth_jwks_url  = module.cognito.jwks_url
+  auth_issuer    = module.cognito.issuer
+  auth_client_id = module.cognito.client_id
+
+  # GameLift Managed EC2（ステップ6）を作ったら fleet_id を配線する。
+  # 空の間は match_status が GameLiftStub にフォールバックする。
   # gamelift_fleet_id = module.gamelift_ec2.fleet_id
   # GAMELIFT_LOCATION は Managed EC2 では空のままにする（Anywhere 用の値のため）。
 

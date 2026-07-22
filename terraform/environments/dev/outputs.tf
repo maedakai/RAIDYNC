@@ -12,3 +12,24 @@ output "lambda_function_names" {
   description = "Lambda 関数キー => 関数名。"
   value       = module.lambda.function_names
 }
+
+output "cognito_user_pool_id" {
+  description = "Cognito User Pool ID。"
+  value       = module.cognito.user_pool_id
+}
+
+output "cognito_client_id" {
+  description = "App Client ID。E2E の InitiateAuth に使う。"
+  value       = module.cognito.client_id
+}
+
+output "cognito_test_user_emails" {
+  description = "E2E テストユーザーのログイン ID 一覧。"
+  value       = module.cognito.test_user_emails
+}
+
+output "cognito_test_user_password" {
+  description = "E2E テストユーザーの共通パスワード。取得は terraform output -raw cognito_test_user_password。"
+  value       = module.cognito.test_user_password
+  sensitive   = true
+}
