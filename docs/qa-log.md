@@ -106,6 +106,30 @@ A.
 - **TTL** … 指定した時刻（epoch 秒）を過ぎたレコードを DynamoDB が自動削除。MatchmakingTickets は 90 秒で消える短命データ。
 - **Global Tables** … 複数リージョン間で自動レプリケーションするマルチマスター構成。Players/Sessions/MatchHistory は対象、短命で region-local な MatchmakingTickets は対象外。
 
+### Q. Terraform でテーブル名を固定名（`Players`）にしているのはなぜ? 論理名との違いは?
+
+A. まず 1 テーブルに 3 レイヤーの名前がある点を区別する。
+
+- **Terraform 論理名**（`aws_dynamodb_table.players` の `players`）… state 内だけの識別子。AWS には送られない。
+- **実テーブル名**（`name = "Players"`）… AWS 上の実体。SDK が `GetItem(TableName:"Players")` で叩くのはこれ。
+- **出力マップのキー**（`table_arns = { players = ... }`）… 下流モジュールへ渡すときのキー。論理名に揃えてあるだけ。
+
+設計上の論点は **実テーブル名の付け方**で、選択肢は 2 つ。
+
+| | A. 固定名 `Players`（採用） | B. プレフィックス `raidync-dev-Players` |
+|---|---|---|
+| アプリ側コード | 名前をハードコードできる（Go `db.DefaultTables()`） | 環境変数で注入が必要 |
+| 1 アカウントに複数環境 | 共存不可（dev と prod が同名を奪い合う） | 共存可 |
+| LocalStack との一致 | 一致（localstack-init も `Players`） | ずれる |
+
+**dynamodb だけ固定名**で、lambda / cognito / api_gateway など他モジュールは全て `name_prefix` 方式。一貫していないように見えるが、DynamoDB を固定名にした理由は 3 つ:
+
+1. Go の `internal/db.DefaultTables()` が実名を直書きしている。B にすると「Lambda 環境変数で注入 → Go 側で `os.Getenv` 差し替え」の配線追加が必須になり、本体コードまで巻き込む。
+2. LocalStack（`localstack-init.sh`）も同名で作るため、固定名だとローカルで書いた Go がそのまま AWS で動く。
+3. 運用が「dev を destroy してから prod」の 1 アカウント 1 環境なので、同名衝突が起きにくい。
+
+**B に切り替えるべき転換点**: dev と prod を同一アカウントに同時常駐させたくなったとき、または Phase 5 の Global Tables を環境別に分けたいとき。その場合は「Terraform を B 化」+「Lambda に `TABLE_*` を渡す」+「Go を `os.Getenv` フォールバック付きに」の 3 点セットが必要。実益（複数環境同居）が出るまでは固定名が妥当。
+
 ---
 
 ## 4. マッチングロジック
@@ -133,6 +157,34 @@ A. 主語を 1 つ補正すると正確になる。
 - **単独稼働は基本なし**: イベントソースは API Gateway のオーソライザ呼び出しのみ。EventBridge 定期実行・他サービスからの直接 invoke のような独立起動は設計に含めない。
 - **毎回起動するわけでもない**: API Gateway は判定結果（トークン→Allow/Deny ポリシー）を **Authorizer result TTL** の間キャッシュする。TOKEN 型なので `Authorization` ヘッダ値がキャッシュキー。同一トークンで TTL 内の再アクセスは authorizer を起動せずキャッシュを使う。例外的な単独起動はコールドスタート初期化やテストの手動 invoke 程度。
 - **未実装**: どのルートに attach するか/キャッシュ TTL は Terraform（Phase 1 `api_gateway` モジュール）で定義予定。現状コードは authorizer 自体（JWT 検証＋Allow/Deny ポリシー生成、`deny` は `Resource:"*"` の Deny・principalID=anonymous）のみ。
+
+### Q. テストユーザーは 3 種類ある? mock-auth / Terraform の Cognito テストユーザー / 実ユーザーの違いは?
+
+A. 認証まわりの「ユーザー」は目的の違う 3 層があり、混同しやすい。
+
+| | ① mock-auth のユーザー | ② Terraform の Cognito テストユーザー | ③ 実ユーザー |
+|---|---|---|---|
+| 用途 | ローカル E2E（①・ロジック検証。**済**） | AWS dev E2E（②・本物のサービス連携検証。未） | 本番の実プレイヤー |
+| 認証基盤 | mock-auth（`docker/mock-auth`, :9229） | 実 Cognito（`modules/cognito`） | 実 Cognito |
+| 作り方 | クライアントが起動時に signup→login（`cmd/client`）。**インメモリ・使い捨て** | Terraform が `aws_cognito_user` で事前作成 | クライアントから正規 signup |
+| メール検証 | 独自実装で省略 | `email_verified=true`+`SUPPRESS` で飛ばす | 検証メールのリンククリックが必要 |
+| 生存期間 | プロセス終了で消える | `apply`〜`destroy` | 恒久 |
+
+要点:
+- **①で使ったユーザーは AWS に存在しない**（mock-auth のメモリ上だけ）。②は実 Cognito 上に実体が要るので、この Terraform が初めて作る。
+- 「E2E は済んだ」は①（ロジック検証）の話。②（Cognito・Lambda・API GW・DynamoDB・GameLift が**本物同士で繋がるか**の配線検証）はこれから。
+
+### Q. ②の E2E は、テストユーザーを作らず「実ユーザー」ではダメ?
+
+A. 技術的には可能。Gmail 等で 4 アドレスを用意し、正規に signup→メール検証→MFA 設定→パスワード管理をやれば実ユーザーでも②は成立する（Cognito から見れば合成テストユーザーと区別はなく、同じ `InitiateAuth` で JWT が出て authorizer が検証できる）。
+
+**それをやらずテストユーザーを合成する理由は「手間削減」＋「再現性」**:
+- 4 人要る（1 セッション最大 4 人 = `protocol.MaxPartySize`）。実メール 4 つの用意は非現実的。
+- 実ユーザーの正規 signup は**メール検証リンクのクリック**が挟まり、無人 E2E を壊す。`email_verified=true`+`SUPPRESS` はこの手作業を最初から飛ばすための合成。
+- パスワードは `random_password` で使い捨て自動生成。実アカウントに E2E 用パスワードを持たせて state/スクリプトに置くのは筋が悪い。
+- `apply`/`destroy` で丸ごと作れて消せる。自分の実アカウントを Terraform 管理下に置くと `destroy` で消す事故につながる。IaC 徹底（CLAUDE.md）とも整合。
+
+つまり②が見たいのは「本物のサービスが繋がるか（配線）」なので、認証の入口だけは摩擦をゼロにしたい。実ユーザーの正規 signup フロー自体の検証は目的が別で、スコープを切り離している。
 
 ---
 
@@ -162,6 +214,22 @@ A.
 - ログは `log.Printf` 直書き（Phase 6 で構造化）。
 
 差し替え容易性: `SessionProvider` / `Store` インターフェースと `apigw.PlayerID` により、**簡略版を本番版へ無痛で挿せる構造**にしてある。
+
+### Q. IAM ロールの最小権限を「最大まで厳密に」しない理由は?
+
+A. Lambda 実行ロールは **2 本**（`terraform/modules/iam`）— authorizer 用（Logs のみ）と matchmaking 用（DynamoDB + GameLift + Logs）。後者は `match_request` / `match_status` / `match_cancel` / `match_history` / `session_end` の **5 関数で共有**している。
+
+厳密に最小権限を突き詰めれば、5 関数それぞれに専用ロールを作り「その関数が実際に呼ぶアクションだけ」に絞れる。例:
+- `session_end` は GameLift の `CreateGameSession` を呼ばない → GameLift 権限は不要。
+- `match_history` は `Query` しかしない → `PutItem` / `TransactWriteItems` は不要。
+
+それをやらず 2 分割で止めたのは **粒度の意図的な選択**:
+
+- **分割の主目的は達成済み**。「入口の authorizer を侵害されても DynamoDB/GameLift に到達できない」という attack surface の分離は、authorizer を切り出した時点で実現している。ここが最小権限で一番効く境界。
+- **5 分割は管理コストが実益を上回る**。ロール・ポリシー・変数・output が関数の数だけ増え、`lambda` モジュール側の配線も複雑化する。得られる追加の安全性（DynamoDB CRUD 系を触る一群の内側でのさらなる細分化）は、この一群が全て同じ信頼境界にある以上、限界的。
+- **アクション単位では既に絞ってある**。`DeleteItem` を外す（TTL 自動削除に委ねる）、GameLift を 2 アクションだけにする等、ロール内のアクションは最小化済み。粗いのは「ロールの本数」だけ。
+
+**さらに分割すべき転換点**: 特定関数だけ機微データ（決済・PII 等）を扱うようになったとき、または監査要件でアクションと関数の 1:1 対応を証明する必要が出たとき。現状のポートフォリオ用途では 2 分割で「最小権限を role で実証する」意図は十分伝わる。
 
 ---
 
@@ -831,3 +899,62 @@ client sendUDP: 受け取った psid を毎パケットの GameMessage.PlayerSes
 - **VPC/NAT 不要**：Lambda は DynamoDB・GameLift を**パブリックエンドポイント**で呼べる。VPC に入れると外部通信に NAT Gateway が要り、**時間課金（概算 ~$30/月）**が発生する。dev の目的（統合検証）に VPC は寄与しないため置かない。
 - **Route53 不要**：API Gateway の実行 URL を直叩き、GameLift は IP 直接接続で E2E は成立する。レイテンシールーティングは Phase 5（マルチリージョン）の担当。ホストゾーンは月額固定課金（概算 $0.50/ゾーン）。
 - 方針の一貫性：「**立てているだけで課金されるもの**を dev に置かない」。唯一の例外が GameLift Managed EC2 フリート（E2E に必須）で、これは検証後に必ず destroy する。
+
+### Q. Lambda を `for_each` で 6 関数まとめて作ると、1 関数だけ直しても全部再デプロイになる?
+
+**ならない。** `for_each` は 6 個を DRY に *書く* ための記法で、生成されるのは独立した 6 リソース（`aws_lambda_function.this["authorizer"]` …）。`terraform plan` はリソース単位で差分するので、仲間だからといってライフサイクルは連動しない。
+- 更新トリガーは各関数の `source_code_hash = data.archive_file.this[each.key].output_base64sha256`（`modules/lambda/main.tf`）。`each.key` ごとに `build/lambda/<関数名>/` の zip ハッシュが**独立**して入る。
+- よって「中身が変わった関数（＋その変更を取り込む関数）だけ `~ update`、残りは No changes」。for_each は連動再デプロイの原因ではない。
+- 実際に何が再デプロイされるかは **ビルドの決定性**次第（次項）。
+
+### Q. `build-lambdas.sh` が毎回 `rm -rf` して 6 個とも作り直すのは無駄では?
+
+感覚は正しいが、**無駄はローカル数秒に圧縮されていて AWS には波及しない**ので、現状は割に合った割り切り。
+
+- **Go のビルドキャッシュ（`$GOCACHE`）で大半が消える**：`rm -rf` が捨てるのは出力先 `build/lambda/` だけで、コンパイル成果物のキャッシュは別の場所に残る。1 関数だけ直したときに実際に走るのは「変わったパッケージの再コンパイル＋各関数の最終リンク」だけ。フルリビルドではない。Lambda バイナリは小さく体感数秒。
+- **AWS 課金・デプロイには一切響かない**：決定的ビルド（`-trimpath` / `-ldflags="-s -w"` / `CGO_ENABLED=0`、Go はデフォルトで時刻を埋めない）なので、触っていない関数はバイト同一 → zip ハッシュ同一 → plan で No changes。アップロードもデプロイも発生しない。無駄なのは手元の CPU 秒だけ。
+- **全ビルドが買っているもの**：`rm -rf` + 全ビルドは①stale バイナリが残らない②関数を改名/削除したとき孤児が残らない③結果が毎回同じ、をノーコストで保証する。
+- **選択ビルドにしない理由**：「変わった関数だけ」を bash でやると推移的依存（`internal/*` を変えたら import 元も作り直す）の追跡が要る。間違えると *古いバイナリのままデプロイ* ＝再ビルドの無駄より遥かに悪い事故。依存追跡は本来 Go のビルドキャッシュの仕事なので bash で再実装しない。
+- **最適化が割に合う転換点**：関数が数十個 / CI のビルド時間が課金直結 の規模。そのときの定石は Makefile のタイムスタンプ依存、CI の `git diff` パス検知、または**コードデプロイを Terraform から分離**（下項）。
+
+### Q. コード更新のたびに `terraform apply` する運用でいい?
+
+dev/検証フェーズはそれでよい（`source_code_hash` があるので apply がコード更新も担う）。ただし本番運用では**インフラ更新（Terraform）とコードデプロイ（CI）を分離**するのが定石。
+- 分離する理由：アプリのコード変更のたびに Terraform state を触りたくない／ロールバック・カナリアを Lambda のバージョン/エイリアスでやりたい。
+- 分離後の分担：Terraform は関数の「器」だけ作り、中身は CI が `aws lambda update-function-code` やコンテナイメージのタグ更新で差し替える。
+- 現状は**ポートフォリオ dev・更新頻度低・再現性優先**なので archive_file 方式が妥当。更新が頻繁になったら CI 分離へ移す段階論。
+
+### Q. API Gateway で REST API(v1) を選んだ理由は? HTTP API(v2) との違いは?
+
+**TOKEN 型カスタムオーソライザとより細かい制御を取るため v1 を選択**（`modules/api_gateway`）。
+- **v1(REST) の代償**：リソース階層・メソッド・統合・デプロイを全部明示的に書く必要がある。パスパラメータ（`{ticketId}` 等）も個別リソース。`main.tf` が長いのはこの冗長さゆえ。
+- **v2(HTTP) なら**：記述量は大幅に減り単価も安い。ただし v1 ほど細かいオーソライザ制御ができない。
+- **書き分け**：リソース階層は動的化しにくいのでベタ書き、メソッド/統合/権限は規則的なので `local.endpoints` + for_each で量産。冗長さの必然性がある所だけ手書き。
+- **ポートフォリオ観点**：REST API を正しく手組みできることを見せる意味もある。
+
+### Q. `aws_api_gateway_deployment` の `triggers` はなぜ必要?
+
+**API Gateway は「構成を変えてもデプロイし直さないと古いスナップショットが配信され続ける」罠があるため**（実際にハマりやすい）。
+- 対処：`triggers` に authorizer ID・全メソッドの `key:method:authorization`・全統合の `key:uri` を `sha1(jsonencode(...))` で畳み、**構成が変われば必ず再デプロイ**させる。
+- `create_before_destroy = true` でデプロイ差し替え時のダウンタイムを避ける。
+- 対比：lambda の `for_each` は「連動させない」設計だが、API Gateway のデプロイは全体で 1 スナップショットなので、逆に**全構成を 1 ハッシュに畳んで意図的に連動**させる。
+- dev 固有：`authorizer_result_ttl_in_seconds = 0` で検証結果をキャッシュせず挙動を追いやすくしている（§5 の TTL を dev では 0 に）。
+
+### Q. GameLift Build はなぜ「更新」でなく「作り直し」なのか?
+
+**GameLift の Build が不変（immutable）リソースだから**（`modules/gamelift_ec2`）。更新 API が無いので、内容が変わったら置き換えるしかない。
+- 仕組み：S3 オブジェクトのキーに `output_md5` を含め（`gameserver-<md5>.zip`）、Build の `version` も `substr(md5,0,12)`。**md5 が変われば S3 キーと Build version が同時に変わり、Build が作り直される**という二重連動。
+- パターンの対比：lambda は `source_code_hash` で**更新**、gamelift_build はハッシュで**置換**。「更新できないリソースはハッシュで作り直す」という定石。
+
+### Q. gamelift_ec2 だけ destroy 前提の運用なのはなぜ?
+
+**他モジュール（DynamoDB/Lambda/API GW/Cognito）が実質従量課金なのに対し、Managed EC2 フリートだけが「ACTIVE な間ずっとインスタンス時間課金」される唯一の性質のため**（プレイヤー 0 でも課金）。
+- この非対称性が設計全体を規定：`force_destroy=true`（バケット中身ごと 1 コマンド後片付け）、`NoProtection`（Spot 中断・整理を妨げない）、capacity は desired=1 最小、E2E 後は必ず destroy。
+- CLAUDE.md の $200 制約／「立てているだけで課金されるものを dev に置かない」方針の唯一の例外で、E2E に必須だから置くが検証後は即畳む。
+
+### Q. フリートの capacity（desired/min/max・オートスケール）を Terraform で管理しないのはなぜ?
+
+**`aws_gamelift_fleet` に該当引数が無く、`UpdateFleetCapacity` API の領分だから**（Terraform の守備範囲外）。
+- 作成時は GameLift 既定の desired=1 になる。dev E2E はこれで足りるため追従しない。
+- オートスケール（spec §2.2 の min1/max20）は Phase 6 の担当。
+- 「IaC 100%」を掲げつつ、API の領分は正直に外す線引き。カバー率100%＝*存在するリソースが管理下にある*であって、*API 操作まで Terraform に押し込む*ことではない。
