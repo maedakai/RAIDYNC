@@ -152,3 +152,72 @@ docker compose -f docker/docker-compose.yml down
 
 - **ポート使用中**
   既存プロセスを止めるか、localapi は `$env:LOCALAPI_ADDR` / `$env:GAMESERVER_BIND_ADDR`、client は `-api` で変更可能。
+
+---
+
+# AWS dev E2E：フリート削除手順（重要）
+
+> ここから下は**ローカル E2E ではなく、`terraform apply` した AWS dev 環境**の後片付け。
+> GameLift Managed EC2 フリートは **ACTIVE な間ずっとインスタンス時間課金**される唯一のリソース（プレイヤー 0 でも課金）。
+> E2E が終わったら**必ず**削除すること。他リソース（DynamoDB/Lambda/API GW/Cognito/S3）は実質従量課金なので、最優先で止めるべきはフリート。
+>
+> リージョンは `ap-northeast-1`、対象は `raidync-dev-fleet`（S3 バケットは `raidync-dev-gamelift-build-444952542001`）。
+
+## 方法A：Terraform で環境ごと destroy（推奨）
+
+構成全体を IaC の逆順で畳む。フリート単体でなく apply したもの全部を消すのが基本。
+
+```powershell
+cd C:\work\RAIDYNC
+terraform -chdir=terraform/environments/dev destroy -var-file=dev.tfvars
+```
+
+注意:
+- **フリート削除は数分〜15分かかる**（`DELETING` → インスタンス終了で課金停止）。**途中で Ctrl+C しない**（中断するとフリートが残り課金が続く）。
+- apply 直後でフリートが `ACTIVATING` 中だと `DeleteFleet` が弾かれることがある。**`ACTIVE` になってから** destroy する。
+- 途中でエラーになったら**同じ destroy を再実行**すれば残りだけ消える（state ベースで冪等）。
+- state 分離のため、この destroy は `anywhere` 環境には触れない。
+
+## 方法B：AWS コンソール（GUI）でフリートだけ削除
+
+Terraform を使わず GUI で今回のフリートを手動削除する場合。**IaC 状態と乖離する**ので、原則は方法A。GUI 操作は `raidync-admin`（MFA 付き）でログインして行う。
+
+1. リージョンを **東京（ap-northeast-1）** に切り替える（画面右上）。
+2. **Amazon GameLift** コンソール → 左メニュー **Hosting → Fleets**。
+3. `raidync-dev-fleet` を選択 → **Actions → Delete**。
+4. 確認ダイアログでフリート名を入力 → **Delete**。ステータスが **DELETING** に変わる。
+5. 数分待ち、一覧から消える（＝インスタンス終了・課金停止）まで確認する。
+6. （任意）**Builds** から `raidync-dev-gameserver` も削除。
+7. **S3** コンソール → `raidync-dev-gamelift-build-444952542001` を空にして削除（Build zip が残っていると微少だが課金対象）。
+
+> GUI でフリートだけ消すと Terraform state には「まだ在る」と記録が残る。次に方法Aを使うときは `terraform destroy` が「既に無い」を検知して整合するが、混乱を避けるため**GUI 削除後は state を捨てる（未 apply からやり直す）か、`terraform refresh` で同期する**こと。
+
+## 方法C：AWS CLI でフリートだけ削除（緊急/フォールバック）
+
+state が壊れて方法Aが使えない、または課金を今すぐ止めたいときの最短手段。
+
+```powershell
+# 1. 今回のフリート ID を確認
+aws gamelift describe-fleet-attributes --region ap-northeast-1 `
+  --query "FleetAttributes[?Name=='raidync-dev-fleet'].[FleetId,Status]" --output table
+
+# 2. フリート削除（課金源を止める）
+aws gamelift delete-fleet --fleet-id <上で得た FleetId> --region ap-northeast-1
+
+# 3. Build 配布バケットを中身ごと削除
+aws s3 rb s3://raidync-dev-gamelift-build-444952542001 --force
+```
+
+## 削除後の独立検証（必須）
+
+「完了」表示を信じるだけでなく、課金源が本当に消えたかを直接確認する。
+
+```powershell
+# フリートが消えたか（該当なし が正常）
+aws gamelift list-fleets --region ap-northeast-1
+
+# Build 配布バケットが消えたか（出力が空 が正常）
+aws s3 ls | Select-String raidync-dev-gamelift-build
+```
+
+どちらも空なら課金源は停止。残っていたら方法C で個別に削除する。
