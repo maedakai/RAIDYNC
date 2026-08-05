@@ -37,6 +37,7 @@ type config struct {
 	apiURL      string
 	email       string
 	password    string
+	token       string
 	questID     string
 	soloAllowed bool
 	moves       int
@@ -94,6 +95,7 @@ func parseFlags() config {
 	flag.StringVar(&cfg.apiURL, "api", "http://localhost:8080", "localapi base URL")
 	flag.StringVar(&cfg.email, "email", "player1@example.com", "login email")
 	flag.StringVar(&cfg.password, "password", "password123", "login password")
+	flag.StringVar(&cfg.token, "token", "", "事前取得済み JWT を直接使う（設定時は mock-auth を迂回）。AWS dev E2E で実 Cognito の id_token を渡す用")
 	flag.StringVar(&cfg.questID, "quest", "quest-rathalos", "quest id to matchmake for")
 	flag.BoolVar(&cfg.soloAllowed, "solo", true, "allow immediate solo match (single-client E2E)")
 	flag.IntVar(&cfg.moves, "moves", 10, "number of PLAYER_MOVE packets to send during play")
@@ -125,6 +127,17 @@ func newClient(cfg config) *client {
 // authenticate は mock-auth に対して signup（既存なら 409 を許容）→ login を行い、
 // playerID と idToken を確立する。
 func (c *client) authenticate(ctx context.Context) error {
+	// -token 指定時は mock-auth を通さず、渡された JWT をそのまま使う。
+	// AWS dev E2E で実 Cognito の id_token を注入するための経路。
+	if c.cfg.token != "" {
+		c.idToken = c.cfg.token
+		sub, err := subjectFromJWT(c.cfg.token)
+		if err != nil {
+			return fmt.Errorf("extract subject from -token: %w", err)
+		}
+		c.playerID = sub
+		return nil
+	}
 	if err := c.signup(ctx); err != nil {
 		return err
 	}

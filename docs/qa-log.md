@@ -989,8 +989,17 @@ dev/検証フェーズはそれでよい（`source_code_hash` があるので ap
 **バグではない。** GameLift Anywhere で切り分けて実証した:
 - Anywhere（Windows, `go run`）で `InitSDK→ProcessReady→OnStartGameSession` 成功 ＝ **コードは正しい**（G4 達成）。
 - 同じ **linux/amd64 バイナリを WSL Ubuntu で実行**しても実 GameLift に ProcessReady 成功 ＝ **バイナリも正しい**。
-- 同一バイナリが Managed EC2 上でのみ失敗 → 原因は **インスタンス上のローカル GameLift エージェントへの接続経路（環境固有）** に限定。`InitSDKFromEnvironment()` がローカルエージェントに繋げず `log.Fatalf`（CRASHED）/接続待ち（SDK_INIT_TIMEOUT）。
-- 確定には**インスタンス内の SDK ログ**（`gamelift-server-sdk-<procid>.log`）が要る。取得には fleet に TCP22 を開けて `get-instance-access` する必要がある（別タスク）。
+- 同一バイナリが Managed EC2 上でのみ失敗 → 一旦「環境固有（ローカルエージェント接続）」と切り分けた。
+- **真の原因は結局 `output_file_mode` だった（2026-08-05 解決）**: 実行ビットを付けた新 Build（output_file_mode=0755）でフリートを作り直したら **一発で ACTIVE・健全**（SERVER_PROCESS エラー皆無、ACTIVE=1/IDLE=1）。旧 Build の非実行ビットが CRASHED/SDK_INIT_TIMEOUT の元凶で、INVALID_PATH と同じパッケージング問題の別症状だった。**「環境固有の謎」ではなくパッケージング**と確定。インスタンスログ取得（TCP22+get-instance-access）は不要になった。
+  - 補足: SDK 5+ フリートは `get-instance-access`(SSH) 非対応で `get-compute-access`(SSM) を使う。その一時認証は `ssm:StartSession` のみ許可で `send-command` 不可、かつインスタンスは GameLift アカウント(902107009410)配下＝自 SSM 在庫外。SSM 経由ログ取得は session-manager-plugin 必須で手間。結局 output_file_mode で解決したため不要。
+
+### Q. AWS dev E2E（実 Cognito→実 API GW→実 GameLift）は通った?
+
+**ほぼ完走（2026-08-05）。Phase 4 の核心「実 GameLift での psid 承認」を達成**。
+- cmd/client に `-token` を追加（mock-auth を迂回し実 Cognito の id_token を注入）。トークンは `aws cognito-idp initiate-auth --auth-flow USER_PASSWORD_AUTH` で取得（client の ExplicitAuthFlows に USER_PASSWORD_AUTH あり）。
+- 通った経路: 実 Cognito 認証（playerId=Cognito sub）→ match/request（API GW→Lambda→DynamoDB）→ マッチ成立で Lambda が実 GameLift に **CreateGameSession + CreatePlayerSessions** → connect=`52.195.186.162:7777` / psid 取得 → UDP 接続 → **SESSION_STATE ×24 受信**（＝サーバーが roster 登録し `AcceptPlayerSession(psid)` を実 GameLift で承認・状態配信）→ プレイ送信。**AcceptPlayerSession の実承認確認が Phase 4 最大の未検証項目で、ここで達成**。
+- **残り 1 手の既知バグ**: `POST /session/{sessionId}/end` が 403 "Missing Authentication Token"。認証でなくルーティング問題。実 GameLift の `GameSessionId` は `arn:aws:gamelift:...::gamesession/fleet-.../gsess-...` と**スラッシュ入り ARN**で、`/session/{sessionId}/end` のパスに入れると余分セグメントになり API GW がルート不一致→403。ローカルは `sess-xxx`（スラッシュ無し）で顕在化せず。
+  - 修正方針（次セッション）: セッション ID を `gsess-xxx` に正規化（UDP 用 ARN / HTTP パス / DynamoDB キーの一貫性を設計）。または session/end のセッション ID をパスでなく body/クエリで渡す。Lambda 側中心の修正で、フリート再作成は不要な見込み。
 
 ### Q. 失敗フリートの後始末で詰まった点は?（運用ハマり）
 
