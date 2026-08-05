@@ -1,0 +1,69 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ProjectServicesFullOnUsedNamespaces",
+      "Effect": "Allow",
+      "Action": [
+        "dynamodb:*",
+        "cognito-idp:*",
+        "apigateway:*",
+        "lambda:*",
+        "gamelift:*",
+        "logs:*"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "CloudControlApiForAwsccGameLiftBuild",
+      "Effect": "Allow",
+      "Action": [
+        "cloudformation:CreateResource",
+        "cloudformation:GetResource",
+        "cloudformation:UpdateResource",
+        "cloudformation:DeleteResource",
+        "cloudformation:ListResources",
+        "cloudformation:GetResourceRequestStatus",
+        "cloudformation:CancelResourceRequest"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "S3ForGameLiftBuildBucket",
+      "Effect": "Allow",
+      "Action": "s3:*",
+      "Resource": [
+        "arn:aws:s3:::raidync-dev-gamelift-build-444952542001",
+        "arn:aws:s3:::raidync-dev-gamelift-build-444952542001/*"
+      ]
+    },
+    {
+      "Sid": "IamRolesScopedToProject",
+      "Effect": "Allow",
+      "Action": [
+        "iam:CreateRole",
+        "iam:DeleteRole",
+        "iam:GetRole",
+        "iam:PassRole",
+        "iam:TagRole",
+        "iam:UntagRole",
+        "iam:ListRoleTags",
+        "iam:PutRolePolicy",
+        "iam:GetRolePolicy",
+        "iam:DeleteRolePolicy",
+        "iam:ListRolePolicies",
+        "iam:AttachRolePolicy",
+        "iam:DetachRolePolicy",
+        "iam:ListAttachedRolePolicies",
+        "iam:ListInstanceProfilesForRole"
+      ],
+      "Resource": "arn:aws:iam::444952542001:role/raidync-dev-*"
+    },
+    {
+      "Sid": "Sts",
+      "Effect": "Allow",
+      "Action": "sts:GetCallerIdentity",
+      "Resource": "*"
+    }
+  ]
+}

@@ -32,8 +32,12 @@ echo "building gameserver -> ${OUT_DIR}/gameserver"
 # あるため、ここで確実に付け直す。
 cat > "$OUT_DIR/install.sh" <<'EOF'
 #!/bin/sh
-set -e
-chmod +x /local/game/gameserver /local/game/start.sh
+# GameLift は Build 展開後にこれを実行する。zip はファイルの実行権限を保持しないため付け直す。
+# set -e で chmod の部分失敗により install 全体が exit 1 で落ちる事故を避け、必ず 0 で終える
+# （実行権限が付かず launch に失敗した場合は、後段の SERVER_PROCESS 系イベントで具体化する）。
+cd /local/game 2>/dev/null || true
+chmod +x gameserver start.sh 2>/dev/null || true
+exit 0
 EOF
 
 # 起動ラッパー。GAMELIFT_ENABLED=true で GameLiftBridge を有効化し、

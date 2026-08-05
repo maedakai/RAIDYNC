@@ -58,6 +58,12 @@ variable "operating_system" {
   default     = "AMAZON_LINUX_2023"
 }
 
+variable "server_sdk_version" {
+  description = "ゲームサーバーが使う GameLift Server SDK のバージョン。AL2023 は 5.0 以上が必須。cmd/gameserver が依存する Go 版 SDK（amazon-gamelift-servers-go-server-sdk）の SdkVersion 定数に合わせる。"
+  type        = string
+  default     = "5.3.0"
+}
+
 variable "tags" {
   description = "共通タグ。"
   type        = map(string)

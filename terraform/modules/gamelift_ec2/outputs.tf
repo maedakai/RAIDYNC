@@ -10,7 +10,7 @@ output "fleet_arn" {
 
 output "build_id" {
   description = "GameLift Build ID。"
-  value       = aws_gamelift_build.this.id
+  value       = awscc_gamelift_build.this.build_id
 }
 
 output "build_bucket" {

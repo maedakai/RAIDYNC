@@ -13,6 +13,8 @@ bin/
 build/
 # GameLift Server SDK ランタイムログ
 server/logs/
+# GameLift Server SDK ランタイムログ（リポジトリ直下 cwd 実行時。Anywhere 手元検証で発生）
+logs/
 # ローカルに置いた Go インストーラ tarball（リポジトリに含めない）
 server/go*.tar.gz
 server/go*.tar.gz.*

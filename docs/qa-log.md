@@ -958,3 +958,42 @@ dev/検証フェーズはそれでよい（`source_code_hash` があるので ap
 - 作成時は GameLift 既定の desired=1 になる。dev E2E はこれで足りるため追従しない。
 - オートスケール（spec §2.2 の min1/max20）は Phase 6 の担当。
 - 「IaC 100%」を掲げつつ、API の領分は正直に外す線引き。カバー率100%＝*存在するリソースが管理下にある*であって、*API 操作まで Terraform に押し込む*ことではない。
+
+### Q. 初回 apply が全リソース `AccessDenied`。どう対処した?（デプロイ用 IAM 権限）
+
+`raidync-cli` は Anywhere 検証・読み取り中心で先行作成したユーザーで、フル構成をプロビジョニングする権限が無かった。`AdministratorAccess` は使わず、**使う 8 サービスに絞った最小権限ポリシー**（`terraform/bootstrap/raidync-cli-deploy-policy.json`）を作成してアタッチした。
+- 許可: `dynamodb/cognito-idp/apigateway/lambda/gamelift/logs`（フルアクション・Resource `*`）、`s3`（Build バケット限定）、`iam`（`raidync-dev-*` ロール限定＋`PassRole`）、`sts:GetCallerIdentity`。
+- **CREATE 権限は plan では検証できない**（plan は作成 API を呼ばない）。事前検証は **IAM Policy Simulator**（`simulate-principal-policy`。副作用なし）を使う。
+- Administrator より大幅に狭く「EC2/RDS/課金/他ユーザーに触れない」ことを担保。ポートフォリオ上「デプロイ identity を最小権限設計した」証跡になる。
+
+### Q. awscc を使うと `cloudformation:CreateResource` が AccessDenied になった。なぜ?
+
+**awscc(Cloud Control) provider は内部で CloudFormation の Cloud Control API を経由する**ため。絞り込みポリシーに `cloudformation` の Cloud Control 7 アクション（`CreateResource`/`GetResource`/`UpdateResource`/`DeleteResource`/`ListResources`/`GetResourceRequestStatus`/`CancelResourceRequest`）を足して解決。awscc を 1 つでも使うと必要になる、provider 全般の性質。
+
+### Q. `aws_gamelift_build` の CreateBuild が「AL2023 は SDK 5.0 未満で非対応」で失敗。原因は?
+
+**classic `aws_gamelift_build` は `server_sdk_version` を公開しておらず**（属性は name/operating_system/version/tags/storage_location のみ）、既定 4.0.2 扱いになるため。AL2023 × SDK 5.x（本プロジェクトの Go サーバー SDK 5.3.0）の Build を作れない。
+- 対策: **Build のみ `awscc_gamelift_build`** に切替（`server_sdk_version` を持つ）。Fleet は EC2 専用引数のため classic `aws_gamelift_fleet` のまま、`build_id` で参照。
+- これで CLAUDE.md の「Anywhere だけが awscc を要する」は不正確と判明。**Managed EC2 の Build も awscc が要る**。
+- awscc は `storage_location`/`tags` が nested block でなく object 属性、tags は `{key,value}` のリスト形式で、aws provider と書式が違う点に注意。
+
+### Q. Fleet が `SERVER_PROCESS_INVALID_PATH` で ERROR。原因は?
+
+**Windows で生成したファイルは実行ビットを持たず、`archive_file` がそのまま zip 化するため展開後 `gameserver`/`start.sh` が非実行**になり、GameLift が起動できない。
+- 対策: `data "archive_file"` に **`output_file_mode = "0755"`**（全ファイルに実行権限を保証する archive_file の正規機能。install.sh の chmod に依存しなくなる）。
+- 前段の installer 失敗（`FLEET_CREATION_FAILED_INSTALLER` exit 1）は install.sh の `set -e`+chmod が部分失敗で全体を落としていたもので、堅牢化（`|| true; exit 0`）で回避済み。
+- 失敗の段階順: installer(exit1) → INVALID_PATH → SERVER_PROCESS_CRASHED/SDK_INIT_TIMEOUT、と一段ずつ表面化した。
+
+### Q. Managed EC2 で gameserver が SDK 初期化に失敗（CRASHED/SDK_INIT_TIMEOUT）。コードのバグ?
+
+**バグではない。** GameLift Anywhere で切り分けて実証した:
+- Anywhere（Windows, `go run`）で `InitSDK→ProcessReady→OnStartGameSession` 成功 ＝ **コードは正しい**（G4 達成）。
+- 同じ **linux/amd64 バイナリを WSL Ubuntu で実行**しても実 GameLift に ProcessReady 成功 ＝ **バイナリも正しい**。
+- 同一バイナリが Managed EC2 上でのみ失敗 → 原因は **インスタンス上のローカル GameLift エージェントへの接続経路（環境固有）** に限定。`InitSDKFromEnvironment()` がローカルエージェントに繋げず `log.Fatalf`（CRASHED）/接続待ち（SDK_INIT_TIMEOUT）。
+- 確定には**インスタンス内の SDK ログ**（`gamelift-server-sdk-<procid>.log`）が要る。取得には fleet に TCP22 を開けて `get-instance-access` する必要がある（別タスク）。
+
+### Q. 失敗フリートの後始末で詰まった点は?（運用ハマり）
+
+- **ERROR フリートがフリート枠(quota)を占有**し、次の Fleet 作成（CreateFleet）がリトライループで進まない（「Still creating」のまま）。古い ERROR フリートを `delete-fleet` すると枠が空いて新フリート作成が成立した。
+- **`ACTIVATING` 中のフリートは `delete-fleet` も `update-fleet-capacity` での縮退も効かない**（`InvalidRequestException`）。リトライを使い切って ERROR になるまで（起動から最大 ~60 分）待つしかなく、その間インスタンス課金が続く。監視して ERROR/DELETING 到達で自動削除する運用にした。
+- Managed EC2 の 1 サイクル（build→fleet→ERROR）は 5〜15 分と重く、ログも取りにくい。**SDK 契約の検証は Anywhere（手元・フルログ・無料）で先に済ませる**のが正しい順序、という教訓。
