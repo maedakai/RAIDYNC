@@ -72,17 +72,17 @@ Unity クライアント (PC/Windows)
 ```
 terraform/
 ├── environments/
-│   ├── dev/                 # AWS dev（本番同等構成）。aws provider 単独
+│   ├── dev/                 # AWS dev（本番同等構成）。aws + awscc（Build のみ）
 │   ├── anywhere/            # GameLift Anywhere 検証用（開発専用）。awscc provider 単独
 │   └── prod/                # 未着手
 └── modules/
     ├── dynamodb/            # 実装済
     ├── iam/                 # 実装済（Lambda 実行ロールを用途別に2分割）
     ├── gamelift_anywhere/   # 実装済（Anywhere 専用・awscc。開発検証用）
-    ├── lambda/              # 予定
-    ├── cognito/             # 予定
-    ├── api_gateway/         # 予定
-    ├── gamelift_ec2/        # 予定（本番同等の Managed EC2 フリート）
+    ├── lambda/              # 実装済（6 関数: authorizer, match-request/status/cancel, session-create/end）
+    ├── cognito/             # 実装済
+    ├── api_gateway/         # 実装済（REST API v1）
+    ├── gamelift_ec2/        # 実装済（Managed EC2 フリート。Build のみ awscc — server_sdk_version が classic aws に無いため）
     └── monitoring/          # 予定（Phase 6）
 ```
 
