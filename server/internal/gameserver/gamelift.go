@@ -9,6 +9,7 @@ import (
 	"github.com/amazon-gamelift/amazon-gamelift-servers-go-server-sdk/server"
 
 	"github.com/raidync/server/internal/game"
+	"github.com/raidync/server/pkg/protocol"
 )
 
 // GameLiftBridge は GameLift Server SDK 5.x のライフサイクルを Hub に橋渡しする。
@@ -115,15 +116,19 @@ func (b *GameLiftBridge) enqueue(e playerEvent) {
 // プレイヤー接続受け入れ可能（ActivateGameSession）を通知する。
 func (b *GameLiftBridge) onStartGameSession(gs model.GameSession) {
 	questID, roster, playerSessions := parseSessionConfig(gs)
-	b.hub.Register(game.NewSession(gs.GameSessionID, questID, roster, nowMs(),
+	// GameLift SDK は GameSessionID を ARN で渡す。Lambda 側（gamelift_provider.go）が
+	// 同じ正規化でショート ID（gsess-xxx）を DynamoDB / クライアントへ配っているため、
+	// Hub のルーティングキーもショート ID に揃える（不一致だと ErrSessionNotFound になる）。
+	sessionID := protocol.NormalizeGameSessionID(gs.GameSessionID)
+	b.hub.Register(game.NewSession(sessionID, questID, roster, nowMs(),
 		game.WithPlayerObserver(b),
 		game.WithPlayerSessions(playerSessions),
 	))
 	if err := server.ActivateGameSession(); err != nil {
-		log.Printf("ActivateGameSession %s: %v", gs.GameSessionID, err)
+		log.Printf("ActivateGameSession %s: %v", sessionID, err)
 		return
 	}
-	log.Printf("game session started: %s (quest=%s roster=%v psids=%d)", gs.GameSessionID, questID, roster, len(playerSessions))
+	log.Printf("game session started: %s (quest=%s roster=%v psids=%d)", sessionID, questID, roster, len(playerSessions))
 }
 
 // onProcessTerminate は GameLift からの停止要求（Spot 中断/スケールダウン）で呼ばれる。
