@@ -966,6 +966,23 @@ dev/検証フェーズはそれでよい（`source_code_hash` があるので ap
 - **CREATE 権限は plan では検証できない**（plan は作成 API を呼ばない）。事前検証は **IAM Policy Simulator**（`simulate-principal-policy`。副作用なし）を使う。
 - Administrator より大幅に狭く「EC2/RDS/課金/他ユーザーに触れない」ことを担保。ポートフォリオ上「デプロイ identity を最小権限設計した」証跡になる。
 
+### Q. awscc とはそもそも何?（classic aws provider との違い）
+
+**`hashicorp/awscc` = AWS Cloud Control provider。classic `hashicorp/aws` とは別物の、もう一つの公式 AWS provider**（HashiCorp と AWS の共同）。同じ AWS リソースを作る手段が 2 系統ある。
+
+| | `aws`(classic) | `awscc`(Cloud Control) |
+|---|---|---|
+| 中身の作られ方 | **人間が手書き** | **CloudFormation リソーススキーマから自動生成** |
+| 呼ぶ API | `CreateBuild` 等サービス固有 API | **Cloud Control API** の汎用 CRUD（`CreateResource`/`GetResource`/`UpdateResource`/`DeleteResource`） |
+| 新機能への追従 | 遅い（実装待ち） | **速い**（CFN スキーマ更新に自動追従） |
+| 書き心地・成熟度 | 良い / 高い | 悪い / 粗い |
+
+- **今回まさにこのトレードオフを踏んだ**: `server_sdk_version` は比較的新しく classic 未実装、awscc は自動生成ゆえ最初から所持 → Build のみ awscc に切替。
+- **書式差は自動生成の副作用**: nested block でなく object 属性（`storage_location = { ... }`）、`tags` は map でなく **CFN 生表現の `[{key,value}]` リスト**（classic なら人間が map に整えている部分が素通しになる）。本プロジェクトは `tags = [for k, v in var.tags : { key = k, value = v }]` で変換。命名も `awscc_` と別名前空間。
+- **CloudFormation スタックは作られない**: Cloud Control API は「CFN が内部で使うリソース定義と操作」をスタック抜きで単体実行できるよう外出しした API。CFN コンソールには何も出ず、state は従来どおり Terraform が持つ。**IAM の権限名だけが `cloudformation:*` で顔を出す**（下記 AccessDenied の理由）。
+- **IAM は二重に要る**: Cloud Control 権限だけでは不足で、実際に作る裏側のサービス権限（`gamelift:CreateBuild` 等）も併せて必要。
+- **混在が正解**: 同一構成で併用・相互参照可（`aws_gamelift_fleet.build_id = awscc_gamelift_build.this.build_id`）。awscc はデータソースが少なく `aws_iam_policy_document` 相当も無いため、**「classic に無い属性が要るリソースだけ awscc」の部分採用**が定石。全面移行はしない。
+
 ### Q. awscc を使うと `cloudformation:CreateResource` が AccessDenied になった。なぜ?
 
 **awscc(Cloud Control) provider は内部で CloudFormation の Cloud Control API を経由する**ため。絞り込みポリシーに `cloudformation` の Cloud Control 7 アクション（`CreateResource`/`GetResource`/`UpdateResource`/`DeleteResource`/`ListResources`/`GetResourceRequestStatus`/`CancelResourceRequest`）を足して解決。awscc を 1 つでも使うと必要になる、provider 全般の性質。
