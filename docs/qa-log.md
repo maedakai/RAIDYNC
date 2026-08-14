@@ -1015,8 +1015,8 @@ dev/検証フェーズはそれでよい（`source_code_hash` があるので ap
 **ほぼ完走（2026-08-05）。Phase 4 の核心「実 GameLift での psid 承認」を達成**。
 - cmd/client に `-token` を追加（mock-auth を迂回し実 Cognito の id_token を注入）。トークンは `aws cognito-idp initiate-auth --auth-flow USER_PASSWORD_AUTH` で取得（client の ExplicitAuthFlows に USER_PASSWORD_AUTH あり）。
 - 通った経路: 実 Cognito 認証（playerId=Cognito sub）→ match/request（API GW→Lambda→DynamoDB）→ マッチ成立で Lambda が実 GameLift に **CreateGameSession + CreatePlayerSessions** → connect=`52.195.186.162:7777` / psid 取得 → UDP 接続 → **SESSION_STATE ×24 受信**（＝サーバーが roster 登録し `AcceptPlayerSession(psid)` を実 GameLift で承認・状態配信）→ プレイ送信。**AcceptPlayerSession の実承認確認が Phase 4 最大の未検証項目で、ここで達成**。
-- **残り 1 手の既知バグ**: `POST /session/{sessionId}/end` が 403 "Missing Authentication Token"。認証でなくルーティング問題。実 GameLift の `GameSessionId` は `arn:aws:gamelift:...::gamesession/fleet-.../gsess-...` と**スラッシュ入り ARN**で、`/session/{sessionId}/end` のパスに入れると余分セグメントになり API GW がルート不一致→403。ローカルは `sess-xxx`（スラッシュ無し）で顕在化せず。
-  - 修正方針（次セッション）: セッション ID を `gsess-xxx` に正規化（UDP 用 ARN / HTTP パス / DynamoDB キーの一貫性を設計）。または session/end のセッション ID をパスでなく body/クエリで渡す。Lambda 側中心の修正で、フリート再作成は不要な見込み。
+- **残り 1 手だったバグ（修正済み）**: `POST /session/{sessionId}/end` が 403 "Missing Authentication Token"。認証でなくルーティング問題。実 GameLift の `GameSessionId` は `arn:aws:gamelift:...::gamesession/fleet-.../gsess-...` と**スラッシュ入り ARN**で、`/session/{sessionId}/end` のパスに入れると余分セグメントになり API GW がルート不一致→403。ローカルは `sess-xxx`（スラッシュ無し）で顕在化せず。
+  - **修正（2026-08-14）**: `NormalizeGameSessionID` を `pkg/protocol` に追加し、ARN 末尾の `gsess-xxx` をショート ID として抽出。Lambda 側（`gamelift_provider.go`: CreatePlayerSessions 後に正規化して返す）とゲームサーバ側（`gamelift.go`: onStartGameSession で Hub 登録前に正規化）の 2 箇所で適用。Hub のルーティングキー（`msg.SessionID` で lookup）・DynamoDB PK・HTTP パス・UDP メッセージの SessionID が一貫してショート ID になり、フリート再作成は不要。
 
 ### Q. 失敗フリートの後始末で詰まった点は?（運用ハマり）
 
