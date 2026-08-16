@@ -19,3 +19,10 @@ output "table_arns" {
     matchmaking_tickets = aws_dynamodb_table.matchmaking_tickets.arn
   }
 }
+
+output "global_tables" {
+  description = "Global Tables 化したテーブルと、そのレプリカ配置先リージョン（検証・ドキュメント用）。"
+  value = local.global_tables_enabled ? {
+    for name in ["Players", "Sessions", "MatchHistory"] : name => var.replica_regions
+  } : {}
+}

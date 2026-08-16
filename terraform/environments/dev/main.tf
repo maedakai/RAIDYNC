@@ -10,7 +10,10 @@ module "dynamodb" {
   # dev は叩いた分だけの従量課金・PITR 無効でコストを抑える（モジュール既定と同じ）。
   billing_mode           = "PAY_PER_REQUEST"
   point_in_time_recovery = false
-  tags                   = var.tags
+  # Phase 5: Players / Sessions / MatchHistory を us-east-1 へレプリケーションする。
+  # レプリカ自体に固定費は無く、書き込み（rWCU）と保存量の従量課金のみ。
+  replica_regions = var.replica_regions
+  tags            = var.tags
 }
 
 module "iam" {

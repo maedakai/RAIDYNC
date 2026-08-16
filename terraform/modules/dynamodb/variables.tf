@@ -15,6 +15,20 @@ variable "point_in_time_recovery" {
   default     = false
 }
 
+variable "replica_regions" {
+  description = <<-EOT
+    Global Tables のレプリカを置くリージョン一覧（プライマリ以外）。例: ["us-east-1"]。
+    既定は空＝単一リージョン構成（Phase 4 までの挙動）。空でない場合のみ DynamoDB Streams が
+    有効化される（Global Tables の前提要件）。
+
+    対象は Players / Sessions / MatchHistory の 3 テーブルのみ。MatchmakingTickets は
+    region-local（レプリケーションすると同一チケットが両リージョンで二重にマッチされるため）。
+    spec-architecture.md §2.5 の方針。
+  EOT
+  type        = list(string)
+  default     = []
+}
+
 variable "tags" {
   description = "全テーブルに付与する共通タグ。"
   type        = map(string)
