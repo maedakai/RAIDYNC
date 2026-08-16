@@ -16,7 +16,7 @@
 
 ```bash
 # ローカル環境
-docker compose -f docker/docker-compose.yml up -d                    # LocalStack + GameLift Local + Mock Auth を起動
+docker compose -f docker/docker-compose.yml up -d                    # LocalStack + Mock Auth を起動（GameLift は Docker 非対象）
 ./docker/localstack/scripts/localstack-init.sh            # LocalStack リソースを初期化
 
 # Go バックエンド (Lambda + GameLift サーバー)
@@ -71,23 +71,30 @@ Unity クライアント (PC/Windows)
 
 ```
 terraform/
-├── environments/dev/   # dev tfvars + main.tf
-├── environments/prod/  # prod tfvars + main.tf
+├── environments/
+│   ├── dev/                 # AWS dev（本番同等構成）。aws + awscc（Build のみ）
+│   ├── anywhere/            # GameLift Anywhere 検証用（開発専用）。awscc provider 単独
+│   └── prod/                # 未着手
 └── modules/
-    ├── vpc/            # VPC 10.0.0.0/16、パブリック/プライベートサブネット
-    ├── cognito/
-    ├── api_gateway/
-    ├── lambda/
-    ├── gamelift/
-    ├── dynamodb/
-    └── monitoring/
+    ├── dynamodb/            # 実装済
+    ├── iam/                 # 実装済（Lambda 実行ロールを用途別に2分割）
+    ├── gamelift_anywhere/   # 実装済（Anywhere 専用・awscc。開発検証用）
+    ├── lambda/              # 実装済（6 関数: authorizer, match-request/status/cancel, session-create/end）
+    ├── cognito/             # 実装済
+    ├── api_gateway/         # 実装済（REST API v1）
+    ├── gamelift_ec2/        # 実装済（Managed EC2 フリート。Build のみ awscc — server_sdk_version が classic aws に無いため）
+    └── monitoring/          # 予定（Phase 6）
 ```
+
+- **`anywhere` 環境を分けている理由**: Anywhere は「自 PC を compute にする開発時の検証手段」で本番構成の部品ではない（本番は Managed EC2 + Spot）。dev の apply/destroy に検証用フリートを巻き込まないよう state を分離している。詳細は docs/qa-log.md §12。
+- **VPC モジュールは作らない**: Lambda は DynamoDB・GameLift をパブリックエンドポイントで呼べ、GameLift Managed EC2 は GameLift 管理の VPC で動くため、自前 VPC の使い所が無い。VPC に入れると NAT Gateway の時間課金（概算 月$60）が乗るだけになる。計画（docs/spec-architecture.md §2.1）からの変更点。判断の詳細は docs/qa-log.md §12。
 
 ### ローカル開発スタック (Docker Compose)
 
 - **LocalStack** — DynamoDB、Lambda、API Gateway をエミュレート
-- **GameLift Local** — Amazon GameLift 公式エミュレーター
 - **Mock Auth Server** — Go 製 Cognito モック（air でホットリロード、ポート 9229）
+
+> **GameLift は Docker スタックに含めない。** 旧 GameLift Local（Java エミュレータ）は Server SDK 5.x で非対応となり廃止された。SDK 5.x の接続検証は **GameLift Anywhere**（自 PC を Anywhere フリートの compute として AWS に登録する方式）で行う。ゲームサーバーの UDP 通信自体は GameLift 非依存でローカル単体テスト可能（`go test ./internal/gameserver/...`）。詳細は docs/qa-log.md §10。
 
 ## 開発フェーズ
 
@@ -95,7 +102,7 @@ terraform/
 
 | フェーズ | 内容 |
 |-------|-------|
-| 0 | ローカル環境セットアップ（Docker、LocalStack、GameLift Local） |
+| 0 | ローカル環境セットアップ（Docker、LocalStack、Mock Auth） |
 | 1 | Terraform コア（VPC、IAM、Cognito、CI/CD） |
 | 2 | Lambda + DynamoDB 実装 & ユニットテスト |
 | 3 | GameLift + Unity 連携 |
@@ -106,7 +113,11 @@ terraform/
 
 ## 主要制約
 
-- **ローカルファースト**: 開発中は AWS の使用を最小化する。AWS へのデプロイ前に LocalStack と GameLift Local を使用すること。
+- **ローカルファースト**: 開発中は AWS の使用を最小化する。デプロイ前は LocalStack でバックエンドを、UDP ゲームサーバーは Go 単体テストで検証する。GameLift の接続検証は GameLift Anywhere（無料枠内・実 AWS）を使う（旧 GameLift Local は SDK 5.x で廃止）。
 - **コスト管理**: AWS Budgets アラートを月 $200 に設定。GameLift フリートは使用しないときは必ず停止すること。
 - **Spot インスタンス**: GameLift は Spot Fleet を使用（約 70% のコスト削減）；On-Demand はフォールバックのみ。
 - **IaC の徹底**: すべての AWS リソースは Terraform で定義すること — コンソールからの手動変更は禁止。
+
+## ドキュメント運用
+
+- **質問ログ**: ユーザーがプロジェクトの内容（設計・実装・インフラ・運用など）について質問したら、その質問と回答の要点を `docs/qa-log.md` に追記すること。トピック別の Q&A 形式（`### Q.` 見出し + 要点回答）を維持し、適切なセクションがなければ新設する。学習ログ兼ポートフォリオ素材として育てる。

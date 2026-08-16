@@ -98,20 +98,25 @@ func (f *fakeStore) TimeoutTicket(_ context.Context, ticketID string) error {
 }
 
 // fakeSessionProvider は固定の sessionId / 接続情報を返す。
+// psid はプレイヤー毎に "ps-<playerID>" を採番する（本番の 1 プレイヤー 1 枠を模す）。
 type fakeSessionProvider struct {
 	sessionID string
 	conn      protocol.ConnectionInfo
 	calls     int
 }
 
-func (f *fakeSessionProvider) CreateGameSession(_ context.Context, _ string, _ []string) (string, protocol.ConnectionInfo, error) {
+func (f *fakeSessionProvider) CreateGameSession(_ context.Context, _ string, playerIDs []string) (string, protocol.ConnectionInfo, map[string]string, error) {
 	f.calls++
-	return f.sessionID, f.conn, nil
+	playerSessions := make(map[string]string, len(playerIDs))
+	for _, pid := range playerIDs {
+		playerSessions[pid] = "ps-" + pid
+	}
+	return f.sessionID, f.conn, playerSessions, nil
 }
 
 func newFakeSessionProvider() *fakeSessionProvider {
 	return &fakeSessionProvider{
 		sessionID: "sess-test",
-		conn:      protocol.ConnectionInfo{IPAddress: "10.0.0.1", Port: 7777, PlayerSessionID: "ps-test"},
+		conn:      protocol.ConnectionInfo{IPAddress: "10.0.0.1", Port: 7777},
 	}
 }

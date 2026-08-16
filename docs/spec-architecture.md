@@ -54,7 +54,15 @@
 
 ### 2.1 ネットワーク（VPC）
 
-| 項目 | 設定値 |
+> ⚠️ **不採用（2026-07-22 決定）。** 以下は計画時の設計であり、**実際には構築しない**。
+> RAIDYNC は サーバーレス（Lambda）+ GameLift マネージド構成であり、Lambda は DynamoDB・
+> GameLift をパブリックエンドポイントで呼べ、GameLift Managed EC2 は GameLift 側が管理する
+> VPC で動くため、自前 VPC の使い所が無い。Lambda を VPC に入れると外部通信に NAT Gateway が
+> 必要になり、下表どおり各 AZ 1台＝2台で月 $60 前後の時間課金が乗るだけになる。
+> 判断の詳細は docs/qa-log.md §12。将来 RDS/ElastiCache 等 VPC 内でしか動かないリソースを
+> 追加する場合はこの設計を再利用する。
+
+| 項目 | 設定値（計画時・未構築） |
 |------|--------|
 | VPC CIDR | 10.0.0.0/16 |
 | パブリックサブネット | 10.0.1.0/24, 10.0.2.0/24（マルチAZ） |
@@ -201,6 +209,13 @@ func (s *Session) handlePlayer(player *Player) {
 ```
 
 ### 3.5 Terraformディレクトリ構成
+
+> 以下は計画時の構成。実際の構成は 2 点変わっている（最新は CLAUDE.md「Terraform レイアウト」）。
+> - **`environments/anywhere` を追加**：GameLift Local が Server SDK 5.x で廃止され、代替の
+>   GameLift Anywhere が必要になったため（計画時には存在しなかった概念）。開発検証専用なので
+>   本番同等の `dev` とは state を分離する。あわせて `modules/gamelift` は
+>   `gamelift_anywhere`（Anywhere 用）と `gamelift_ec2`（本番同等の Managed EC2 用）に分割。
+> - **`modules/vpc` は不採用**：§2.1 の注記を参照。
 
 ```
 terraform/

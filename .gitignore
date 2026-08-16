@@ -7,6 +7,14 @@
 *.prof
 coverage.out
 vendor/
+# ローカルビルド exe / 一時生成物置き場（gameprops.json 等）
+bin/
+# Lambda ビルド成果物（scripts/build-lambdas.sh の出力 + archive_file の zip）
+build/
+# GameLift Server SDK ランタイムログ
+server/logs/
+# GameLift Server SDK ランタイムログ（リポジトリ直下 cwd 実行時。Anywhere 手元検証で発生）
+logs/
 # ローカルに置いた Go インストーラ tarball（リポジトリに含めない）
 server/go*.tar.gz
 server/go*.tar.gz.*

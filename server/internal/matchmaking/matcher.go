@@ -139,11 +139,12 @@ func (m *Matcher) finalize(ctx context.Context, self *protocol.Ticket, group []p
 		playerIDs = append(playerIDs, g.PlayerID)
 	}
 
-	sessionID, conn, err := m.sessions.CreateGameSession(ctx, self.QuestID, playerIDs)
+	sessionID, conn, playerSessions, err := m.sessions.CreateGameSession(ctx, self.QuestID, playerIDs)
 	if err != nil {
 		return nil, err
 	}
 
+	// conn は全員共通の接続先（psid 無し）。セッションレコードには共通接続先を保存する。
 	sess := protocol.Session{
 		SessionID:      sessionID,
 		QuestID:        self.QuestID,
@@ -157,15 +158,20 @@ func (m *Matcher) finalize(ctx context.Context, self *protocol.Ticket, group []p
 		return nil, err
 	}
 
+	// 各チケットには「共通 conn ＋ 本人の playerSessionId」を配る（1 プレイヤー 1 枠）。
 	for _, g := range group {
-		if err := m.store.MarkMatched(ctx, g.TicketID, sessionID, conn); err != nil {
+		pc := conn
+		pc.PlayerSessionID = playerSessions[g.PlayerID]
+		if err := m.store.MarkMatched(ctx, g.TicketID, sessionID, pc); err != nil {
 			return nil, err
 		}
 	}
 
+	selfConn := conn
+	selfConn.PlayerSessionID = playerSessions[self.PlayerID]
 	self.Status = protocol.StatusMatched
 	self.SessionID = sessionID
-	self.ConnectionInfo = &conn
+	self.ConnectionInfo = &selfConn
 	return self, nil
 }
 
