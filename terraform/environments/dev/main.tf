@@ -58,6 +58,11 @@ module "iam" {
   tags = var.tags
 }
 
+# Cognito は**東京の 1 プールを両リージョンで共用する**。
+# ユーザープールはリージョンをまたいで複製できないため、リージョンごとに独立させると
+# 同じプレイヤーが両方で登録し直す羽目になり破綻する。JWT 検証は JWKS を HTTPS で
+# 引いて署名を確かめるだけでリージョン親和性が無いので、us-east-1 の authorizer からも
+# 東京のプールのトークンを検証できる。
 module "cognito" {
   source = "../../modules/cognito"
 
@@ -65,9 +70,12 @@ module "cognito" {
   tags        = var.tags
 }
 
-# ⚠ 唯一「立てているだけで時間課金」されるモジュール。E2E 後は必ず destroy すること。
+# ⚠ 唯一「立てているだけで時間課金」されるモジュール。
+# 既定では作らない（enable_gamelift = false）。E2E 検証時のみ true にし、終わったら
+# false に戻して apply すると消える。詳細は variables.tf の enable_gamelift。
 module "gamelift_ec2" {
   source = "../../modules/gamelift_ec2"
+  count  = var.enable_gamelift ? 1 : 0
 
   name_prefix = "raidync-dev"
   # scripts/build-gameserver.sh の出力先。apply 前に必ずビルドしておくこと。
@@ -94,7 +102,9 @@ module "lambda" {
   # マッチ成立時に実 GameLift へセッションを作らせる。
   # GAMELIFT_LOCATION は Managed EC2 では空のままにする（Anywhere 用の値のため。
   # gamelift_provider.go の locationPtr が空なら Location を省略する）。
-  gamelift_fleet_id = module.gamelift_ec2.fleet_id
+  # フリート未作成時は空文字を渡す＝match_status が GameLiftStub にフォールバックする
+  # （cmd/lambda/match_status/main.go の selectSessionProvider）。
+  gamelift_fleet_id = one(module.gamelift_ec2[*].fleet_id)
 
   tags = var.tags
 }
@@ -107,6 +117,60 @@ module "api_gateway" {
 
   lambda_invoke_arns    = module.lambda.invoke_arns
   lambda_function_names = module.lambda.function_names
+
+  tags = var.tags
+}
+
+# ---------------------------------------------------------------------------
+# セカンダリリージョン（us-east-1）— Phase 5-2
+#
+# 東京と同じ Lambda 6 関数 + REST API をもう一組立てる。プライマリとの違いは
+# provider だけで、モジュールもビルド成果物も同一のものを使い回す。
+#
+# ここで DynamoDB のリージョン局所性が自動的に成立する: Lambda ランタイムが
+# AWS_REGION=us-east-1 を自動設定し、internal/db.NewClient がそれを読んで
+# SDK のリージョンにするため、Go 側の変更は一切要らない。
+#
+#   Global Tables の 3 表 … us-east-1 のレプリカを読み書き（東京と同一データ）
+#   MatchmakingTickets   … us-east-1 の独立テーブル（東京とは別データ）
+#
+# 認証は東京の Cognito を共用する（プールは複製できないため）。
+# GameLift は判断どおり検証時のみなので、セカンダリのフリートはまだ作らない
+# （fleet_id 未指定 → match_status は GameLiftStub にフォールバック）。
+# ---------------------------------------------------------------------------
+
+module "lambda_secondary" {
+  source = "../../modules/lambda"
+  providers = {
+    aws = aws.secondary
+  }
+
+  name_prefix   = "raidync-dev"
+  artifacts_dir = "${path.root}/../../../build/lambda"
+
+  # IAM ロールはグローバルなので東京と同じものを使う。
+  authorizer_role_arn  = module.iam.authorizer_role_arn
+  matchmaking_role_arn = module.iam.matchmaking_role_arn
+
+  # 東京の Cognito を共用（JWT 検証はリージョン非依存）。
+  auth_jwks_url  = module.cognito.jwks_url
+  auth_issuer    = module.cognito.issuer
+  auth_client_id = module.cognito.client_id
+
+  tags = var.tags
+}
+
+module "api_gateway_secondary" {
+  source = "../../modules/api_gateway"
+  providers = {
+    aws = aws.secondary
+  }
+
+  name_prefix = "raidync-dev"
+  stage_name  = "dev"
+
+  lambda_invoke_arns    = module.lambda_secondary.invoke_arns
+  lambda_function_names = module.lambda_secondary.function_names
 
   tags = var.tags
 }

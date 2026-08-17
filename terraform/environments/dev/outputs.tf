@@ -25,23 +25,28 @@ output "dynamodb_tickets_secondary_arn" {
 }
 
 output "lambda_function_names" {
-  description = "Lambda 関数キー => 関数名。"
+  description = "Lambda 関数キー => 関数名（プライマリリージョン）。"
   value       = module.lambda.function_names
 }
 
 output "gamelift_fleet_id" {
-  description = "Managed EC2 フリート ID。"
-  value       = module.gamelift_ec2.fleet_id
+  description = "Managed EC2 フリート ID。enable_gamelift=false のときは null。"
+  value       = one(module.gamelift_ec2[*].fleet_id)
 }
 
 output "gamelift_build_id" {
-  description = "GameLift Build ID。"
-  value       = module.gamelift_ec2.build_id
+  description = "GameLift Build ID。enable_gamelift=false のときは null。"
+  value       = one(module.gamelift_ec2[*].build_id)
 }
 
 output "api_invoke_url" {
-  description = "API のベース URL。E2E クライアントの接続先。"
+  description = "プライマリ（ap-northeast-1）API のベース URL。E2E クライアントの接続先。"
   value       = module.api_gateway.invoke_url
+}
+
+output "api_invoke_url_secondary" {
+  description = "セカンダリ（us-east-1）API のベース URL。マルチリージョン検証で直接叩く先。"
+  value       = module.api_gateway_secondary.invoke_url
 }
 
 output "cognito_user_pool_id" {

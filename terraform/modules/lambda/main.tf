@@ -54,6 +54,11 @@ locals {
   }
 }
 
+# このモジュールがどのリージョンに適用されているかを知るために引く。
+# マルチリージョン構成では同じモジュールが provider alias 違いで複数回インスタンス化され、
+# zip の出力先が衝突するため、パスにリージョン名を混ぜて分離する。
+data "aws_region" "current" {}
+
 # ビルド済み bootstrap を関数ごとに zip 化する。
 # 事前に scripts/build-lambdas.sh の実行が必要（未実行だと plan 時に source_dir 不在で失敗）。
 data "archive_file" "this" {
@@ -61,7 +66,7 @@ data "archive_file" "this" {
 
   type        = "zip"
   source_dir  = "${var.artifacts_dir}/${each.key}"
-  output_path = "${var.artifacts_dir}/${each.key}.zip"
+  output_path = "${var.artifacts_dir}/${each.key}-${data.aws_region.current.name}.zip"
 }
 
 # ロググループを明示的に作る。Lambda の自動作成に任せると保持期間が「無期限」になり
