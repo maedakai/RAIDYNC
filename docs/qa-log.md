@@ -1180,3 +1180,30 @@ match/request → Route53 → 東京にチケット作成
 → 先に決めた「どのデータを共有し、どれを分離するか」の設計が、そのまま「どの API を固定すべきか」を決めている。
 
 **実装上の単純化**: API ごとに向き先を出し分けるのは煩雑。Global Tables 側の API はどちらに投げても正しく動くので、**「マッチング〜セッション終了までの一連の流れを、最初に選ばれたリージョンへ全部投げる」で構わない**（固定が必要なのは 3 つだが、実装は全部固定でも害が無い）。
+
+### Q. マルチリージョン構成（Phase 5-2）は実際に動いた? 何を実証した?
+
+**両リージョンで独立稼働することを実 API で確認（2026-08-18）。** 設計上の主張を 4 つとも実機で裏取りした。
+
+構成: `ap-northeast-1` / `us-east-1` に Lambda 6 関数 + REST API を 1 組ずつ（計 100 リソース）。Cognito は東京の 1 プールを共用。GameLift は `enable_gamelift=false` で未作成。
+
+**① 東京発行の Cognito トークンがバージニアの authorizer で通る**
+東京の User Pool で `initiate-auth` して得た id_token で、us-east-1 の `POST /match/request` が 200。**Cognito 共用（プールを複製しない）方針が成立**することの実証。JWT 検証は JWKS を引いて署名を見るだけでリージョン親和性が無い、という前提どおり。
+
+**② MatchmakingTickets はリージョンごとに完全分離**
+同一プレイヤーが両リージョンに request → **別々の ticketId が 2 枚発行**された。region-local が効いている証拠であり、同時に「1 プレイヤー 1 チケットがリージョンを跨がない」（不都合②）の実証でもある。
+
+**③ 不都合③（Route 53 導入時の 404）を実機で再現**
+
+| 問い合わせ | 結果 |
+|-----------|------|
+| 東京のチケット → 東京の API | 200 |
+| **東京のチケット → バージニアの API** | **404 `ticket not found`** |
+| バージニアのチケット → バージニアの API | 200 |
+
+ポーリング中にリージョンが切り替わると確実に落ちる。**セッションアフィニティ（案B）は Route 53 導入前に必須**と確定。
+
+**④ Global Tables 側はどちらの API からでも同一の答え**
+東京の MatchHistory に 1 件書き込み → 東京・バージニア両方の `GET /player/{id}/history` が**完全に同一の JSON** を返した。Lambda 経由でも Global Tables が機能し、「history / session_end は固定不要」の裏付けになった。
+
+**副次的な確認**: us-east-1 の Lambda が us-east-1 の DynamoDB を掴んでいる（Go の変更ゼロ）。`internal/db.NewClient` が Lambda ランタイムの `AWS_REGION` を読む実装がそのまま効いた。
