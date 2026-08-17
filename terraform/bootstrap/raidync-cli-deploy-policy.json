@@ -60,6 +60,17 @@
       "Resource": "arn:aws:iam::444952542001:role/raidync-dev-*"
     },
     {
+      "Sid": "DynamoDBGlobalTablesServiceLinkedRole",
+      "Effect": "Allow",
+      "Action": "iam:CreateServiceLinkedRole",
+      "Resource": "arn:aws:iam::444952542001:role/aws-service-role/replication.dynamodb.amazonaws.com/AWSServiceRoleForDynamoDBReplication",
+      "Condition": {
+        "StringEquals": {
+          "iam:AWSServiceName": "replication.dynamodb.amazonaws.com"
+        }
+      }
+    },
+    {
       "Sid": "Sts",
       "Effect": "Allow",
       "Action": "sts:GetCallerIdentity",

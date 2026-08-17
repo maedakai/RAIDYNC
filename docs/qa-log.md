@@ -1023,3 +1023,62 @@ dev/検証フェーズはそれでよい（`source_code_hash` があるので ap
 - **ERROR フリートがフリート枠(quota)を占有**し、次の Fleet 作成（CreateFleet）がリトライループで進まない（「Still creating」のまま）。古い ERROR フリートを `delete-fleet` すると枠が空いて新フリート作成が成立した。
 - **`ACTIVATING` 中のフリートは `delete-fleet` も `update-fleet-capacity` での縮退も効かない**（`InvalidRequestException`）。リトライを使い切って ERROR になるまで（起動から最大 ~60 分）待つしかなく、その間インスタンス課金が続く。監視して ERROR/DELETING 到達で自動削除する運用にした。
 - Managed EC2 の 1 サイクル（build→fleet→ERROR）は 5〜15 分と重く、ログも取りにくい。**SDK 契約の検証は Anywhere（手元・フルログ・無料）で先に済ませる**のが正しい順序、という教訓。
+
+---
+
+## 13. Phase 5：マルチリージョン化
+
+### Q. Global Tables の対象テーブルをどう選んだ?
+
+**Players / Sessions / MatchHistory の 3 つのみ。MatchmakingTickets は除外**（spec-architecture.md §2.5 の方針を実装で追認）。
+
+除外の理由は「region-local だから」ではなく**不変条件が壊れるから**:
+- マッチメイキングは楽観ロック（`version` 属性 + 条件付き書き込み）で「1 チケットを 1 回だけ `WAITING`→`MATCHING` に遷移させる」ことで成立している。
+- Global Tables は**結果整合のマルチライター**（last-writer-wins）。東京とバージニアで同一チケットが同時に確保され得るため、この排他が保証できない。
+- よってマッチングは region-local に閉じ、リージョンをまたぐ待機列の統合は行わない。プレイヤーは自分が繋いだリージョン内でのみマッチングされる。
+
+### Q. Terraform で Global Tables を作るとき、セカンダリ用の provider alias は要る?
+
+**不要。** `aws_dynamodb_table` の `replica` ブロックが「レプリカ作成の指示」までを担い、実際のレプリカ生成は AWS 側（DynamoDB サービス）が行う。プライマリリージョンの provider だけで完結する。
+
+- 前提要件として **DynamoDB Streams（`NEW_AND_OLD_IMAGES`）が必須**。本モジュールは `replica_regions` が空でない時だけ Streams を有効化する（単一リージョン構成では無効のまま）。
+- `replica_regions`（既定 `[]`）で opt-in にしたため、Phase 4 までの単一リージョン構成を壊さずに拡張できた。空に戻せばレプリカ削除の apply が走る。
+
+### Q. Global Tables の apply が `iam:CreateServiceLinkedRole` 不足で失敗した。なぜ?
+
+**Global Tables はレプリケーション実行のためにサービスリンクロール `AWSServiceRoleForDynamoDBReplication` を必要とする**が、アカウントに未作成で、`raidync-cli` の絞り込みポリシーは IAM を `raidync-dev-*` ロール限定にしていたため `aws-service-role/` 配下が対象外だった。
+
+対策として最小権限を維持したまま 1 Statement を追加（`terraform/bootstrap/raidync-cli-deploy-policy.json`）:
+- Resource を**そのロール 1 個の ARN だけ**に限定
+- さらに `Condition: iam:AWSServiceName = replication.dynamodb.amazonaws.com` で二重に絞る
+- 汎用の `iam:CreateServiceLinkedRole` on `*` は付けない
+
+### Q. 権限を足した後も 1 テーブルだけ `UnrecognizedClientException` で失敗した。原因は?
+
+**サービスリンクロールの伝播ラグ**。3 テーブルのレプリカ作成が並行実行され、ロールが作られた直後のウィンドウに当たった 1 つ（MatchHistory）が「security token invalid」で弾かれた。IAM/STS は結果整合のため、ロール作成直後に別リージョンへ assume すると稀に起こる。**権限設定もコードも正しい**。
+
+- 失敗したリソースは Terraform が **tainted**（作成はしたが完了しなかった印）にする。次の apply で `1 to add, 1 to destroy`＝作り直しになる。安全側の挙動。
+- 対処は**再 apply するだけ**。2 回目は伝播済みで成功した。
+- 教訓: サービスリンクロールを新規作成する apply は、初回だけ一部が失敗し得る。冪等なので再実行で解消する。
+
+### Q. レプリケーションは実際に機能した? どう検証した?
+
+**双方向とも成功（2026-08-17）**。CLI で実データを流して確認した。
+
+| 方向 | 結果 |
+|------|------|
+| ap-northeast-1 → us-east-1（put-item→get-item） | **2 秒以内**に到達 |
+| us-east-1 → ap-northeast-1（逆方向 put→get） | 約 4 秒で到達 |
+| 削除（delete-item）の伝播 | 両リージョンで 0 件を確認 |
+
+- レプリカ状態は `describe-table --query 'Table.Replicas'` で全 3 テーブル `ACTIVE` を確認。MatchmakingTickets は `None`（意図どおりレプリカ無し）。
+- Global Tables は**マルチライター**なので、どちらのリージョンに書いても他方へ伝播する（プライマリ/セカンダリの区別はアプリ側の運用上の呼び方であり、DynamoDB 側に主従は無い）。
+
+### Q. Global Tables のコストは?
+
+**固定費は無い。** レプリカテーブルの「存在」自体に時間課金は発生せず、以下の従量課金のみ:
+- **rWCU（replicated write capacity unit）**: レプリケーションされる書き込み。通常の書き込みとほぼ同単価が、レプリカ数ぶん加算される。
+- **保存量**: 各リージョンで個別に課金（データが 2 か所にあるため実質 2 倍）。
+- **クロスリージョンのデータ転送**。
+
+dev は PAY_PER_REQUEST・データ量ほぼ 0 のため、実質無視できる。**GameLift フリートのような「立てているだけで課金」とは性質が異なり、destroy を急ぐ必要はない**。
