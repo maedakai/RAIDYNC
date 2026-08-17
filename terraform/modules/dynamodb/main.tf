@@ -1,14 +1,16 @@
-# RAIDYNC の DynamoDB テーブル群を IaC 化するモジュール。
+# RAIDYNC の**クロスリージョン共有**テーブル（Players / Sessions / MatchHistory）を
+# IaC 化するモジュール。region-local な MatchmakingTickets は modules/dynamodb_tickets。
 #
 # スキーマの権威は docker/localstack/scripts/localstack-init.sh（ローカルと同一定義）と
 # server/internal/db/*.go。テーブル名は internal/db.DefaultTables() が固定名で参照するため
-# 実名（Players / Sessions / MatchHistory / MatchmakingTickets）で作る。
+# 実名（Players / Sessions / MatchHistory）で作る。
 #
 # 課金: PAY_PER_REQUEST 既定（叩かなければほぼ無料）。固定の時間課金は発生しない。
+#   Global Tables 化してもレプリカの「存在」自体に固定費は無く、rWCU・保存量・
+#   クロスリージョン転送の従量課金のみ（GameLift フリートとは性質が異なる）。
 #
 # Global Tables（Phase 5）:
-#   replica_regions が空でなければ Players / Sessions / MatchHistory を Global Tables 化する。
-#   MatchmakingTickets は対象外（region-local。理由は variables.tf の replica_regions を参照）。
+#   replica_regions が空でなければ 3 テーブルを Global Tables 化する。
 #   Terraform では replica ブロックが「レプリカテーブルの作成」までを担うため、セカンダリ
 #   リージョン用の provider alias は不要（AWS 側が裏でレプリカを作る）。
 
@@ -114,63 +116,7 @@ resource "aws_dynamodb_table" "match_history" {
   tags = var.tags
 }
 
-# マッチ待機チケット（PK: ticketId, 短命 TTL=ttl）
-#   GSI questId-status-index  … 同 quest の WAITING を抽出（QueryWaitingByQuest）
-#   GSI playerId-status-index … 1 プレイヤー 1 チケット制約（FindWaitingByPlayer）
-#
-# ⚠ このテーブルは Global Tables にしない（replica ブロックを持たない唯一のテーブル）。
-#   マッチメイキングは楽観ロック（version 属性）で「1 チケットを 1 回だけ MATCHING に遷移」
-#   させることで成立する。Global Tables は結果整合のマルチライターであり、リージョン間で
-#   同一チケットが同時に確保され得るため、この不変条件が壊れる。マッチングは region-local に
-#   閉じ、リージョンをまたぐ待機列の統合は行わない（spec-architecture.md §2.5）。
-resource "aws_dynamodb_table" "matchmaking_tickets" {
-  name         = "MatchmakingTickets"
-  billing_mode = var.billing_mode
-  hash_key     = "ticketId"
-
-  attribute {
-    name = "ticketId"
-    type = "S"
-  }
-
-  attribute {
-    name = "questId"
-    type = "S"
-  }
-
-  attribute {
-    name = "status"
-    type = "S"
-  }
-
-  attribute {
-    name = "playerId"
-    type = "S"
-  }
-
-  global_secondary_index {
-    name            = "questId-status-index"
-    hash_key        = "questId"
-    range_key       = "status"
-    projection_type = "ALL"
-  }
-
-  global_secondary_index {
-    name            = "playerId-status-index"
-    hash_key        = "playerId"
-    range_key       = "status"
-    projection_type = "ALL"
-  }
-
-  # 期限切れチケットの自動削除（localstack-init と同じ属性名 ttl）。
-  ttl {
-    attribute_name = "ttl"
-    enabled        = true
-  }
-
-  point_in_time_recovery {
-    enabled = var.point_in_time_recovery
-  }
-
-  tags = var.tags
-}
+# 注: MatchmakingTickets はこのモジュールに含めない。
+#   Global Tables に載せられない（楽観ロックが結果整合のマルチライターで壊れる）ため
+#   region-local として各リージョンに独立した実体を置く必要があり、
+#   modules/dynamodb_tickets に分離してある。設計理由はそちらのヘッダコメント参照。

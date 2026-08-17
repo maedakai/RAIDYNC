@@ -26,6 +26,14 @@ provider "aws" {
   region = var.region
 }
 
+# Phase 5: セカンダリリージョン（us-east-1）。region-local な MatchmakingTickets と、
+# セカンダリの Lambda / API Gateway をここに作る。
+# Global Tables のレプリカはこの alias を使わない（replica ブロックが AWS 側に作らせる）。
+provider "aws" {
+  alias  = "secondary"
+  region = var.secondary_region
+}
+
 provider "awscc" {
   region = var.region
 }

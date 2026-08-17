@@ -56,8 +56,8 @@ data "aws_iam_policy_document" "matchmaking" {
       "dynamodb:TransactWriteItems",
     ]
     resources = concat(
-      values(var.dynamodb_table_arns),
-      [for arn in values(var.dynamodb_table_arns) : "${arn}/index/*"],
+      var.dynamodb_table_arns,
+      [for arn in var.dynamodb_table_arns : "${arn}/index/*"],
     )
   }
 

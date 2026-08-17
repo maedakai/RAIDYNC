@@ -3,21 +3,31 @@
 output "table_names" {
   description = "論理名 => 実テーブル名。"
   value = {
-    players             = aws_dynamodb_table.players.name
-    sessions            = aws_dynamodb_table.sessions.name
-    match_history       = aws_dynamodb_table.match_history.name
-    matchmaking_tickets = aws_dynamodb_table.matchmaking_tickets.name
+    players       = aws_dynamodb_table.players.name
+    sessions      = aws_dynamodb_table.sessions.name
+    match_history = aws_dynamodb_table.match_history.name
   }
 }
 
 output "table_arns" {
-  description = "論理名 => テーブル ARN（IAM 最小権限ポリシーで使用）。GSI も含めるため /index/* を付けた ARN も併記。"
+  description = "論理名 => テーブル ARN（プライマリリージョン）。IAM 最小権限ポリシーで使用。GSI を含めるには /index/* を付けること。"
   value = {
-    players             = aws_dynamodb_table.players.arn
-    sessions            = aws_dynamodb_table.sessions.arn
-    match_history       = aws_dynamodb_table.match_history.arn
-    matchmaking_tickets = aws_dynamodb_table.matchmaking_tickets.arn
+    players       = aws_dynamodb_table.players.arn
+    sessions      = aws_dynamodb_table.sessions.arn
+    match_history = aws_dynamodb_table.match_history.arn
   }
+}
+
+output "replica_table_arns" {
+  description = <<-EOT
+    レプリカテーブルの ARN 一覧（セカンダリリージョン）。
+    同名テーブルでもリージョンが違えば ARN が別物なので、セカンダリの Lambda に
+    IAM 許可を出すにはこちらも Resource に含める必要がある。
+  EOT
+  value = flatten([
+    for t in [aws_dynamodb_table.players, aws_dynamodb_table.sessions, aws_dynamodb_table.match_history] :
+    [for r in t.replica : r.arn]
+  ])
 }
 
 output "global_tables" {

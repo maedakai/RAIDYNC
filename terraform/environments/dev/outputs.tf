@@ -1,11 +1,27 @@
 output "dynamodb_table_names" {
-  description = "DynamoDB 論理名 => 実テーブル名。"
-  value       = module.dynamodb.table_names
+  description = "DynamoDB 論理名 => 実テーブル名（Tickets を含む全テーブル）。"
+  value = merge(
+    module.dynamodb.table_names,
+    { matchmaking_tickets = module.dynamodb_tickets.table_name },
+  )
 }
 
 output "dynamodb_table_arns" {
-  description = "DynamoDB 論理名 => テーブル ARN。"
-  value       = module.dynamodb.table_arns
+  description = "DynamoDB 論理名 => テーブル ARN（プライマリリージョン）。"
+  value = merge(
+    module.dynamodb.table_arns,
+    { matchmaking_tickets = module.dynamodb_tickets.table_arn },
+  )
+}
+
+output "dynamodb_global_tables" {
+  description = "Global Tables 化したテーブルとレプリカ配置先リージョン。"
+  value       = module.dynamodb.global_tables
+}
+
+output "dynamodb_tickets_secondary_arn" {
+  description = "セカンダリリージョンの MatchmakingTickets ARN（region-local。Global Tables ではない）。"
+  value       = module.dynamodb_tickets_secondary.table_arn
 }
 
 output "lambda_function_names" {

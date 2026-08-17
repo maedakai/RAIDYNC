@@ -4,6 +4,9 @@
 # 開発検証用の Anywhere フリートは environments/anywhere に分離してある
 # （自 PC を compute にする開発専用の手段であり、本番構成の部品ではないため）。
 
+# クロスリージョン共有テーブル（Players / Sessions / MatchHistory）。
+# Global Tables なので実体は両リージョンにあるが、Terraform 上はこの 1 モジュールが
+# レプリカまで面倒を見る（セカンダリ用 provider は使わない）。
 module "dynamodb" {
   source = "../../modules/dynamodb"
 
@@ -16,11 +19,43 @@ module "dynamodb" {
   tags            = var.tags
 }
 
+# region-local な待機チケット表。Global Tables に載せられないため（楽観ロックが
+# 結果整合のマルチライターで壊れる）、**各リージョンに独立した実体を 1 つずつ**置く。
+# マッチングは自リージョン内で完結し、待機列はリージョンをまたいで統合されない。
+module "dynamodb_tickets" {
+  source = "../../modules/dynamodb_tickets"
+
+  billing_mode           = "PAY_PER_REQUEST"
+  point_in_time_recovery = false
+  tags                   = var.tags
+}
+
+module "dynamodb_tickets_secondary" {
+  source = "../../modules/dynamodb_tickets"
+  providers = {
+    aws = aws.secondary
+  }
+
+  billing_mode           = "PAY_PER_REQUEST"
+  point_in_time_recovery = false
+  tags                   = var.tags
+}
+
+# IAM ロールはグローバルリソースなので 1 インスタンスで両リージョンの Lambda を賄う。
+# ただしテーブル ARN はリージョンごとに別物なので、許可対象には
+# 東京の 3 テーブル + us-east-1 レプリカ 3 + 両リージョンの Tickets を全て渡す。
 module "iam" {
   source = "../../modules/iam"
 
-  dynamodb_table_arns = module.dynamodb.table_arns
-  tags                = var.tags
+  dynamodb_table_arns = concat(
+    values(module.dynamodb.table_arns),
+    module.dynamodb.replica_table_arns,
+    [
+      module.dynamodb_tickets.table_arn,
+      module.dynamodb_tickets_secondary.table_arn,
+    ],
+  )
+  tags = var.tags
 }
 
 module "cognito" {
