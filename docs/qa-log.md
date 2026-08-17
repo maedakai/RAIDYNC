@@ -1163,3 +1163,20 @@ match/request → Route53 → 東京にチケット作成
 | C. 404 をリトライ扱い | 対症療法。リージョンが戻らないと解決しない | 不十分 |
 
 **Route 53 は「最初の入口を決める」役割に徹し、マッチング開始後はそのリージョンに留まる**設計（案 B）が本筋。
+
+### Q. セッションアフィニティ（案B）では、どの API を同一リージョンに固定する?
+
+**API 単位ではなく「触るテーブルが region-local かどうか」で決まる。** Tickets を触る 3 つが対象。
+
+| API | 触るテーブル | 性質 | 固定 |
+|-----|------------|------|------|
+| `POST /match/request` | MatchmakingTickets | region-local | **固定される側でなく決める側**（Route 53 がここで行き先を選ぶ） |
+| `GET /match/status/{ticketId}` | MatchmakingTickets | region-local | ⭕ 必要 |
+| `DELETE /match/cancel/{ticketId}` | MatchmakingTickets | region-local | ⭕ 必要 |
+| `GET /player/{playerId}/history` | MatchHistory | Global Tables | ❌ 不要（どこでも同じ答え） |
+| `POST /session/{sessionId}/end` | Sessions + MatchHistory | Global Tables | ❌ 不要（どこでも動く） |
+
+**線引きの理由はデータがレプリケーションされているか一点**。Global Tables 側はバージニアに聞いても東京と同じ答えが返るのでどこへ投げてもよい。Tickets は東京のものが東京にしか無いので、行き先を間違えると 404 になる。
+→ 先に決めた「どのデータを共有し、どれを分離するか」の設計が、そのまま「どの API を固定すべきか」を決めている。
+
+**実装上の単純化**: API ごとに向き先を出し分けるのは煩雑。Global Tables 側の API はどちらに投げても正しく動くので、**「マッチング〜セッション終了までの一連の流れを、最初に選ばれたリージョンへ全部投げる」で構わない**（固定が必要なのは 3 つだが、実装は全部固定でも害が無い）。
