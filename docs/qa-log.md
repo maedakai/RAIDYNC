@@ -69,6 +69,25 @@ A. 実装は **2 つの平面**に分かれ、その間を **`pkg/protocol`（�
 - **2 平面の継ぎ目（最重要）**: マッチ結果 `matchmaking.finalize → protocol.Session.PlayerIDs` が、GameLift の `GameProperties["playerIds"]` → `gamelift.go parseSessionConfig` → `game.NewSession(roster)` へ流れる。**`Session.PlayerIDs`（REST）＝ `Session.roster`（RT）**を一致させることで、別プロセス・別プロトコルの 2 平面が論理結合する。現状この継ぎ目は `gamelift_stub`（固定接続先）で、Phase 3 後半に実 GameLift へ差し替え。
 - **依存方向の規律**: 全層が内側の `protocol` に依存し `protocol` は何にも依存しない。`db`/`game` は末端。`net` は `gameserver` 層、AWS SDK は `db`/`gamelift` 層に局所化。`Store`/`SessionProvider`/`Sender`/`apigw.PlayerID` の各 IF が簡略版→本番版の無痛差し替えを可能にする（処理フロー視点は §10「Phase 3 各ファイルのシーケンス」を参照）。
 
+### Q. `server/` ディレクトリの全体を、下層から順に解説すると?
+A. Phase 4 完了時点（約 5,200 行 / 12 パッケージ）の構成。上記の 2 平面図に `handlers` と `cmd/localapi`・`cmd/client` が加わった形。
+
+**依存の下層から**
+1. **`pkg/protocol`（依存ゼロの正典）** — `types.go`（Ticket/Session/Player/MatchHistoryEntry + API 入出力。`dynamodbav` と `json` の両タグを 1 つの構造体に持たせ、DB 表現と API 表現の乖離を防ぐ）／`game.go`（UDP エンベロープ `GameMessage`。`Seq` は spec 外の自前拡張＝UDP の順序保証欠如への対策、`PlayerSessionID` は G1-full で追加）／`session_id.go`（`NormalizeGameSessionID`：ARN 末尾の `gsess-xxx` 抽出。AWS dev E2E の 403 バグ対策）。
+2. **`internal/db`** — DynamoDB に触れる唯一の層。`client.go`（`DYNAMODB_ENDPOINT` の有無で LocalStack/実 AWS を切替）＋テーブル別 4 ファイル。要は `tickets.go`：`ClaimTickets` が **TransactWriteItems + version/status 条件**で WAITING→MATCHING を原子的に取り、条件外れを `ErrConflict` に翻訳する。`status` は DynamoDB 予約語なので全クエリで `#s` プレースホルダ必須。
+3. **`internal/auth`** — JWKS 経由の RS256 JWT 検証。`aud`(id token) と `client_id`(access token) を Cognito 流儀で切り分ける。mock-auth と実 Cognito の**両方**に同じコードで通る。
+4. **`internal/apigw`** — `respond.go`（JSON/Error 整形）／`auth.go`（Authorizer Context から `sub` 抽出、`X-Player-Id` フォールバック付き）／`endpoint.go`（Phase 5: リージョン固定 URL の導出）。
+5. **`internal/matchmaking`** — `matcher.go` が中核。`TryMatch` は status ポーリング契機で呼ばれ、①WAITING 以外は素通し ②期限超過は最低人数で見切り発車→無理なら TIMEOUT ③solo 即成立 ④通常は 4 人狙い、の順に分岐。`selectGroup` はパーティを分割せず FIFO で残席を埋める純関数。`SessionProvider` IF の実装が 3 つ（`gamelift_stub`＝固定 127.0.0.1、`hubSessionProvider`＝ローカル同居 Hub、`gamelift_provider`＝実 GameLift の CreateGameSession+CreatePlayerSessions）。
+6. **`internal/game`** — UDP を知らないゲーム状態。`session.go` の `Ingest` が roster 検証→psid 採用→seq ゲート→種別別反映。参加/離脱通知は **Mutex 解放後に走らせる**（`defer` の LIFO を利用）ため、observer がネットワーク I/O をしても受信ホットパスを止めない。`sync.go` の `Hub` が sessionId でルーティングし 50ms tick でブロードキャスト。送信は `Sender` IF で抽象化。
+7. **`internal/gameserver`** — `server.go` が UDP ソケット＋2 ループ（受信は 500ms の read deadline で ctx キャンセルに応答）。`gamelift.go` の `GameLiftBridge` が SDK 5.x ライフサイクルを Hub に橋渡しし、`game.PlayerObserver` を実装。Accept/RemovePlayerSession は**バッファ付き channel で 1 本のワーカーに直列化**（順序保証＋ホットパス非ブロック、満杯時は落としてゲーム進行を優先）。
+8. **`internal/handlers`** — 5 つの API ハンドラ本体（Phase 4 で `package main` から抽出）。`Handle(ctx, APIGatewayProxyRequest)` 固定シグネチャで、本番 Lambda とローカル `localapi` が**同一実装を共有**する。`session_end.go` だけは server-to-server 経路でプレイヤー JWT を要求しない。
+9. **`cmd/lambda/*`（6 関数）** — `authorizer` 以外は依存を組んで `lambda.Start(h.Handle)` するだけの薄い殻。判断が残るのは `match_status/main.go` の `selectSessionProvider`（`GAMELIFT_FLEET_ID` の有無でスタブ/実 GameLift を選ぶ）。
+10. **`cmd/gameserver`** — 環境変数を読んで起動するだけ。`GAMELIFT_ENABLED=true` で Bridge を Activate し、セッションはコールバックで動的生成（false なら固定セッション 1 本のローカルモード）。
+11. **`cmd/localapi`** — 案 A のローカルハーネス。`adapter.go` が http⇄APIGatewayProxy の純変換、`main.go` の `withAuth` が authorizer Lambda の代役、`gameserver.go` が UDP サーバーを同居させ `hubSessionProvider` でマッチ結果を Hub に注入する（＝`OnStartGameSession` の代役）。
+12. **`cmd/client`** — E2E ドライバ。signup→login→match/request→ポーリング→UDP play→session/end→history を 1 本で通す。`-token` で実 Cognito のトークンを注入でき（AWS dev E2E 用）、`playerId` は JWT の sub をデコードして得る（署名検証はサーバー側の責務なのでしない）。
+
+**テストの分布** — ロジック層に集中: `matchmaking`（fakeStore で楽観ロック競合まで再現）37 ケース前後、`game`（session/sync/observer）、`auth`（9 ケース：期限切れ・issuer 違い・署名改竄）、`gamelift_provider`（フェイク SDK で AWS 無し検証）、`session_id`。実 I/O を伴うのは `server_loopback_test.go`（ループバック UDP 往復）と `db/integration_test.go`（`//go:build integration` タグ、LocalStack 必須）の 2 つだけ。
+
 ---
 
 ## 2. マッチメイキングの設計判断
@@ -1207,3 +1226,37 @@ match/request → Route53 → 東京にチケット作成
 東京の MatchHistory に 1 件書き込み → 東京・バージニア両方の `GET /player/{id}/history` が**完全に同一の JSON** を返した。Lambda 経由でも Global Tables が機能し、「history / session_end は固定不要」の裏付けになった。
 
 **副次的な確認**: us-east-1 の Lambda が us-east-1 の DynamoDB を掴んでいる（Go の変更ゼロ）。`internal/db.NewClient` が Lambda ランタイムの `AWS_REGION` を読む実装がそのまま効いた。
+
+### Q. セッションアフィニティ（③-a）はどう実装した? 効果は確認できた?
+
+**`match/request` の応答に「以降のリクエスト先」を含めてクライアントに固定させる方式で実装し、実機で確認（2026-08-18）。**
+
+**解決の優先順位**（`internal/apigw/endpoint.go` の `RegionEndpoint`）:
+1. 環境変数 `API_BASE_URL` … Route 53 導入後にリージョン固有カスタムドメインを注入する口
+2. リクエストの `requestContext` から導出 … `https://<domainName>/<stage>`
+
+**2 を主経路にした理由は Terraform の循環依存回避**。api_gateway モジュールは lambda の ARN を必要とするため、逆に lambda が API の URL を output 経由で受け取ると循環する。リクエストから読めば依存が要らない。execute-api のドメインは `<api-id>.execute-api.<region>.amazonaws.com` と**元々リージョン固有**なので、カスタムドメイン導入前でも固定先として十分機能する。
+
+**実機確認**:
+
+```
+東京       → {"endpoint":"https://0eyv….execute-api.ap-northeast-1.amazonaws.com/dev","region":"ap-northeast-1"}
+バージニア → {"endpoint":"https://zpyt….execute-api.us-east-1.amazonaws.com/dev","region":"us-east-1"}
+```
+
+| 経路 | 結果 |
+|------|------|
+| 東京のチケット → 返された endpoint（東京） | **200** |
+| 東京のチケット → バージニア（endpoint を無視した場合） | **404**（＝対策前の挙動） |
+
+cmd/client で `-api` にバージニアを渡した実行ログ:
+`ticket status=WAITING region=us-east-1 pinned=https://zpyt….us-east-1.amazonaws.com/dev`
+→ 応答の endpoint を採用して以降のポーリングを固定していることを確認。
+
+**固定しない API**: `session/end` と `player/history` は Sessions / MatchHistory が Global Tables でどのリージョンからでも同じ結果になるため `cfg.apiURL` のまま（コードにも理由をコメント）。
+
+**ローカルへの影響なし**: localapi は `RequestContext` を埋めないため `RegionEndpoint` は空を返し、クライアントは従来どおり自分の URL を使い続ける。
+
+**検証中の余談（バグではない挙動）**:
+- 同一プレイヤーの 2 回目の `match/request` は冪等性により既存 WAITING チケットを返す。先に `soloAllowed=false` で作ったチケットが再利用され、`-solo=true` を付けてもソロマッチしない。
+- 60 秒（`MaxWaitSeconds`）経過したチケットは `TIMEOUT` に遷移済みで、`match/cancel` は **409** を返す。どちらも仕様どおり。
