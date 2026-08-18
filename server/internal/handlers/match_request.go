@@ -40,11 +40,17 @@ func (h *MatchRequest) Handle(ctx context.Context, req events.APIGatewayProxyReq
 		return apigw.Error(400, "questId is required"), nil
 	}
 
+	// 以降の match/status・match/cancel を送るべきリージョン固定 URL。
+	// チケットが region-local なため、クライアントはこれに従って接続先を固定する。
+	endpoint := apigw.RegionEndpoint(req)
+
 	// 1 プレイヤー 1 チケット: 既存 WAITING があれば再利用（冪等）。
+	// 注: この検索は自リージョンのテーブルのみが対象。別リージョンで発行済みの
+	// チケットは見えない（region-local の帰結。docs/qa-log.md §13 の不都合②）。
 	if existing, err := h.db.FindWaitingByPlayer(ctx, playerID); err != nil {
 		return apigw.Error(500, "ticket lookup failed"), nil
 	} else if existing != nil {
-		return apigw.JSON(200, matchRequestOutput(existing)), nil
+		return apigw.JSON(200, matchRequestOutput(existing, endpoint)), nil
 	}
 
 	now := time.Now()
@@ -66,14 +72,19 @@ func (h *MatchRequest) Handle(ctx context.Context, req events.APIGatewayProxyReq
 	if err := h.db.PutTicket(ctx, ticket); err != nil {
 		return apigw.Error(500, "failed to create ticket"), nil
 	}
-	return apigw.JSON(200, matchRequestOutput(&ticket)), nil
+	return apigw.JSON(200, matchRequestOutput(&ticket, endpoint)), nil
 }
 
-func matchRequestOutput(t *protocol.Ticket) protocol.MatchRequestOutput {
+// matchRequestOutput はチケットを応答形に変換する。endpoint は以降のリクエスト先を
+// リージョンに固定するためのベース URL（導出できなければ空で、その場合クライアントは
+// 従来どおり自分の知っている URL を使い続ける）。
+func matchRequestOutput(t *protocol.Ticket, endpoint string) protocol.MatchRequestOutput {
 	return protocol.MatchRequestOutput{
 		TicketID:  t.TicketID,
 		Status:    t.Status,
 		CreatedAt: t.CreatedAt,
 		ExpiresAt: t.ExpiresAt,
+		Endpoint:  endpoint,
+		Region:    t.Region,
 	}
 }

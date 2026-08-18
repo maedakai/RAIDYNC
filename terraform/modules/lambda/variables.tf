@@ -53,6 +53,23 @@ variable "gamelift_fleet_id" {
   default     = ""
 }
 
+variable "api_base_url" {
+  description = <<-EOT
+    match/request が「以降のリクエスト先」としてクライアントに返す、
+    **リージョン固定**の API ベース URL（セッションアフィニティ用）。
+
+    空なら Lambda 側がリクエストの requestContext から execute-api の URL を導出する
+    （execute-api ドメインは元々リージョン固有なのでそれで足りる）。
+    Route 53 導入後は、レイテンシールーティング対象の共通名ではなく
+    リージョン固有のカスタムドメイン（例 https://apne1.api.example.com/dev）を渡すこと。
+
+    ここを Terraform の api_gateway モジュール output で埋めないのは循環依存になるため
+    （api_gateway が lambda の ARN を必要とする）。
+  EOT
+  type        = string
+  default     = ""
+}
+
 variable "gamelift_location" {
   description = <<-EOT
     GameLift のカスタムロケーション。Anywhere 用の値であり、

@@ -18,9 +18,13 @@ locals {
         AUTH_CLIENT_ID = var.auth_client_id
       }
     }
+    # API_BASE_URL はセッションアフィニティ用のリージョン固定 URL。
+    # 空なら Lambda がリクエストから導出する（変数の説明を参照）。
     match_request = {
       role_arn = var.matchmaking_role_arn
-      env      = {}
+      env = {
+        API_BASE_URL = var.api_base_url
+      }
     }
     # マッチ成立時に実 GameLift へセッションを作るのは match_status のみ
     # （matcher が status ポーリング契機でマッチングを実行するため）。
