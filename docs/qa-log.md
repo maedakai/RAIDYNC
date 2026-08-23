@@ -88,6 +88,29 @@ A. Phase 4 完了時点（約 5,200 行 / 12 パッケージ）の構成。上�
 
 **テストの分布** — ロジック層に集中: `matchmaking`（fakeStore で楽観ロック競合まで再現）37 ケース前後、`game`（session/sync/observer）、`auth`（9 ケース：期限切れ・issuer 違い・署名改竄）、`gamelift_provider`（フェイク SDK で AWS 無し検証）、`session_id`。実 I/O を伴うのは `server_loopback_test.go`（ループバック UDP 往復）と `db/integration_test.go`（`//go:build integration` タグ、LocalStack 必須）の 2 つだけ。
 
+### Q. `pkg/protocol/types.go` の `type TicketStatus string` + 定数群という書き方は何?
+A. Go に `enum` キーワードが無いための定石イディオム。「文字列を基底とする**定義型**」＋「その型を持つ定数群」で列挙型を代用する。`TicketStatus` / `SessionStatus` / `MatchResult` の 3 つが同じ形。
+
+**定義型であってエイリアスではない** — `type T string`（`=` なし）は基底型が `string` なだけの**別の型**。`var s string; t.Status = s` はコンパイルエラーになる。`type T = string`（`=` あり）だと `string` そのものになり、この防波堤は効かない。
+
+**`iota`（連番 int）を使わない理由** — この値は DynamoDB に保存され JSON で API を往復するため。
+
+| | int + iota | string |
+|---|---|---|
+| DynamoDB コンソール | `2` としか見えない | `MATCHED` と読める |
+| 定数の並び替え・途中挿入 | 既存データの意味が壊れる | 壊れない |
+| GSI キー（`questId-status`） | 判読不能 | そのまま使える |
+
+→ 永続化・外部公開される値は string、プロセス内で閉じる値は `iota`、という使い分け。
+
+**シリアライズは自動** — 基底型が `string` なので `encoding/json` も `dynamodbav` も追加実装なしで文字列として扱う。C# の `[JsonStringEnumConverter]` 相当が不要。
+
+**ただし閉じた enum ではない** — `t.Status = "BOGUS"`（未型付け定数の代入）も `TicketStatus(input)`（明示変換）も通る。守れるのは「変数経由の取り違え」までで、値の網羅性や `switch` の case 漏れはコンパイラが保証しない（`exhaustive` linter の領分）。不正値の検証は実行時に自前で書く前提。
+
+**定数名に型名を前置する理由** — Go の定数は型ではなくパッケージのスコープに属し、`TicketStatus.Waiting` のような修飾ができない（`protocol.StatusWaiting` になる）。そのため名前側に文脈を埋め込む。`Status*` / `Session*` / `Result*` の接頭辞がそれ。
+
+**メソッドを生やせる** — 定義型なので `func (s TicketStatus) IsTerminal() bool` のように振る舞いを付けられる（単なる string 定数群では不可）。現状は必要になっていないため未定義。
+
 ---
 
 ## 2. マッチメイキングの設計判断
@@ -148,6 +171,22 @@ A. まず 1 テーブルに 3 レイヤーの名前がある点を区別する�
 3. 運用が「dev を destroy してから prod」の 1 アカウント 1 環境なので、同名衝突が起きにくい。
 
 **B に切り替えるべき転換点**: dev と prod を同一アカウントに同時常駐させたくなったとき、または Phase 5 の Global Tables を環境別に分けたいとき。その場合は「Terraform を B 化」+「Lambda に `TABLE_*` を渡す」+「Go を `os.Getenv` フォールバック付きに」の 3 点セットが必要。実益（複数環境同居）が出るまでは固定名が妥当。
+
+### Q. `internal/db/client.go` の `DYNAMODB_ENDPOINT` は、AWS 上ではどこから取得する?
+
+A. **取得しない。実 AWS では未設定のままが正解**で、この変数は「LocalStack へ向けるときだけ立てるスイッチ」。空文字のとき `NewClient` の分岐が両方 false になり、以下が全て SDK / ランタイム任せになる。
+
+| 要素 | 空（実 AWS）のときの解決元 |
+|---|---|
+| エンドポイント | `o.BaseEndpoint` を設定しない → SDK 既定の endpoint resolver が `region` から組み立てる（`https://dynamodb.ap-northeast-1.amazonaws.com`） |
+| 認証情報 | static credentials を挿さない → 既定クレデンシャルチェーン。Lambda ではランタイムが実行ロールの一時認証情報を `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN` に注入する |
+| リージョン | `AWS_REGION` は Lambda の**予約環境変数**でランタイムが自動設定（`getenv` の既定値 `ap-northeast-1` はローカル実行時の保険） |
+
+Terraform 側も `terraform/modules/lambda/main.tf` 冒頭コメントの通り、`env` マップに `DYNAMODB_ENDPOINT` も `AWS_REGION` も**意図的に入れていない**。
+
+この設計が Phase 5 のマルチリージョンでそのまま効いている: us-east-1 に同一の zip をデプロイするだけで、ランタイムが `AWS_REGION=us-east-1` を設定 → `NewClient` がそれを読む → us-east-1 のレプリカを叩く。Go 側にリージョン分岐が一切要らない（`terraform/environments/dev/main.tf` の該当コメント参照）。
+
+設定するのはローカルのみ: `.env.example`（`http://localhost:4566`）、`docs/phase4-e2e-runbook.md` の PowerShell 手順、`internal/db/integration_test.go`（未設定なら `t.Setenv` で LocalStack を既定に）。
 
 ---
 
@@ -1043,6 +1082,31 @@ dev/検証フェーズはそれでよい（`source_code_hash` があるので ap
 - **`ACTIVATING` 中のフリートは `delete-fleet` も `update-fleet-capacity` での縮退も効かない**（`InvalidRequestException`）。リトライを使い切って ERROR になるまで（起動から最大 ~60 分）待つしかなく、その間インスタンス課金が続く。監視して ERROR/DELETING 到達で自動削除する運用にした。
 - Managed EC2 の 1 サイクル（build→fleet→ERROR）は 5〜15 分と重く、ログも取りにくい。**SDK 契約の検証は Anywhere（手元・フルログ・無料）で先に済ませる**のが正しい順序、という教訓。
 
+### Q. `terraform/` ディレクトリの全体を、構成要素ごとに解説すると?
+A. `environments/`（2 つ＝適用単位・state 単位）＋ `modules/`（8 つ＝部品）＋ `bootstrap/`（デプロイ用 IAM ポリシー JSON）。合計 1,905 行。
+
+**environments — 「何を作るか」を決める層**
+- **`dev/`**（本番同等）— `main.tf` がモジュールを 9 個呼ぶだけの組み立て図。provider は 3 つ（`aws` プライマリ／`aws.secondary`=us-east-1／`awscc`）。Phase 5 で `lambda` と `api_gateway` を `providers = { aws = aws.secondary }` で**もう一組**インスタンス化し、同じモジュール・同じビルド成果物を使い回してマルチリージョン化している。`variables.tf` の `enable_gamelift`（既定 false）が唯一の時間課金リソースの ON/OFF スイッチ。
+- **`anywhere/`**（開発検証専用）— モジュールを 1 つ呼ぶだけの 20 行。dev と **state を分離**することが目的で、dev の apply/destroy サイクルに検証用フリートを巻き込まない。
+
+**modules — 「どう作るか」を閉じ込める層**
+| モジュール | 要点 |
+|---|---|
+| `dynamodb` | Players/Sessions/MatchHistory。`replica_regions` が非空なら Streams(NEW_AND_OLD_IMAGES) を有効化して `dynamic "replica"` で Global Tables 化 |
+| `dynamodb_tickets` | MatchmakingTickets を**分離**（楽観ロックが結果整合のマルチライターで壊れるため region-local）。GSI 2 本 + TTL |
+| `iam` | Lambda 実行ロールを 2 分割（authorizer=Logs のみ／matchmaking=DynamoDB 5 アクション + GameLift 2 アクション）。GSI 用に `${arn}/index/*` も許可対象に含める |
+| `cognito` | mock-auth の置き換え。`random_password` でテストユーザーのパスワードを自動生成（平文をリポジトリに置かない）。`message_action=SUPPRESS` + 永続パスワードで E2E の手数を減らす |
+| `lambda` | `for_each` で 6 関数。関数ごとに違うのは role と環境変数だけ。zip 出力先にリージョン名を混ぜてマルチリージョンでの衝突を回避 |
+| `api_gateway` | REST v1。リソース階層を明示定義し、メソッド/統合/権限は `local.endpoints` で `for_each`。`session_end` だけ `authorization = NONE` |
+| `gamelift_ec2` | S3 バケット + Build(awscc) + Fleet。`output_file_mode="0755"` が Phase 4 のハマりどころの最終解 |
+| `gamelift_anywhere` | location + ANYWHERE フリート。awscc 単独 |
+
+**横断する判断**
+- **provider の使い分け**: 原則 classic `aws`。`awscc` は「classic に無い属性/リソース」だけ（`gamelift_build.server_sdk_version`、`gamelift_location`、`compute_type=ANYWHERE`）。混在は意図的で、理由が各ファイル冒頭に書いてある。
+- **コスト設計がコードに埋まっている**: 従量課金のみのモジュール群と、唯一時間課金の `gamelift_ec2` を `count` で分離。ロググループも Lambda の自動作成に任せず `retention_in_days` を明示。
+- **state はローカル**（`.gitignore` で `*.tfstate` 除外、S3 backend 未設定）。個人ポートフォリオで単独作業のため。CI/チーム開発に移すなら S3 + DynamoDB ロックの追加が最初の一手。
+- **ビルドは Terraform 外**: `local-exec` を使わず `scripts/*.sh` → `archive_file` の分業。apply 前のビルドが前提条件になる。
+
 ---
 
 ## 13. Phase 5：マルチリージョン化
@@ -1260,3 +1324,26 @@ cmd/client で `-api` にバージニアを渡した実行ログ:
 **検証中の余談（バグではない挙動）**:
 - 同一プレイヤーの 2 回目の `match/request` は冪等性により既存 WAITING チケットを返す。先に `soloAllowed=false` で作ったチケットが再利用され、`-solo=true` を付けてもソロマッチしない。
 - 60 秒（`MaxWaitSeconds`）経過したチケットは `TIMEOUT` に遷移済みで、`match/cancel` は **409** を返す。どちらも仕様どおり。
+
+### Q. `API_BASE_URL` は AWS ではどこから入る?
+
+A. **現時点の dev では空文字が入る**（＝優先順位 2 のリクエスト導出が動く）。`DYNAMODB_ENDPOINT` と違い環境変数のキー自体は Terraform に存在するが、値を渡していない。
+
+値の流れ:
+
+1. `modules/lambda/main.tf` … `match_request` の env に `API_BASE_URL = var.api_base_url`
+2. `modules/lambda/variables.tf` … `default = ""`
+3. `environments/dev/main.tf` … `module.lambda`（東京）／`module.lambda_secondary`（us-east-1）**どちらも `api_base_url` を渡していない** → 既定値 `""`
+
+空なので `apigw.RegionEndpoint` は `https://<requestContext.domainName>/<requestContext.stage>` を組み立てる。`domainName` は API Gateway がリクエストごとに埋める値で、カスタムドメイン未使用なら `<api-id>.execute-api.<region>.amazonaws.com` ＝**元々リージョン固有**のため、これで固定先として機能する。
+
+**Terraform から注入しない理由**は循環依存（api_gateway が lambda の ARN を必要とするので、逆向きに URL を output で受け取れない）。
+
+**環境変数が実際に埋まるのは Route 53 + カスタムドメイン導入時**。そのとき各モジュール呼び出しにリージョン固有名を明示する:
+
+```hcl
+module "lambda"           { api_base_url = "https://apne1.api.example.com/dev" }
+module "lambda_secondary" { api_base_url = "https://use1.api.example.com/dev" }
+```
+
+共通名（`api.example.com`）を入れてはいけない。レイテンシールーティングで別リージョンに飛び、固定したはずのアフィニティが壊れる。
