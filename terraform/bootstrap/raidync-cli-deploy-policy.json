@@ -119,6 +119,23 @@
       }
     },
     {
+      "Sid": "SelfInspectionForTroubleshooting",
+      "Effect": "Allow",
+      "Action": [
+        "iam:GetUser",
+        "iam:ListAttachedUserPolicies",
+        "iam:ListUserPolicies",
+        "iam:GetPolicy",
+        "iam:GetPolicyVersion",
+        "iam:ListPolicyVersions",
+        "iam:SimulatePrincipalPolicy"
+      ],
+      "Resource": [
+        "arn:aws:iam::444952542001:user/raidync-cli",
+        "arn:aws:iam::444952542001:policy/raidync-cli-deploy"
+      ]
+    },
+    {
       "Sid": "Sts",
       "Effect": "Allow",
       "Action": "sts:GetCallerIdentity",
