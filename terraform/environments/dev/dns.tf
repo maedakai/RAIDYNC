@@ -65,25 +65,34 @@ module "api_cert_secondary" {
 # 両リージョンの証明書が同じ api.<domain> を含むため、ACM が返す検証レコードは
 # その名前について同名・同値になる（ACM は同一アカウント・同一ドメインなら同じ
 # 検証レコードを返す＝1 本作れば両方の証明書が検証される）。
-# レコード名をキーにした map に畳んで重複を排除する。
-# これをやらないと同じ Route 53 レコードを 2 リソースが取り合い、destroy 時に
+# 重複を排除しないと同じ Route 53 レコードを 2 リソースが取り合い、destroy 時に
 # 「片方が消した後にもう片方が消そうとして失敗する」事故になる。
 locals {
-  cert_validation_records = local.dns_enabled ? {
+  # for_each のキーは plan 時に確定していなければならない。ACM の
+  # resource_record_name は apply 後にしか決まらないので、**設定から静的に分かる
+  # ドメイン名**を集合にしてキーにする。toset がそのまま重複排除も兼ねる。
+  cert_validation_domains = local.dns_enabled ? toset(concat(
+    local.primary_domain_names,
+    local.secondary_domain_names,
+  )) : toset([])
+
+  # ドメイン名 => 検証レコード情報。同名（api.<domain>）が両リージョンから来るため
+  # グルーピング（... 記法）で受けて、先頭を採る。値は同一なのでどちらでもよい。
+  cert_validation_by_domain = local.dns_enabled ? {
     for o in concat(
       module.api_cert[0].domain_validation_options,
       module.api_cert_secondary[0].domain_validation_options,
-    ) : o.resource_record_name => o
+    ) : o.domain_name => o...
   } : {}
 }
 
 resource "aws_route53_record" "cert_validation" {
-  for_each = local.cert_validation_records
+  for_each = local.cert_validation_domains
 
   zone_id = data.aws_route53_zone.this[0].zone_id
-  name    = each.value.resource_record_name
-  type    = each.value.resource_record_type
-  records = [each.value.resource_record_value]
+  name    = local.cert_validation_by_domain[each.key][0].resource_record_name
+  type    = local.cert_validation_by_domain[each.key][0].resource_record_type
+  records = [local.cert_validation_by_domain[each.key][0].resource_record_value]
   ttl     = 60
 
   # 同名の検証レコードが既にあっても上書きして進む（証明書の再作成時に詰まらせない）。
