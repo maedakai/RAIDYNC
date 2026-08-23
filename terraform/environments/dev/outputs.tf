@@ -49,6 +49,35 @@ output "api_invoke_url_secondary" {
   value       = module.api_gateway_secondary.invoke_url
 }
 
+output "api_custom_domains" {
+  description = <<-EOT
+    カスタムドメイン名。domain_name 未設定なら空。
+      latency   … レイテンシールーティング対象（クライアントの入口）
+      primary   … 東京固定（match/request が API_BASE_URL として返す）
+      secondary … バージニア固定（同上）
+  EOT
+  value = local.dns_enabled ? {
+    latency   = local.api_fqdn
+    primary   = local.api_fqdn_primary
+    secondary = local.api_fqdn_secondary
+  } : {}
+}
+
+output "api_regional_endpoints" {
+  description = <<-EOT
+    リージョン => (カスタムドメイン名 => API Gateway のリージョナルエンドポイント)。
+    Route 53 alias レコードの向き先に使う。
+
+    リージョンで階層を分けているのは、レイテンシールーティング用の共通名
+    api.<domain> が**両リージョンに同名で存在する**ため。1 段の map に merge すると
+    キーが衝突して片方が消える。
+  EOT
+  value = local.dns_enabled ? {
+    (var.region)           = module.api_domain[0].regional_endpoints
+    (var.secondary_region) = module.api_domain_secondary[0].regional_endpoints
+  } : {}
+}
+
 output "cognito_user_pool_id" {
   description = "Cognito User Pool ID。"
   value       = module.cognito.user_pool_id

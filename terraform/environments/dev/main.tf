@@ -106,6 +106,11 @@ module "lambda" {
   # （cmd/lambda/match_status/main.go の selectSessionProvider）。
   gamelift_fleet_id = one(module.gamelift_ec2[*].fleet_id)
 
+  # セッションアフィニティの固定先。**リージョン固定名**を渡すこと。
+  # レイテンシールーティング対象の api.<domain> を渡すと、DNS が振り直された瞬間に
+  # 固定が意味を失う。空なら Lambda がリクエストから execute-api URL を導出する。
+  api_base_url = local.dns_enabled ? "https://${local.api_fqdn_primary}" : ""
+
   tags = var.tags
 }
 
@@ -156,6 +161,9 @@ module "lambda_secondary" {
   auth_jwks_url  = module.cognito.jwks_url
   auth_issuer    = module.cognito.issuer
   auth_client_id = module.cognito.client_id
+
+  # セッションアフィニティの固定先（このリージョン固有名）。
+  api_base_url = local.dns_enabled ? "https://${local.api_fqdn_secondary}" : ""
 
   tags = var.tags
 }

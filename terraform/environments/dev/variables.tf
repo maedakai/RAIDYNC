@@ -4,6 +4,22 @@ variable "region" {
   default     = "ap-northeast-1"
 }
 
+variable "domain_name" {
+  description = <<-EOT
+    Route 53 で取得したドメイン（例 "raidync.com"）。**空ならカスタムドメインと
+    Route 53 関連を一切作らない**（ドメイン未取得でも apply できる）。
+
+    設定すると以下の名前が作られる:
+      api.<domain>       … レイテンシールーティング対象。クライアントの入口
+      apne1.api.<domain> … 東京固定（セッションアフィニティ用）
+      use1.api.<domain>  … バージニア固定（同上）
+
+    ホストゾーンはドメイン登録時に自動作成されたものを data で引く（Terraform で作らない）。
+  EOT
+  type        = string
+  default     = ""
+}
+
 variable "enable_gamelift" {
   description = <<-EOT
     GameLift Managed EC2 フリートを作るか。**既定 false**。
