@@ -102,13 +102,19 @@
       "Resource": "*"
     },
     {
-      "Sid": "DynamoDBGlobalTablesServiceLinkedRole",
+      "Sid": "ServiceLinkedRolesForUsedServices",
       "Effect": "Allow",
       "Action": "iam:CreateServiceLinkedRole",
-      "Resource": "arn:aws:iam::444952542001:role/aws-service-role/replication.dynamodb.amazonaws.com/AWSServiceRoleForDynamoDBReplication",
+      "Resource": [
+        "arn:aws:iam::444952542001:role/aws-service-role/replication.dynamodb.amazonaws.com/AWSServiceRoleForDynamoDBReplication",
+        "arn:aws:iam::444952542001:role/aws-service-role/ops.apigateway.amazonaws.com/AWSServiceRoleForAPIGateway"
+      ],
       "Condition": {
         "StringEquals": {
-          "iam:AWSServiceName": "replication.dynamodb.amazonaws.com"
+          "iam:AWSServiceName": [
+            "replication.dynamodb.amazonaws.com",
+            "ops.apigateway.amazonaws.com"
+          ]
         }
       }
     },
