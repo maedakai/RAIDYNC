@@ -1,17 +1,18 @@
-# カスタムドメインと証明書（Phase 5-3b-1）。
+# カスタムドメイン・証明書・Route 53 レイテンシールーティング（Phase 5-3b）。
 #
 # domain_name が空なら丸ごと作らない（ドメイン未取得でも apply できる）。
-# Route 53 のレイテンシーレコードとヘルスチェックは次段（5-3b-2）で追加する。
 #
 # ここに置く名前:
-#   api.<domain>          … レイテンシールーティング対象。両リージョンに**同名**で作る
+#   api.<domain>          … レイテンシールーティング対象。両リージョンに**同名**で作る。
+#                           クライアントの入口で、近い方のリージョンへ自動で振られる
 #   apne1.api.<domain>    … 東京固定（セッションアフィニティ用）
 #   use1.api.<domain>     … バージニア固定（同上）
 #
-# 処理の順序が肝で、次の 3 段階を経る必要がある:
+# 処理の順序が肝で、次の 4 段階を経る:
 #   1) 証明書を要求（リージョンごと。api_cert モジュール）
 #   2) 検証用 CNAME を Route 53 に作り、検証完了を待つ（このファイル。重複排除が要る）
 #   3) 検証済み証明書でカスタムドメインを作る（api_domain モジュール）
+#   4) Route 53 レコードを張る（固定名 → レイテンシー。ヘルスチェックは opt-in）
 # 2 を挟むためにモジュールを 2 つに割っている。
 
 locals {
@@ -143,4 +144,82 @@ module "api_domain_secondary" {
   stage_name      = "dev"
 
   tags = var.tags
+}
+
+# ---- 4) Route 53 レコード（Phase 5-3b-2） ----
+
+# リージョン固定名。単純な alias で、それぞれ自分のリージョンだけを指す。
+# セッションアフィニティ（match/request が返す API_BASE_URL）の実体はこれ。
+# レイテンシールーティングしないので、DNS が途中で別リージョンへ振り直すことがない。
+resource "aws_route53_record" "api_regional" {
+  for_each = local.dns_enabled ? {
+    (local.api_fqdn_primary)   = module.api_domain[0].regional_endpoints[local.api_fqdn_primary]
+    (local.api_fqdn_secondary) = module.api_domain_secondary[0].regional_endpoints[local.api_fqdn_secondary]
+  } : {}
+
+  zone_id = data.aws_route53_zone.this[0].zone_id
+  name    = each.key
+  type    = "A"
+
+  alias {
+    name    = each.value.regional_domain_name
+    zone_id = each.value.regional_zone_id
+    # API Gateway は alias のターゲットヘルスを報告しないため false 固定。
+    # 生死判定は下の aws_route53_health_check で明示的に行う。
+    evaluate_target_health = false
+  }
+}
+
+# ヘルスチェック（enable_health_checks で opt-in）。
+#
+# 監視先に**リージョン固定名**を使うのが肝。共通名 api.<domain> を指すと、
+# 世界中に散らばる Route 53 のヘルスチェッカーがそれぞれ自分の最寄りへ解決してしまい、
+# 「特定リージョンの生死」を測れなくなる。
+resource "aws_route53_health_check" "api" {
+  for_each = local.dns_enabled && var.enable_health_checks ? {
+    (var.region)           = local.api_fqdn_primary
+    (var.secondary_region) = local.api_fqdn_secondary
+  } : {}
+
+  fqdn          = each.value
+  port          = 443
+  type          = "HTTPS"
+  resource_path = "/health" # MOCK 統合で 200 を返す（Lambda を呼ばない）
+
+  # spec-architecture.md §2.7 の「30 秒間隔」。3 回連続失敗で異常と判定する。
+  request_interval  = 30
+  failure_threshold = 3
+
+  tags = merge(var.tags, { Name = "raidync-dev-health-${each.key}" })
+
+  # 監視先の名前が解決できるようになってから作る。
+  depends_on = [aws_route53_record.api_regional]
+}
+
+# レイテンシールーティング。**同名のレコードを 2 本**置き、set_identifier で区別する。
+# Route 53 は問い合わせ元から見て最も低レイテンシーなリージョンの方を返す。
+# ヘルスチェックを付けた場合、異常なリージョンは候補から外れる（＝フェイルオーバー）。
+resource "aws_route53_record" "api_latency" {
+  for_each = local.dns_enabled ? {
+    (var.region)           = module.api_domain[0].regional_endpoints[local.api_fqdn]
+    (var.secondary_region) = module.api_domain_secondary[0].regional_endpoints[local.api_fqdn]
+  } : {}
+
+  zone_id        = data.aws_route53_zone.this[0].zone_id
+  name           = local.api_fqdn
+  type           = "A"
+  set_identifier = each.key
+
+  latency_routing_policy {
+    region = each.key
+  }
+
+  alias {
+    name                   = each.value.regional_domain_name
+    zone_id                = each.value.regional_zone_id
+    evaluate_target_health = false
+  }
+
+  # 未作成なら null＝ヘルスチェック無しのレイテンシールーティングになる。
+  health_check_id = try(aws_route53_health_check.api[each.key].id, null)
 }

@@ -1369,3 +1369,58 @@ module "lambda_secondary" { api_base_url = "https://use1.api.example.com/dev" }
 インラインは「そのプリンシパル専用で、消えるときに一緒に消えてほしい」場合に使うもので、**デプロイ用の共通ポリシーは管理ポリシー向き**。Phase 4 の時点では 8 サービスで 2048 に収まっていたため気づかなかった。
 
 **移行手順（コンソール）**: IAM → ポリシー → ポリシーを作成 → JSON に `terraform/bootstrap/raidync-cli-deploy-policy.json` を貼付 → 名前を付けて作成 → IAM → ユーザー → raidync-cli → 許可を追加 → ポリシーを直接アタッチ → 作成したポリシーを選択 → **最後に古いインラインポリシーを削除**（両方残すと合計文字数の制限に再び触れる）。
+
+### Q. Route 53 レイテンシールーティング（③-b）はどう組んだ? 効果は測れた?
+
+**独自ドメイン `raidync.com` を Route 53 で取得し、API Gateway リージョナルカスタムドメイン + レイテンシールーティングで構築（2026-08-24）。**
+
+**名前の設計**
+
+| 名前 | 役割 | ルーティング |
+|------|------|------------|
+| `api.raidync.com` | クライアントの入口 | **レイテンシー**（同名レコードを 2 本置き `set_identifier` で区別） |
+| `apne1.api.raidync.com` | 東京固定 | 単純 alias |
+| `use1.api.raidync.com` | バージニア固定 | 単純 alias |
+
+**同じカスタムドメイン名を両リージョンに作る**のが AWS のマルチリージョン API パターン。API Gateway 側は同名でもリージョンごとに別のリージョナルエンドポイント（`d-xxxx.execute-api.<region>.amazonaws.com`）を持ち、DNS 側で振り分ける。
+
+**構築の 4 段階**（`terraform/environments/dev/dns.tf`）
+1. 証明書を要求（`api_cert` モジュール。REGIONAL は同一リージョンの証明書しか使えないので 2 枚）
+2. 検証用 CNAME を作り ISSUED を待つ（**重複排除が必須**。下記）
+3. 検証済み証明書でカスタムドメイン作成（`api_domain` モジュール）
+4. Route 53 レコード（固定名 → レイテンシー）
+
+2 を挟むためモジュールを 2 つに割っている。検証レコードはホストゾーン（グローバル）側の作業でリージョンモジュール内に閉じない。
+
+**実測（日本から）**
+
+| 名前 | 応答時間 |
+|------|---------|
+| `api.raidync.com` | **0.13s** |
+| `apne1.api.raidync.com` | 0.16s |
+| `use1.api.raidync.com` | **0.57s**（約 4 倍） |
+
+共通名が東京固定名とほぼ同速＝最寄りへ正しく振られている。名前解決も `api.raidync.com → 35.78.43.27`（東京の帯）を確認。
+
+**セッションアフィニティとの噛み合わせ（本番同等の経路で確認）**
+
+```
+POST https://api.raidync.com/match/request   ← レイテンシーで東京へ
+  → {"endpoint":"https://apne1.api.raidync.com","region":"ap-northeast-1"}
+GET  https://apne1.api.raidync.com/match/status/{id}  → 200 ⭕
+GET  https://use1.api.raidync.com/match/status/{id}   → 404 ❌（endpoint を無視した場合）
+```
+
+入口で近いリージョンに振られ、以降は固定名に貼り付く。③-a の仕組みが execute-api URL からカスタムドメインへ問題なく引き継がれた（`API_BASE_URL` にリージョン固定名を注入）。
+
+### Q. ヘルスチェック用の `/health` はなぜ MOCK 統合にした?
+
+Route 53 のヘルスチェックは **2xx/3xx を返す URL** を要求するが、業務 API はすべて認証必須か POST で流用できない（401 は「異常」と判定される）。
+
+**MOCK 統合**は API Gateway がバックエンドを呼ばずに応答を組み立てる方式で、**Lambda を呼ばないため実行課金もコールドスタートも無い**。ヘルスチェックが判定したいのは「API Gateway がそのリージョンで生きているか」なので、Lambda や DynamoDB まで到達する必要はなく、この浅さがむしろ適切（深く探ると DynamoDB の一時的な遅延でリージョン全体を切り離しかねない）。
+
+**注意点**: `/health` を足したら `aws_api_gateway_deployment` の `triggers` にも含めること。含め忘れると再デプロイされずステージに反映されない（ヘルスチェックが 403 を見続ける）。
+
+**ヘルスチェックの監視先はリージョン固定名にする**。共通名 `api.<domain>` を指すと、世界中に散らばる Route 53 のヘルスチェッカーがそれぞれ自分の最寄りへ解決してしまい「特定リージョンの生死」を測れない。
+
+**opt-in にした理由（コスト）**: レイテンシールーティング自体はヘルスチェック無しでも動く。ヘルスチェックが足すのは**自動フェイルオーバー**で、月 $3.00（$0.50/個 + HTTPS オプション $1.00/個 × 2。API Gateway は HTTPS 専用なのでオプション必須）。ホストゾーン $0.50/月 に対して支配的なため `enable_health_checks`（既定 false）で必要時のみ有効化する。`enable_gamelift` と同じ考え方。

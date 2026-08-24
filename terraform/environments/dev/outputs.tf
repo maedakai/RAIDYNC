@@ -63,6 +63,11 @@ output "api_custom_domains" {
   } : {}
 }
 
+output "api_health_check_ids" {
+  description = "リージョン => Route 53 ヘルスチェック ID。enable_health_checks=false なら空。"
+  value       = { for k, h in aws_route53_health_check.api : k => h.id }
+}
+
 output "api_regional_endpoints" {
   description = <<-EOT
     リージョン => (カスタムドメイン名 => API Gateway のリージョナルエンドポイント)。

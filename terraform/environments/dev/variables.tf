@@ -20,6 +20,22 @@ variable "domain_name" {
   default     = ""
 }
 
+variable "enable_health_checks" {
+  description = <<-EOT
+    Route 53 ヘルスチェックを作るか。**既定 false**。
+
+    レイテンシールーティング自体はヘルスチェック無しでも動く（近い方へ振り分ける）。
+    ヘルスチェックが足すのは**自動フェイルオーバー**（片リージョンが落ちたら
+    生存側へ寄せる）で、月 $3.00 かかる（$0.50/個 + HTTPS オプション $1.00/個 の 2 個分。
+    API Gateway は HTTPS 専用なのでオプションが必須になる）。
+
+    ホストゾーン $0.50/月 に対してこちらが支配的なので、フェイルオーバーを
+    実演するときだけ true にする。enable_gamelift と同じ opt-in の考え方。
+  EOT
+  type        = bool
+  default     = false
+}
+
 variable "enable_gamelift" {
   description = <<-EOT
     GameLift Managed EC2 フリートを作るか。**既定 false**。
