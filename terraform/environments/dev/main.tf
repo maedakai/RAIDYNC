@@ -84,6 +84,26 @@ module "gamelift_ec2" {
   tags = var.tags
 }
 
+# セカンダリリージョンのフリート（Phase 5-4）。
+# 同じ enable_gamelift で連動させる＝「起動するときは両リージョン、止めるときも両方」。
+# 片方だけ残して課金し続ける事故を防ぐため、意図的に別フラグにしていない。
+#
+# Build は awscc が必要（server_sdk_version が classic aws に無い）なので、
+# aws / awscc の両方の provider を alias で渡す。
+module "gamelift_ec2_secondary" {
+  source = "../../modules/gamelift_ec2"
+  count  = var.enable_gamelift ? 1 : 0
+  providers = {
+    aws   = aws.secondary
+    awscc = awscc.secondary
+  }
+
+  name_prefix = "raidync-dev"
+  build_dir   = "${path.root}/../../../build/gameserver"
+
+  tags = var.tags
+}
+
 module "lambda" {
   source = "../../modules/lambda"
 
@@ -164,6 +184,10 @@ module "lambda_secondary" {
 
   # セッションアフィニティの固定先（このリージョン固有名）。
   api_base_url = local.dns_enabled ? "https://${local.api_fqdn_secondary}" : ""
+
+  # このリージョンのフリートに繋ぐ。us-east-1 でマッチしたプレイヤーが
+  # 東京のゲームサーバーに飛ばされては本末転倒なので、必ず自リージョンのものを渡す。
+  gamelift_fleet_id = one(module.gamelift_ec2_secondary[*].fleet_id)
 
   tags = var.tags
 }

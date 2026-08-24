@@ -29,14 +29,24 @@ output "lambda_function_names" {
   value       = module.lambda.function_names
 }
 
-output "gamelift_fleet_id" {
-  description = "Managed EC2 フリート ID。enable_gamelift=false のときは null。"
-  value       = one(module.gamelift_ec2[*].fleet_id)
+output "gamelift_fleet_ids" {
+  description = <<-EOT
+    リージョン => Managed EC2 フリート ID。enable_gamelift=false なら空。
+    ⚠ フリートは唯一の時間課金リソース。検証が終わったら必ず
+    enable_gamelift=false で apply して消すこと（2 基で約 $0.06/時）。
+  EOT
+  value = var.enable_gamelift ? {
+    (var.region)           = module.gamelift_ec2[0].fleet_id
+    (var.secondary_region) = module.gamelift_ec2_secondary[0].fleet_id
+  } : {}
 }
 
-output "gamelift_build_id" {
-  description = "GameLift Build ID。enable_gamelift=false のときは null。"
-  value       = one(module.gamelift_ec2[*].build_id)
+output "gamelift_build_ids" {
+  description = "リージョン => GameLift Build ID。enable_gamelift=false なら空。"
+  value = var.enable_gamelift ? {
+    (var.region)           = module.gamelift_ec2[0].build_id
+    (var.secondary_region) = module.gamelift_ec2_secondary[0].build_id
+  } : {}
 }
 
 output "api_invoke_url" {

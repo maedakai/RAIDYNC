@@ -37,3 +37,9 @@ provider "aws" {
 provider "awscc" {
   region = var.region
 }
+
+# gamelift_ec2 をセカンダリにも建てる場合に使う（Build は awscc が必要）。
+provider "awscc" {
+  alias  = "secondary"
+  region = var.secondary_region
+}

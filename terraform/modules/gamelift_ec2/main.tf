@@ -10,13 +10,19 @@
 
 data "aws_caller_identity" "current" {}
 
+# マルチリージョン構成ではこのモジュールが provider alias 違いで複数回
+# インスタンス化される。S3 バケット名（グローバル一意）・IAM ロール名（グローバル）・
+# zip の出力パスがそのままだと衝突するため、リージョン名を混ぜて分離する。
+data "aws_region" "current" {}
+
 # ---- Build 成果物の zip 化と S3 配置 ----
 
 # scripts/build-gameserver.sh の出力（gameserver / install.sh / start.sh）を固める。
 data "archive_file" "build" {
-  type        = "zip"
-  source_dir  = var.build_dir
-  output_path = "${var.build_dir}.zip"
+  type       = "zip"
+  source_dir = var.build_dir
+  # リージョンごとに別ファイルにする（同一パスだと 2 インスタンスが取り合う）。
+  output_path = "${var.build_dir}-${data.aws_region.current.name}.zip"
   # Windows で生成したファイルは実行ビットを持たず、そのまま zip 化すると
   # 展開後 gameserver / start.sh が非実行になり GameLift が起動できない
   # （SERVER_PROCESS_INVALID_PATH）。全ファイルを 0755 で固めて実行権限を保証する。
@@ -24,8 +30,10 @@ data "archive_file" "build" {
 }
 
 resource "aws_s3_bucket" "build" {
-  # バケット名はグローバル一意が必要なためアカウント ID を混ぜる。
-  bucket = "${var.name_prefix}-gamelift-build-${data.aws_caller_identity.current.account_id}"
+  # バケット名はグローバル一意が必要なためアカウント ID を混ぜる。さらに
+  # GameLift の CreateBuild は**フリートと同一リージョンの S3** を要求するため、
+  # リージョンごとにバケットを分ける（リージョン名も名前に含める）。
+  bucket = "${var.name_prefix}-gamelift-build-${data.aws_caller_identity.current.account_id}-${data.aws_region.current.name}"
 
   # dev では destroy 時に中身ごと消せるようにする（後片付けを 1 コマンドで完結させる）。
   force_destroy = true
@@ -65,7 +73,7 @@ data "aws_iam_policy_document" "gamelift_assume" {
 }
 
 resource "aws_iam_role" "build_access" {
-  name               = "${var.name_prefix}-gamelift-build-access"
+  name               = "${var.name_prefix}-gamelift-build-access-${data.aws_region.current.name}"
   assume_role_policy = data.aws_iam_policy_document.gamelift_assume.json
   tags               = var.tags
 }
@@ -85,7 +93,7 @@ data "aws_iam_policy_document" "build_access" {
 }
 
 resource "aws_iam_role_policy" "build_access" {
-  name   = "${var.name_prefix}-gamelift-build-access"
+  name   = "${var.name_prefix}-gamelift-build-access-${data.aws_region.current.name}"
   role   = aws_iam_role.build_access.id
   policy = data.aws_iam_policy_document.build_access.json
 }
@@ -96,7 +104,7 @@ resource "aws_iam_role_policy" "build_access" {
 # awscc（Cloud Control）版なら server_sdk_version を指定できる。storage_location / tags は
 # nested block でなく object 属性で、tags は {key,value} のリスト形式である点が aws provider と異なる。
 resource "awscc_gamelift_build" "this" {
-  name             = "${var.name_prefix}-gameserver"
+  name             = "${var.name_prefix}-gameserver-${data.aws_region.current.name}"
   operating_system = var.operating_system
   # AL2023 は SDK 5.0 以上でのみサポートされる（未指定だと既定 4.0.2 で CreateBuild が失敗する）。
   server_sdk_version = var.server_sdk_version
@@ -118,7 +126,7 @@ resource "awscc_gamelift_build" "this" {
 # ---- Fleet ----
 
 resource "aws_gamelift_fleet" "this" {
-  name        = "${var.name_prefix}-fleet"
+  name        = "${var.name_prefix}-fleet-${data.aws_region.current.name}"
   description = "RAIDYNC ゲームサーバー（Managed EC2 / ${var.fleet_type}）"
 
   build_id          = awscc_gamelift_build.this.build_id
