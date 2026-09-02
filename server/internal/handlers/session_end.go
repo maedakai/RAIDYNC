@@ -33,27 +33,27 @@ func NewSessionEnd(client *db.Client) *SessionEnd {
 func (h *SessionEnd) Handle(ctx context.Context, req events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
 	sessionID := req.PathParameters["sessionId"]
 	if sessionID == "" {
-		return apigw.Error(400, "sessionId is required"), nil
+		return apigw.Error(ctx, 400, "sessionId is required", nil), nil
 	}
 
 	var in protocol.SessionEndInput
 	if err := json.Unmarshal([]byte(req.Body), &in); err != nil {
-		return apigw.Error(400, "invalid request body"), nil
+		return apigw.Error(ctx, 400, "invalid request body", nil), nil
 	}
 	if !validResult(in.Result) {
-		return apigw.Error(400, "result must be one of CLEAR/FAILED/ABANDONED"), nil
+		return apigw.Error(ctx, 400, "result must be one of CLEAR/FAILED/ABANDONED", nil), nil
 	}
 
 	sess, err := h.db.GetSession(ctx, sessionID)
 	if err != nil {
-		return apigw.Error(500, "session lookup failed"), nil
+		return apigw.Error(ctx, 500, "session lookup failed", err), nil
 	}
 	if sess == nil {
-		return apigw.Error(404, "session not found"), nil
+		return apigw.Error(ctx, 404, "session not found", nil), nil
 	}
 	// 既に終了済みなら二重報告として弾く（冪等性ガード）。
 	if sess.Status == protocol.SessionEnded {
-		return apigw.Error(409, "session already ended"), nil
+		return apigw.Error(ctx, 409, "session already ended", nil), nil
 	}
 
 	// 履歴を先に全員分書き、最後にセッションを終了する。
@@ -69,15 +69,15 @@ func (h *SessionEnd) Handle(ctx context.Context, req events.APIGatewayProxyReque
 			DurationSec: in.DurationSec,
 		}
 		if err := h.db.PutMatchResult(ctx, entry); err != nil {
-			return apigw.Error(500, "failed to save match result"), nil
+			return apigw.Error(ctx, 500, "failed to save match result", err), nil
 		}
 	}
 
 	if err := h.db.EndSession(ctx, sessionID, now); err != nil {
-		return apigw.Error(500, "failed to end session"), nil
+		return apigw.Error(ctx, 500, "failed to end session", err), nil
 	}
 
-	return apigw.JSON(200, protocol.SessionEndOutput{
+	return apigw.JSON(ctx, 200, protocol.SessionEndOutput{
 		SessionID:    sessionID,
 		Status:       protocol.SessionEnded,
 		PlayersSaved: len(sess.PlayerIDs),

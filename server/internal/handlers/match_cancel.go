@@ -27,28 +27,28 @@ func NewMatchCancel(client *db.Client) *MatchCancel {
 func (h *MatchCancel) Handle(ctx context.Context, req events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
 	ticketID := req.PathParameters["ticketId"]
 	if ticketID == "" {
-		return apigw.Error(400, "ticketId is required"), nil
+		return apigw.Error(ctx, 400, "ticketId is required", nil), nil
 	}
 
 	t, err := h.db.GetTicket(ctx, ticketID)
 	if err != nil {
-		return apigw.Error(500, "ticket lookup failed"), nil
+		return apigw.Error(ctx, 500, "ticket lookup failed", err), nil
 	}
 	if t == nil {
-		return apigw.Error(404, "ticket not found"), nil
+		return apigw.Error(ctx, 404, "ticket not found", nil), nil
 	}
 	if t.Status != protocol.StatusWaiting {
-		return apigw.Error(409, "ticket is not cancellable"), nil
+		return apigw.Error(ctx, 409, "ticket is not cancellable", nil), nil
 	}
 
 	// 条件付き更新で WAITING 以外への遷移と競合した場合も 409 に倒す。
 	if err := h.db.CancelTicket(ctx, ticketID); err != nil {
 		if errors.Is(err, db.ErrConflict) {
-			return apigw.Error(409, "ticket is not cancellable"), nil
+			return apigw.Error(ctx, 409, "ticket is not cancellable", nil), nil
 		}
-		return apigw.Error(500, "cancel failed"), nil
+		return apigw.Error(ctx, 500, "cancel failed", err), nil
 	}
-	return apigw.JSON(200, map[string]string{
+	return apigw.JSON(ctx, 200, map[string]string{
 		"ticketId": ticketID,
 		"status":   string(protocol.StatusCancelled),
 	}), nil

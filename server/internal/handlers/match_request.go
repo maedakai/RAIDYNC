@@ -29,15 +29,15 @@ func NewMatchRequest(client *db.Client) *MatchRequest {
 func (h *MatchRequest) Handle(ctx context.Context, req events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
 	playerID, ok := apigw.PlayerID(req)
 	if !ok {
-		return apigw.Error(401, "missing player identity"), nil
+		return apigw.Error(ctx, 401, "missing player identity", nil), nil
 	}
 
 	var in protocol.MatchRequestInput
 	if err := json.Unmarshal([]byte(req.Body), &in); err != nil {
-		return apigw.Error(400, "invalid request body"), nil
+		return apigw.Error(ctx, 400, "invalid request body", nil), nil
 	}
 	if in.QuestID == "" {
-		return apigw.Error(400, "questId is required"), nil
+		return apigw.Error(ctx, 400, "questId is required", nil), nil
 	}
 
 	// 以降の match/status・match/cancel を送るべきリージョン固定 URL。
@@ -48,9 +48,9 @@ func (h *MatchRequest) Handle(ctx context.Context, req events.APIGatewayProxyReq
 	// 注: この検索は自リージョンのテーブルのみが対象。別リージョンで発行済みの
 	// チケットは見えない（region-local の帰結。docs/qa-log.md §13 の不都合②）。
 	if existing, err := h.db.FindWaitingByPlayer(ctx, playerID); err != nil {
-		return apigw.Error(500, "ticket lookup failed"), nil
+		return apigw.Error(ctx, 500, "ticket lookup failed", err), nil
 	} else if existing != nil {
-		return apigw.JSON(200, matchRequestOutput(existing, endpoint)), nil
+		return apigw.JSON(ctx, 200, matchRequestOutput(existing, endpoint)), nil
 	}
 
 	now := time.Now()
@@ -70,9 +70,9 @@ func (h *MatchRequest) Handle(ctx context.Context, req events.APIGatewayProxyReq
 		TTL:         now.Unix() + protocol.TicketTTLSeconds,
 	}
 	if err := h.db.PutTicket(ctx, ticket); err != nil {
-		return apigw.Error(500, "failed to create ticket"), nil
+		return apigw.Error(ctx, 500, "failed to create ticket", err), nil
 	}
-	return apigw.JSON(200, matchRequestOutput(&ticket, endpoint)), nil
+	return apigw.JSON(ctx, 200, matchRequestOutput(&ticket, endpoint)), nil
 }
 
 // matchRequestOutput はチケットを応答形に変換する。endpoint は以降のリクエスト先を
