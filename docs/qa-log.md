@@ -16,6 +16,9 @@
 9. [Git / SSH 環境構築](#9-git--ssh-環境構築)
 10. [Phase 3：ゲームサーバー / トランスポート](#10-phase-3ゲームサーバー--トランスポート)
 11. [Phase 4：ローカル E2E ハーネス](#11-phase-4ローカル-e2e-ハーネス)
+12. [Phase 4：AWS dev E2E（本番同等環境）](#12-phase-4aws-dev-e2e本番同等環境)
+13. [Phase 5：マルチリージョン化](#13-phase-5マルチリージョン化)
+14. [IAM とトラブルシュート](#14-iam-とトラブルシュート)
 
 ---
 
@@ -136,6 +139,43 @@ A. はい。トランザクションは原子的。条件不一致が 1 件で�
 ### Q. マッチング成立処理をクライアントに任せることでインフラ構成が簡略化されている認識でいい?
 A. 正しい。専用のワーカーや EventBridge スケジューラを置かず、**クライアントのポーリングが matcher の実行契機**になる。チケットは受動的なデータ、Lambda が能動的なアクター、という役割分担でインフラを軽くしている。
 
+### Q. なぜ「悲観ロック」ではなく「楽観ロック」なのか?
+A. 前提が違う。
+
+| | 悲観ロック | 楽観ロック |
+|---|-----------|-----------|
+| 前提 | 競合は**よく起きる** | 競合は**めったに起きない** |
+| やり方 | 先にロックを取ってから作業 | 競合しない前提で進み、**書く瞬間に検証** |
+| 競合時 | 待たされる | 失敗を返し、**やり直す** |
+
+マッチメイキングでは大半のポーリングが空振り（4 人揃っていない）で、競合は「ちょうど同時に成立した」稀なケースだけ。低頻度の競合のために毎回ロックを取るコストは割に合わない。そもそも DynamoDB に行ロック（`SELECT ... FOR UPDATE` 相当）が無いので選択の余地もない。
+
+使える排他の道具は**条件付き書き込み**だけ = 「この属性がこうなっていたら書く、違えば書かずに失敗を返す」。比較と書き込みが**不可分**。C# の `Interlocked.CompareExchange`、EF Core の `RowVersion` / `[ConcurrencyCheck]` と同じ仕組み。
+
+### Q. 楽観ロックは Sessions テーブルに掛けるのでは?
+A. **違う。ロックは Tickets に掛ける。** 時間軸で見ると理由が分かる。
+
+```
+t0  A B C D E が全員 WAITING            ← チケットが 5 枚
+    Sessions テーブル … 空。まだ何も無い
+t1  Lambda-1 が {A,B,C,D} のチケット 4 枚を
+    TransactWriteItems で WAITING → MATCHING に確定   ← ★ 競合はここ
+    Lambda-2 は条件不成立で全ロールバック
+t2  勝った Lambda-1 だけが GameLift にセッション生成を依頼
+    返ってきた接続情報を Sessions に書く              ← 競合相手はもういない
+```
+
+争っているのは「**B・C・D という 4 人を自分のグループに入れる権利**」であり、その所有権を表すのがチケットの `status`。セッションを作る時点では勝者が 1 人に絞られているので、Sessions への書き込みに条件付き書き込みは不要。
+
+> **セッションは競争の結果であって、競争の対象ではない。**
+
+| | チケット | セッション |
+|---|---------|-----------|
+| いつ生まれる | 申請した瞬間 | **4 人揃った後** |
+| 生存期間 | 最大 90 秒（TTL） | 最大 20 分 |
+| 何を表す | 「待っている」という状態 | 「確定した」という結果 |
+| 競合するか | **する**（取り合いの対象） | しない（勝者だけが書く） |
+
 ---
 
 ## 3. DynamoDB
@@ -187,6 +227,50 @@ Terraform 側も `terraform/modules/lambda/main.tf` 冒頭コメントの通り�
 この設計が Phase 5 のマルチリージョンでそのまま効いている: us-east-1 に同一の zip をデプロイするだけで、ランタイムが `AWS_REGION=us-east-1` を設定 → `NewClient` がそれを読む → us-east-1 のレプリカを叩く。Go 側にリージョン分岐が一切要らない（`terraform/environments/dev/main.tf` の該当コメント参照）。
 
 設定するのはローカルのみ: `.env.example`（`http://localhost:4566`）、`docs/phase4-e2e-runbook.md` の PowerShell 手順、`internal/db/integration_test.go`（未設定なら `t.Setenv` で LocalStack を既定に）。
+
+### Q. SK（ソートキー）は何のためにある? 一意性が確保できれば何でもいい?
+A. **SK には役割が 2 つある。**
+1. 同じ PK の中でレコードを**区別する**（一意性）
+2. 同じ PK の中の**並び順を決める**（ソート・範囲検索）
+
+名前が Sort Key なのは 2 のため。MatchHistory の SK に `sessionId` を置くと 1 は満たすが 2 で破綻する（ランダムな文字列なので並び順が無意味 → 「最近 20 件」を取るのに全件読んでソートが必要 = Scan）。
+
+`timestamp`(Number) を SK にすると SK の並びがそのまま時系列になり:
+```
+Query(playerId = "abc", ScanIndexForward = false, Limit = 20)
+```
+で**新しい方から 20 件だけ読んで止まれる**（読み取り 20 件ぶんしか課金されない）。`timestamp BETWEEN 月初 AND 月末` のような範囲指定も可能。
+
+**PK は完全一致しか引けない。SK は範囲指定・前方一致ができる。** これが決定的な違い。sessionId はキーにせず**属性として**持つ。
+
+### Q. MatchmakingTickets の SK に TicketStatus を置いてはいけないのはなぜ?
+A. **PK / SK は主キーであり、主キーは変更できない**から。TicketStatus は `WAITING → MATCHING → MATCHED` と遷移するので、SK に置くと状態変更のたびに**レコードを削除して作り直す**ことになり、削除と再作成の間に別の Lambda が割り込める。
+
+これは §2 の楽観ロック（`version` + 条件付き書き込みで「1 チケットを 1 回だけ WAITING→MATCHING に遷移」を保証）を根本から壊す。条件付き `UpdateItem` はキーが不変であることが前提。
+
+**キーには変わらないものを置く。変わるものは属性に置く。**
+
+ただし「status で引きたい」という要求自体は正しく、それに応えるのが **GSI**。GSI のキーは**変化する属性でも構わない**（ベーステーブルの主キーと違い、DynamoDB が裏で維持する射影なので元の属性が変われば自動で張り替わる）。よって status は「ベーステーブルの SK」ではなく「**GSI のキー**」として使う。
+
+| GSI | 用途 |
+|-----|------|
+| `questId-status` | matcher が「同じクエストで status=WAITING」のチケットを探す |
+| `playerId-status` | 同一プレイヤーの二重申請チェック、キャンセル処理 |
+
+### Q. MatchmakingTickets の PK に sessionId を使えない理由は?
+A. **時間軸が合わない。** マッチ申請した瞬間、セッションはまだ存在しない（4 人揃ってから GameLift に作らせる）。存在しないものの ID は主キーにできない。PK は申請の応答としてクライアントへ返す `ticketId`。
+
+チケットとセッションは**ライフサイクルが別**（チケット: 申請時に生成、最大 90 秒で TTL 消滅 / セッション: マッチ成立後に生成、最大 20 分）。だからテーブルもキーも分かれる。
+
+### Q. Players テーブルにメールアドレスとパスワードを持つべき?
+A. **持たない。** 持った瞬間 Cognito を選んだ意味が消える（ハッシュアルゴリズム選定・ソルト・ストレッチング・漏洩時の責任・リセットフローが全部自前になる）。
+
+| | 持ち主 | 中身 |
+|---|--------|------|
+| 認証情報 | **Cognito** | メールアドレス、パスワード、MFA 設定 |
+| ゲームデータ | **DynamoDB (Players)** | 表示名、ランク、統計、所持装備など |
+
+繋ぐのは ID。Cognito の JWT に含まれる `sub`（ユーザー一意 ID）を `playerId` として DynamoDB を引く。よって Players テーブルにはメールアドレスすら不要。**PII をマネージドサービス側に寄せ、自前テーブルには置かない**という設計。
 
 ---
 
@@ -1447,3 +1531,378 @@ Route 53 のヘルスチェックは **2xx/3xx を返す URL** を要求する�
 **必要になった時の見通し**: オリジンは S3、証明書は **us-east-1 固定**（CloudFront は
 リージョナルと違い us-east-1 の証明書しか使えない）。Route 53 / ACM の実装で得た知見が
 そのまま使えるので、着手コストは低い。
+
+---
+
+### Q. 「セッション最大 20 分」という要件は、サービス選定にどう効く?
+A. **20 分という数字そのものはサービス選定を決めない。** 選定を決めるのは長さではなく「その 20 分間、接続が張りっぱなしで状態を持ち続ける」という**性質**のほう。ここから「UDP が要る → API Gateway も ALB も UDP を通せない → NLB か GameLift」という分岐が出る（§10 の UDP 採用判断につながる）。
+
+20 分という数字が実際に効くのは、アーキテクチャ選定ではなく**可用性設計とコスト計算**:
+
+| 効く箇所 | 内容 |
+|---------|------|
+| スケールインの猶予 | 進行中セッションを殺せない。縮退完了まで最大 20 分かかる前提で設計する（GameLift のドレイン） |
+| Spot 中断との関係 | Spot の中断通知は 2 分前。20 分のセッションには足りない → **On-Demand フォールバックが必要**な根拠 |
+| Sessions テーブルの TTL | 終了済みセッションレコードをいつ消すかの基準 |
+| 必要インスタンス数 | 1 インスタンスあたりの同時セッション数 × 回転率 で見積る |
+
+### Q. ゲームサーバー基盤に GameLift を選ぶ理由は「管理が最小だから」でいい?
+A. **不十分。**「ECS Fargate の方が管理は少ない」で崩れる。本当の決定打は管理コストではなく**スケーリングの軸**。
+
+- ECS / EKS のオートスケーリングは **CPU 使用率やリクエスト数**が基準。
+- ゲームサーバーで見るべき指標は「**空きセッションスロット数**」。CPU 30% でも 4/4 人埋まっていれば新規は受けられず、CPU 80% でも空きがあれば受けられる。**CPU とプレイヤー収容能力が相関しない**。
+
+汎用コンテナ基盤を選ぶと、以下 4 つを自前実装する必要が出る:
+1. **セッション配置** — 新規マッチをどの空きインスタンスに割り当てるか（GameLift の placement）
+2. **ドレイン** — スケールイン時、進行中セッションを殺さず新規受付だけ止めて終了を待つ
+3. **Spot 中断ハンドリング** — 2 分前通知を受けてセッションを退避
+4. **マッチメイキング** — FlexMatch 相当
+
+「これらを自作するか GameLift に任せるか」という比較にして初めて選定に説得力が出る。
+
+### Q. 認証に Cognito を選ぶ理由は「AWS と連携が取りやすいから」でいい?
+A. 弱い。具体的な利点を挙げる:
+- **パスワードハッシュの保管責任を自分で負わない**（自前 JWT + DynamoDB だとここを背負う）
+- 発行された **JWT を API Gateway / Lambda Authorizer 側で検証できる**（§5 参照）
+- **TOTP による MFA が標準で付く**
+
+### Q. このシステムの「サーバー」は 1 種類ではない?
+A. 性質の異なる **2 系統**がある。同じ基盤に載せてはいけない。
+
+| | データプレーン | コントロールプレーン |
+|---|---|---|
+| 中身 | ゲームサーバー本体 | ログイン・マッチ申請・セッション一覧・戦績 |
+| プロトコル | UDP | HTTP / REST |
+| 状態 | ステートフル、接続張りっぱなし | ステートレス |
+| 寿命 | 最大 20 分で消える | 1 リクエスト数十 ms |
+| 基盤 | GameLift | API Gateway + Lambda |
+
+分離する理由: ゲームサーバーに REST を生やすと「20 分で死ぬプロセス」に永続 API を同居させることになり、スケール単位も障害の影響範囲も混ざる。逆に Lambda では UDP のゲームループを回せない（実行時間上限があり、状態を持てない）。
+
+この分離を出発点に置くと「Lambda と GameLift の間で誰がセッション情報を持つのか → DynamoDB」「4 人揃うまでの待機状態をどこに置くか → MatchmakingTickets」まで自然に降りられる。
+
+---
+
+## 14. IAM とトラブルシュート
+
+> 「IAM 権限を 1 つ意図的に削って壊し、CloudWatch Logs から自力で原因を特定する」演習の記録。
+> 壊した箇所: `modules/iam` の DynamoDB ステートメントから `"${arn}/index/*"` を除去。
+
+### Q. テーブルへの `dynamodb:Query` 権限はあるのに、GSI への Query が `AccessDeniedException` で落ちるのはなぜか
+
+**ARN は階層ではなく、IAM のリソース照合はワイルドカード付きの単純な文字列マッチだから。**
+
+```
+arn:aws:dynamodb:ap-northeast-1:<acct>:table/MatchmakingTickets
+arn:aws:dynamodb:ap-northeast-1:<acct>:table/MatchmakingTickets/index/playerId-status-index
+```
+
+見た目は「テーブルの下に index がある」構造だが、IAM に「配下も自動的に許可」というルールは無い。**GSI は独立した IAM リソース**であり、テーブル ARN は index ARN を含まない。
+
+さらに DynamoDB 側の挙動として、`IndexName` を指定した `Query` は**テーブル ARN ではなく index ARN に対して**認可される。ゆえに「テーブルへの Query 権限はあるのに落ちる」が成立する。
+
+```hcl
+# 正: テーブル本体と index の両方を列挙する
+resources = concat(
+  var.dynamodb_table_arns,
+  [for arn in var.dynamodb_table_arns : "${arn}/index/*"],
+)
+```
+
+`table/MatchmakingTickets*`（末尾ワイルドカード）でも通るが、`MatchmakingTicketsBackup` のような別テーブルにも当たるため使わない。
+
+### Q. 権限エラーなのに、なぜ HTTP 403 ではなく 500 が返るのか
+
+**IAM の文脈が 2 つあり、失敗しているのが「呼び出した人」ではなく「Lambda 自身」だから。**
+
+| | 誰の権限か | 何を判定するか | この事故での結果 |
+|---|---|---|---|
+| ① API Gateway 層 | **プレイヤー**（JWT の `sub`） | `execute-api:Invoke` してよいか | 成功（authorizer は通る） |
+| ② Lambda 実行層 | **Lambda 自身**（実行ロール） | DynamoDB を Query してよいか | **失敗** |
+
+403 は ① の文脈のコード。今回は JWT 検証も authorizer も通っており、落ちているのは ②。クライアントから見れば「サーバー側の都合で失敗した」ので 5xx が正しい。ここで 403 を返すと、クライアントが「ログインし直す」という誤った回復動作をしてしまう。
+
+```go
+// handlers/match_request.go
+if existing, err := h.db.FindWaitingByPlayer(ctx, playerID); err != nil {
+    return apigw.Error(500, "ticket lookup failed"), nil
+}
+```
+
+**帰結: HTTP ステータスだけでは原因を切り分けられない。ログを見に行くしかない。**
+
+診断手順:
+
+```bash
+# Lambda のロググループ名は /aws/lambda/<関数名> で決まる
+aws logs tail /aws/lambda/raidync-dev-match_request --since 5m --region ap-northeast-1
+```
+
+`AccessDeniedException` のメッセージには「どの Principal が・どの Action を・どの Resource に」拒否されたかが全て入っており、末尾の ARN が `.../index/playerId-status-index` を名指しする。
+
+### Q. この権限漏れはいつ混入し、なぜテストをすり抜けるのか
+
+**混入と発覚のタイミングが大きくズレる。**
+
+混入の典型は「**後から GSI を 1 本追加する**」作業。本来 3 つやるべきところ、2 つしかやらない。
+
+| # | 作業 | 実際 |
+|---|---|---|
+| 1 | Terraform に `global_secondary_index` を追加 | やる |
+| 2 | Go に `IndexName` 付き Query を書く | やる |
+| 3 | IAM に index ARN を追加 | **忘れる** |
+
+忘れる理由は 2 つ。
+
+- ポリシーを見ると `dynamodb:Query` が既にあり、**権限が足りているように見える**。追加が必要なのは Action ではなく Resource
+- **IAM ファイルは変更されないので PR の diff に現れない**。「変更していないファイルが原因」という最も見つけにくい形になる
+
+他の混入経路: セキュリティ強化で `Resource = "*"` を明示 ARN に絞る作業、モジュールの別環境への使い回し。
+
+すり抜ける理由:
+
+```
+ローカル E2E : 通る（LocalStack は IAM を評価しない）
+CI 単体テスト: 通る（DynamoDB はモック）
+AWS dev      : 実行された経路だけ落ちる
+本番         : レアな経路が初めて落ちる
+```
+
+**IAM の権限不足は「そのコードパスが実行された瞬間」にしか発覚しない。** 今回壊した `playerId-status-index` は `match_request` の冒頭で使われるため最初の 1 リクエストで落ちるが、`match_cancel` の所有者確認だけが使う GSI なら、キャンセルを試すまで誰も気づかない。カバレッジの低い経路の権限不足は本番まで生き残る。
+
+対策（Phase 6 へつながる）:
+
+1. **AWS dev で実 E2E を回す** — Phase 4 でこれをやった理由がここにある
+2. **CloudTrail の `AccessDenied` を監視してアラート** — 発覚を「ユーザーの苦情」ではなく「メトリクス」にする
+3. IAM Access Analyzer の policy validation
+
+### Q. `terraform plan` で身に覚えのない destroy 差分（19 個）が出た
+
+**`-var-file=dev.tfvars` の付け忘れ。** 変更履歴とは無関係の、見かけ上の差分。
+
+```hcl
+# variables.tf
+variable "domain_name" {
+  type    = string
+  default = ""      # ← 未指定ならこれ
+}
+
+# dns.tf:19
+dns_enabled = var.domain_name != ""
+```
+
+DNS・ACM 証明書・カスタムドメイン一式は `dns_enabled` で `count` ゲートされているため、`domain_name` が空になると全部 destroy 対象になる。
+
+| 実行方法 | `domain_name` | 結果 |
+|---|---|---|
+| `terraform plan` | `""`（default） | DNS 系 **19 個を destroy** |
+| `terraform plan -var-file=dev.tfvars` | `"raidync.com"` | 差分なし |
+
+同時に出る `2 to change` は `match_request`（primary/secondary）の環境変数 `API_BASE_URL`。`apigw.RegionEndpoint()` がここからリージョン固定エンドポイントを読むため、ドメインが消えると値が空になる。**`match_request` だけが対象なのは偶然ではなく、セッションアフィニティ用エンドポイントを返すのがこの関数だけだから**（§13 参照）。
+
+`default = ""` は「ドメイン未取得でも apply できる」ための意図的な設計だが、その柔軟性と引き換えに**付け忘れ事故のリスク**を負っている。回避策は `terraform.tfvars` にリネームして自動読み込みさせるか、`default` を消して必須変数にするか。
+
+### Q. Windows でシェルを変えたら同じコマンドが通らなくなった（Git Bash / PowerShell）
+
+**引数の分解ルールがシェルごとに違う。** この演習中に 2 つ踏んだので記録する。
+
+#### ① Git Bash（MSYS）: `/` 始まりの引数を Windows パスに変換する
+
+```bash
+aws logs tail /aws/lambda/raidync-dev-match_request --region ap-northeast-1
+# → InvalidParameterException: logGroupName failed to satisfy constraint: [\.\-_/#A-Za-z0-9]+
+```
+
+MSYS が `/aws/lambda/...` を Windows パスとみなし、`C:/Program Files/Git/aws/lambda/...` に書き換える。変換後は**スペース**を含むため AWS 側の正規表現に落ちる。ロググループ名自体は正しい。
+
+```bash
+# 回避
+MSYS_NO_PATHCONV=1 aws logs tail /aws/lambda/raidync-dev-match_request --region ap-northeast-1
+```
+
+CloudWatch Logs のロググループ、IAM のパス、S3 のキーなど「`/` 始まりの識別子」全般で起きる。
+
+#### ② PowerShell: `-name=value` の値にあるドットで引数が分断される
+
+```powershell
+terraform ... -target=module.iam.aws_iam_role_policy.matchmaking
+# → Error: Invalid target "module"
+# → Error: Too many command line arguments
+```
+
+実測した分解結果:
+
+| 書き方 | 分解結果 |
+|---|---|
+| `-a=foo.bar` | `[-a=foo]` `[.bar]` ← **割れる** |
+| `-a=foo_bar.baz` | `[-a=foo_bar]` `[.baz]` ← 割れる |
+| `-a=C:/x/foo.bar` | `[-a=C:/x/foo.bar]` ← 割れない |
+| `foo.bar`（先頭に `-` なし） | `[foo.bar]` ← 割れない |
+
+**規則:** トークンが `-` で始まり `=` を含むと、PowerShell は `=` の右側を式として読み始める。bareword の直後の `.` が**メンバーアクセス演算子**と解釈され、そこで引数が切れる。`-var-file=C:/.../dev.tfvars` が無傷なのは、値に `:` と `/` があり「パスらしい」ため bareword 扱いされるから。Git Bash では `.` に特別な意味がないのでそのまま渡る。
+
+回避策（いずれも実測で有効）:
+
+```powershell
+terraform ... -target="module.iam.aws_iam_role_policy.matchmaking"   # A. 値だけ引用（推奨）
+terraform ... "-target=module.iam.aws_iam_role_policy.matchmaking"   # B. 全体を引用
+terraform ... -target module.iam.aws_iam_role_policy.matchmaking     # C. = をやめる
+terraform --% apply -target=module.iam...                            # D. stop-parsing トークン
+```
+
+**危険性:** 今回は terraform が両方エラーにしたが、壊れた `-target` が単に無視される作りだったら**ターゲット指定なしの全体 apply** が走り得た。`-var-file` 付け忘れと重なれば DNS 19 個が消える。`-target` は必ずドットを含むので、**常に引用符で囲む**のを習慣にする。
+
+### Q. IAM ポリシーの 1 行を消したら diff が 8 行出た。影響範囲をどう読むか
+
+**`for` 式は「ソース 1 行」と「展開後の権限」が一致しない。**
+
+```hcl
+[for arn in var.dynamodb_table_arns : "${arn}/index/*"]
+# → 4 テーブル × 2 リージョン = 8 本の index ARN を生成
+```
+
+変更されるリソースは `aws_iam_role_policy` 1 個（`Plan: 1 to change`）だが、権限としては 8 本が消える。**HCL のソースだけを見て「1 行だから安全」と判断すると事故る。plan の出力こそがレビュー対象。**
+
+副次的な発見として、**元のポリシー自体がやや過剰付与だった**。GSI を持つのは `MatchmakingTickets` のみで、`Players` / `Sessions` / `MatchHistory` には index が無い。存在しないリソースへの権限なので今は無害だが、将来それらに GSI を足した瞬間に意図せず権限が付く。`for` で楽をした代償として「どのテーブルに index 権限が要るか」を人間が考えなくなっている、という構造的な指摘ができる。
+
+---
+
+> ここから下は、上の演習中に**演習とは無関係の実在の欠陥**が見つかったため、その修正記録。
+> 欠陥: 全ハンドラが `err` を握り潰しており、500 が起きても CloudWatch に何も残らなかった。
+
+### Q. 500 を返しているのに CloudWatch Logs に何も出ないのはなぜか
+
+**アプリが一度もログを書いていなかったから。** そのうえで、監視の穴が三重になっていた。
+
+| 経路 | 状態 |
+|---|---|
+| クライアントへの応答 | `{"error":"ticket lookup failed"}` — 原因を含まない（これは正しい） |
+| CloudWatch Logs | **空**。`START`/`END`/`REPORT` のみ |
+| Lambda の `Errors` メトリクス | **0**。`return apigw.Error(500, ...), nil` は Lambda 的には「成功」 |
+
+唯一反応するのは API Gateway の `5XXError` だが、これは「どこかで 500 が出た」しか教えてくれない。**原因を持っている唯一の場所（`err`）が、コード上で捨てられていた**のが根本。
+
+```go
+if existing, err := h.db.FindWaitingByPlayer(ctx, playerID); err != nil {
+    return apigw.Error(500, "ticket lookup failed"), nil   // err がここで消える
+}
+```
+
+`err` を捨てているのは 6 ハンドラすべて。ログ出力が存在したのは `authorizer` の 1 行のみだった。
+
+### Q. エラーログはどこに書くべきか。各ハンドラか、共通関数か
+
+**「規律で守る」のではなく「型で守る」形にした。** `apigw.Error()` のシグネチャに `err` を必須引数として足す。
+
+```go
+// 変更前: err を渡す口が無い。だから捨てるしかなかった
+func Error(status int, message string) events.APIGatewayProxyResponse
+
+// 変更後: 渡さないとコンパイルが通らない
+func Error(ctx context.Context, status int, message string, err error) events.APIGatewayProxyResponse
+```
+
+各ハンドラに `log.Printf` を書いて回る案（＝規律）は、次にハンドラを足した人がまた忘れる。**忘れることをコンパイルエラーにする**のがこの変更の狙い。エラーを持たない 4xx では `nil` を明示的に渡すことになり、その `nil` が「ここは意図的にログ不要」というレビュー可能な意思表示になる。
+
+### Q. `requestId` も引数で渡すべきか
+
+**渡すべきではない。`ctx` の中にすでに入っているため。**
+
+```go
+reqID := ""
+if lc, ok := lambdacontext.FromContext(ctx); ok {
+    reqID = lc.AwsRequestID
+}
+```
+
+引数にすると、24 か所すべてで `lambdacontext` の定型コードを書き、渡し直すことになる。しかも `""` を渡してもコンパイルは通るので、**「型で守る」どころか間違える口を 24 個増やす**。`ctx` はリクエストスコープの値を運ぶ袋であり、中身を取り出すのはそれを使う側（＝`Error()` の中）の仕事。
+
+> C# で言えば、`HttpContext` を渡しておきながら `TraceIdentifier` も別引数で渡すようなもので、片方が嘘をつける状態になる。
+
+### Q. `slog.Error(err.Error())` の何が問題だったか（2 つ）
+
+**① `err == nil` で panic する。** `err.Error()` は nil インターフェースへのメソッド呼び出し。`nil` を渡す箇所が 15 あるため、**`questId` を空にして叩くだけで Lambda がクラッシュ**した。
+
+そしてプロキシ統合の帰結として、**クライアントの入力ミス（400）がサーバー障害（502）に化ける**。元の欠陥より悪化していた。`go build` も `go vet` も通ったが、`internal/handlers` にテストが 1 つも無いため誰も気づけない。
+
+**② `slog` の引数はキーと値のペアで、奇数個だと最後が捨てられる。**
+
+```
+現在:  ...,"requestId":"abc-123","!BADKEY":"operation error DynamoDB: Query, AccessDenied..."
+正しい: ...,"requestId":"abc-123","err":"operation error DynamoDB: Query, AccessDenied..."
+```
+
+`!BADKEY` になると `err` というキーで検索できず、**構造化した目的そのものが失われる**。`err.Error()` ではなく `err` をそのまま渡せば、JSON ハンドラが文字列化する。
+
+なお `msg` にエラー本文を入れるのも避ける。エラーごとに `msg` が変わると `stats count() by msg` のような集計ができない。**`msg` は低カーディナリティの固定文字列、変動値は属性**。
+
+### Q. 4xx にも `err` を渡してよいか
+
+**渡さない。ERROR レベルは「人が起きて対応すべきこと」に限る。**
+
+当初 4 か所で 4xx に `err` を渡していた。
+
+| 場所 | 状況 | 実態 |
+|---|---|---|
+| 400 invalid request body | `json.Unmarshal` 失敗 | 不正なクライアントが投げれば出る |
+| 404 ticket not found | `ErrTicketNotFound` | TTL 90 秒で消えるので**日常的に出る** |
+| 409 not cancellable | `db.ErrConflict` | **楽観ロックが設計どおり効いた証拠** |
+
+これらを ERROR にすると、Phase 6 で作る「ERROR が出たらアラート」が四六時中鳴り、やがて誰も見なくなる。そのとき本物の `AccessDeniedException` が埋もれる。**アラート疲れは運用でいちばん多い失敗**。4xx はクライアントの問題であってサーバーの障害ではない。
+
+### Q. `slog.SetDefault` はどこに置くか
+
+**各 `cmd/lambda/*/main.go`。`apigw` パッケージの `init()` には置かない。**
+
+`init()` に置くと、`apigw` を import しただけでそのプロセスのログ形式が変わる。**import した側はコードからその副作用を読み取れない。** Go の慣習は「ライブラリはログを設定しない。設定するのは `main` だけ」。C# でクラスライブラリの静的コンストラクタがアプリの `ILoggerFactory` を上書きしたら事故なのと同じ。
+
+```go
+func main() {
+    slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
+    ...
+}
+```
+
+### Q. `return apigw.Error(500, ...), nil` の `nil` を `err` に変えるべきか
+
+**変えない。** Lambda の `Errors` メトリクスは立つが、代償が大きい。
+
+| | `..., nil`（採用） | `nil, err` |
+|---|---|---|
+| Lambda `Errors` | 0 | 1 |
+| クライアントのコード | **500**（自分で決めた値） | **502 Bad Gateway** |
+| クライアントのボディ | `{"error":"ticket lookup failed"}` | `{"message":"Internal server error"}` |
+
+**Lambda プロキシ統合は、関数エラーが返った時点でこちらのレスポンスを捨てる。** ステータスもボディも制御を失ううえ、502 は「ゲートウェイの先が不正」という**嘘**になる（壊れているのは DynamoDB の権限で、ゲートウェイは正常）。
+
+代わりに、アラートは**ログから作る**。① CloudWatch Logs のメトリクスフィルタ（`{ $.level = "ERROR" }`）か、② EMF（決められた形の JSON を出すと自動でメトリクス化される。フィルタ設定も `PutMetricData` も不要）。**どちらも JSON ログが前提**で、これが `slog` を選ぶ実務上の理由。Phase 6 で実装する。
+
+> なお API Gateway → Lambda は**同期**呼び出しなので、エラーを返してもリトライは起きない（非同期なら自動で 2 回リトライされる）。
+
+### Q. 修正は実際に効いたか（AWS dev での検証結果）
+
+IAM を再び壊して同じ経路を踏ませた。**前回は空だった場所に、原因が名指しで出た。**
+
+```json
+{"time":"2026-09-02T13:52:55.699699825Z","level":"ERROR","msg":"ticket lookup failed",
+ "status":500,"requestId":"8ee19780-36cf-4e82-849c-f480a969f8b3",
+ "err":"operation error DynamoDB: Query, ... AccessDeniedException: User: arn:aws:sts::<acct>:assumed-role/raidync-dev-matchmaking/raidync-dev-match_request is not authorized to perform: dynamodb:Query on resource: arn:aws:dynamodb:ap-northeast-1:<acct>:table/MatchmakingTickets/index/playerId-status-index because no identity-based policy allows the dynamodb:Query action"}
+```
+
+クライアントが受け取ったのは `{"error":"ticket lookup failed"}` のみで、アカウント ID もロール名も漏れていない。**詳細はログへ、クライアントへは曖昧に**が成立。
+
+CloudWatch Logs Insights でフィールドとして引けることも確認した。
+
+```
+fields @timestamp, msg, status, requestId, err | filter level = "ERROR" | sort @timestamp desc
+```
+
+4xx（`questId` 空 → 400）では ERROR 行が出ないことも確認済み。
+
+### Q. `-target` を付けた apply の後、何に注意すべきか
+
+**`-target` は「今は触らない」ではなく「後で必ず追いつかせる」という借金。**
+
+デプロイを `-target=module.lambda` に絞った結果、**`module.lambda_secondary`（us-east-1）に古いバイナリが残った**。`terraform plan`（`-target` なし）に `6 to change` として現れて発覚。
+
+マルチリージョン構成で片肺だけ古いコードが動く状態は、本番なら事故のもと。Terraform が毎回 `Resource targeting is in effect` と警告するのはこのため。**`-target` を使ったら、必ず素の `plan` で `No changes` まで戻す。**
