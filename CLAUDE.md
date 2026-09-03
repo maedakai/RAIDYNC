@@ -71,17 +71,28 @@ Unity クライアント (PC/Windows)
 
 ```
 terraform/
-├── environments/dev/   # dev tfvars + main.tf
-├── environments/prod/  # prod tfvars + main.tf
+├── environments/
+│   ├── dev/                 # AWS dev（本番同等構成）。aws + awscc（Build のみ）
+│   ├── anywhere/            # GameLift Anywhere 検証用（開発専用）。awscc provider 単独
+│   └── prod/                # 未着手
 └── modules/
-    ├── vpc/            # VPC 10.0.0.0/16、パブリック/プライベートサブネット
-    ├── cognito/
-    ├── api_gateway/
-    ├── lambda/
-    ├── gamelift/
-    ├── dynamodb/
-    └── monitoring/
+    ├── dynamodb/            # 実装済（Global Tables: Players/Sessions/MatchHistory）
+    ├── dynamodb_tickets/    # 実装済（region-local な MatchmakingTickets。各リージョンに 1 つ）
+    ├── iam/                 # 実装済（Lambda 実行ロールを用途別に2分割）
+    ├── gamelift_anywhere/   # 実装済（Anywhere 専用・awscc。開発検証用）
+    ├── lambda/              # 実装済（6 関数: authorizer, match-request/status/cancel, session-create/end）
+    ├── cognito/             # 実装済
+    ├── api_gateway/         # 実装済（REST API v1 + ヘルスチェック用 GET /health＝MOCK 統合）
+    ├── api_cert/            # 実装済（カスタムドメイン用 ACM 証明書。リージョンごと）
+    ├── api_domain/          # 実装済（API Gateway リージョナルカスタムドメイン）
+    ├── gamelift_ec2/        # 実装済（Managed EC2 フリート。Build のみ awscc — server_sdk_version が classic aws に無いため）
+    └── monitoring/          # 予定（Phase 6）
 ```
+
+- **`anywhere` 環境を分けている理由**: Anywhere は「自 PC を compute にする開発時の検証手段」で本番構成の部品ではない（本番は Managed EC2 + Spot）。dev の apply/destroy に検証用フリートを巻き込まないよう state を分離している。詳細は docs/qa-log.md §12。
+- **VPC モジュールは作らない**: Lambda は DynamoDB・GameLift をパブリックエンドポイントで呼べ、GameLift Managed EC2 は GameLift 管理の VPC で動くため、自前 VPC の使い所が無い。VPC に入れると NAT Gateway の時間課金（概算 月$60）が乗るだけになる。計画（docs/spec-architecture.md §2.1）からの変更点。判断の詳細は docs/qa-log.md §12。
+- **CloudFront モジュールも作らない**: 配信すべき静的アセットが存在しない（Unity クライアント未実装、ゲームサーバーは GameLift Build として S3 から配布され CloudFront を通らない）。空の CDN では本質的な難所に触れられない。計画（docs/spec-architecture.md §2.6、Phase 5-4）からの変更点。判断の詳細は docs/qa-log.md §13。
+- **MatchmakingTickets は Global Tables にしない**: 楽観ロック（`version` + 条件付き書き込み）による「1 チケットを 1 回だけ MATCHING に遷移」が、結果整合のマルチライターでは保証できないため。レプリケーションせず**各リージョンに独立した実体**を置く（`modules/dynamodb_tickets`）。この帰結として、レイテンシールーティング下ではポーリング先を発行元リージョンに固定する**セッションアフィニティ**が必須になる。
 
 ### ローカル開発スタック (Docker Compose)
 

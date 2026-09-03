@@ -37,6 +37,7 @@ type config struct {
 	apiURL      string
 	email       string
 	password    string
+	token       string
 	questID     string
 	soloAllowed bool
 	moves       int
@@ -94,6 +95,7 @@ func parseFlags() config {
 	flag.StringVar(&cfg.apiURL, "api", "http://localhost:8080", "localapi base URL")
 	flag.StringVar(&cfg.email, "email", "player1@example.com", "login email")
 	flag.StringVar(&cfg.password, "password", "password123", "login password")
+	flag.StringVar(&cfg.token, "token", "", "事前取得済み JWT を直接使う（設定時は mock-auth を迂回）。AWS dev E2E で実 Cognito の id_token を渡す用")
 	flag.StringVar(&cfg.questID, "quest", "quest-rathalos", "quest id to matchmake for")
 	flag.BoolVar(&cfg.soloAllowed, "solo", true, "allow immediate solo match (single-client E2E)")
 	flag.IntVar(&cfg.moves, "moves", 10, "number of PLAYER_MOVE packets to send during play")
@@ -113,6 +115,11 @@ type client struct {
 	sessionID string                  // マッチ成立で確定したゲームセッション ID
 	conn      protocol.ConnectionInfo // UDP 接続先（ゲームサーバ）
 	matchedAt time.Time               // マッチ成立時刻（所要秒の起点）
+
+	// ticketAPI は match/status・match/cancel の送り先。マルチリージョンでは
+	// チケットが region-local なので、match/request が返したリージョン固定 URL に
+	// 貼り付ける（セッションアフィニティ）。応答に endpoint が無ければ cfg.apiURL のまま。
+	ticketAPI string
 }
 
 func newClient(cfg config) *client {
@@ -125,6 +132,17 @@ func newClient(cfg config) *client {
 // authenticate は mock-auth に対して signup（既存なら 409 を許容）→ login を行い、
 // playerID と idToken を確立する。
 func (c *client) authenticate(ctx context.Context) error {
+	// -token 指定時は mock-auth を通さず、渡された JWT をそのまま使う。
+	// AWS dev E2E で実 Cognito の id_token を注入するための経路。
+	if c.cfg.token != "" {
+		c.idToken = c.cfg.token
+		sub, err := subjectFromJWT(c.cfg.token)
+		if err != nil {
+			return fmt.Errorf("extract subject from -token: %w", err)
+		}
+		c.playerID = sub
+		return nil
+	}
 	if err := c.signup(ctx); err != nil {
 		return err
 	}
@@ -242,8 +260,25 @@ func (c *client) requestMatch(ctx context.Context) error {
 		return fmt.Errorf("empty ticketId")
 	}
 	c.ticketID = out.TicketID
-	log.Printf("client: ticket status=%s quest=%s", out.Status, c.cfg.questID)
+
+	// 以降の status/cancel はチケットを作ったリージョンに固定する。
+	// マルチリージョンでは Route 53 が途中で別リージョンを返し得るため、
+	// 同じ URL を使い続けると「そのチケットは無い」で 404 になる。
+	c.ticketAPI = c.cfg.apiURL
+	if out.Endpoint != "" {
+		c.ticketAPI = out.Endpoint
+	}
+	log.Printf("client: ticket status=%s quest=%s region=%s pinned=%s",
+		out.Status, c.cfg.questID, orNone(out.Region), c.ticketAPI)
 	return nil
+}
+
+// orNone は空文字を可読な "(none)" に置き換える。
+func orNone(s string) string {
+	if s == "" {
+		return "(none)"
+	}
+	return s
 }
 
 // pollMatch は MATCHED になるまで GET /match/status/{ticketId} を一定間隔でポーリングする。
@@ -418,6 +453,10 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 // reportResult は POST /session/{sessionId}/end で結果を報告する。本番ではゲームサーバ
 // （GameLift プロセス）が呼ぶ server-to-server 経路のため、プレイヤー JWT は載せない。
 // DurationSec はマッチ成立からの経過秒。これにより MatchHistory への保存が走る。
+//
+// 送り先は ticketAPI ではなく cfg.apiURL でよい。Sessions / MatchHistory は
+// Global Tables でどのリージョンからでも同じデータを読み書きできるため、
+// リージョン固定が不要な API（docs/qa-log.md §13）。
 func (c *client) reportResult(ctx context.Context) error {
 	in := protocol.SessionEndInput{
 		Result:      protocol.MatchResult(c.cfg.result),
@@ -472,8 +511,9 @@ func (c *client) fetchHistory(ctx context.Context) error {
 }
 
 // matchStatus は GET /match/status/{ticketId} を 1 回叩いて結果をデコードする。
+// 送り先は cfg.apiURL ではなく ticketAPI（チケットを作ったリージョンに固定した URL）。
 func (c *client) matchStatus(ctx context.Context) (protocol.MatchStatusOutput, error) {
-	url := c.cfg.apiURL + "/match/status/" + c.ticketID
+	url := c.ticketAPI + "/match/status/" + c.ticketID
 	status, raw, err := c.getJSON(ctx, url, c.idToken)
 	if err != nil {
 		return protocol.MatchStatusOutput{}, err

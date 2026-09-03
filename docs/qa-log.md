@@ -16,6 +16,9 @@
 9. [Git / SSH 環境構築](#9-git--ssh-環境構築)
 10. [Phase 3：ゲームサーバー / トランスポート](#10-phase-3ゲームサーバー--トランスポート)
 11. [Phase 4：ローカル E2E ハーネス](#11-phase-4ローカル-e2e-ハーネス)
+12. [Phase 4：AWS dev E2E（本番同等環境）](#12-phase-4aws-dev-e2e本番同等環境)
+13. [Phase 5：マルチリージョン化](#13-phase-5マルチリージョン化)
+14. [IAM とトラブルシュート](#14-iam-とトラブルシュート)
 
 ---
 
@@ -69,6 +72,48 @@ A. 実装は **2 つの平面**に分かれ、その間を **`pkg/protocol`（�
 - **2 平面の継ぎ目（最重要）**: マッチ結果 `matchmaking.finalize → protocol.Session.PlayerIDs` が、GameLift の `GameProperties["playerIds"]` → `gamelift.go parseSessionConfig` → `game.NewSession(roster)` へ流れる。**`Session.PlayerIDs`（REST）＝ `Session.roster`（RT）**を一致させることで、別プロセス・別プロトコルの 2 平面が論理結合する。現状この継ぎ目は `gamelift_stub`（固定接続先）で、Phase 3 後半に実 GameLift へ差し替え。
 - **依存方向の規律**: 全層が内側の `protocol` に依存し `protocol` は何にも依存しない。`db`/`game` は末端。`net` は `gameserver` 層、AWS SDK は `db`/`gamelift` 層に局所化。`Store`/`SessionProvider`/`Sender`/`apigw.PlayerID` の各 IF が簡略版→本番版の無痛差し替えを可能にする（処理フロー視点は §10「Phase 3 各ファイルのシーケンス」を参照）。
 
+### Q. `server/` ディレクトリの全体を、下層から順に解説すると?
+A. Phase 4 完了時点（約 5,200 行 / 12 パッケージ）の構成。上記の 2 平面図に `handlers` と `cmd/localapi`・`cmd/client` が加わった形。
+
+**依存の下層から**
+1. **`pkg/protocol`（依存ゼロの正典）** — `types.go`（Ticket/Session/Player/MatchHistoryEntry + API 入出力。`dynamodbav` と `json` の両タグを 1 つの構造体に持たせ、DB 表現と API 表現の乖離を防ぐ）／`game.go`（UDP エンベロープ `GameMessage`。`Seq` は spec 外の自前拡張＝UDP の順序保証欠如への対策、`PlayerSessionID` は G1-full で追加）／`session_id.go`（`NormalizeGameSessionID`：ARN 末尾の `gsess-xxx` 抽出。AWS dev E2E の 403 バグ対策）。
+2. **`internal/db`** — DynamoDB に触れる唯一の層。`client.go`（`DYNAMODB_ENDPOINT` の有無で LocalStack/実 AWS を切替）＋テーブル別 4 ファイル。要は `tickets.go`：`ClaimTickets` が **TransactWriteItems + version/status 条件**で WAITING→MATCHING を原子的に取り、条件外れを `ErrConflict` に翻訳する。`status` は DynamoDB 予約語なので全クエリで `#s` プレースホルダ必須。
+3. **`internal/auth`** — JWKS 経由の RS256 JWT 検証。`aud`(id token) と `client_id`(access token) を Cognito 流儀で切り分ける。mock-auth と実 Cognito の**両方**に同じコードで通る。
+4. **`internal/apigw`** — `respond.go`（JSON/Error 整形）／`auth.go`（Authorizer Context から `sub` 抽出、`X-Player-Id` フォールバック付き）／`endpoint.go`（Phase 5: リージョン固定 URL の導出）。
+5. **`internal/matchmaking`** — `matcher.go` が中核。`TryMatch` は status ポーリング契機で呼ばれ、①WAITING 以外は素通し ②期限超過は最低人数で見切り発車→無理なら TIMEOUT ③solo 即成立 ④通常は 4 人狙い、の順に分岐。`selectGroup` はパーティを分割せず FIFO で残席を埋める純関数。`SessionProvider` IF の実装が 3 つ（`gamelift_stub`＝固定 127.0.0.1、`hubSessionProvider`＝ローカル同居 Hub、`gamelift_provider`＝実 GameLift の CreateGameSession+CreatePlayerSessions）。
+6. **`internal/game`** — UDP を知らないゲーム状態。`session.go` の `Ingest` が roster 検証→psid 採用→seq ゲート→種別別反映。参加/離脱通知は **Mutex 解放後に走らせる**（`defer` の LIFO を利用）ため、observer がネットワーク I/O をしても受信ホットパスを止めない。`sync.go` の `Hub` が sessionId でルーティングし 50ms tick でブロードキャスト。送信は `Sender` IF で抽象化。
+7. **`internal/gameserver`** — `server.go` が UDP ソケット＋2 ループ（受信は 500ms の read deadline で ctx キャンセルに応答）。`gamelift.go` の `GameLiftBridge` が SDK 5.x ライフサイクルを Hub に橋渡しし、`game.PlayerObserver` を実装。Accept/RemovePlayerSession は**バッファ付き channel で 1 本のワーカーに直列化**（順序保証＋ホットパス非ブロック、満杯時は落としてゲーム進行を優先）。
+8. **`internal/handlers`** — 5 つの API ハンドラ本体（Phase 4 で `package main` から抽出）。`Handle(ctx, APIGatewayProxyRequest)` 固定シグネチャで、本番 Lambda とローカル `localapi` が**同一実装を共有**する。`session_end.go` だけは server-to-server 経路でプレイヤー JWT を要求しない。
+9. **`cmd/lambda/*`（6 関数）** — `authorizer` 以外は依存を組んで `lambda.Start(h.Handle)` するだけの薄い殻。判断が残るのは `match_status/main.go` の `selectSessionProvider`（`GAMELIFT_FLEET_ID` の有無でスタブ/実 GameLift を選ぶ）。
+10. **`cmd/gameserver`** — 環境変数を読んで起動するだけ。`GAMELIFT_ENABLED=true` で Bridge を Activate し、セッションはコールバックで動的生成（false なら固定セッション 1 本のローカルモード）。
+11. **`cmd/localapi`** — 案 A のローカルハーネス。`adapter.go` が http⇄APIGatewayProxy の純変換、`main.go` の `withAuth` が authorizer Lambda の代役、`gameserver.go` が UDP サーバーを同居させ `hubSessionProvider` でマッチ結果を Hub に注入する（＝`OnStartGameSession` の代役）。
+12. **`cmd/client`** — E2E ドライバ。signup→login→match/request→ポーリング→UDP play→session/end→history を 1 本で通す。`-token` で実 Cognito のトークンを注入でき（AWS dev E2E 用）、`playerId` は JWT の sub をデコードして得る（署名検証はサーバー側の責務なのでしない）。
+
+**テストの分布** — ロジック層に集中: `matchmaking`（fakeStore で楽観ロック競合まで再現）37 ケース前後、`game`（session/sync/observer）、`auth`（9 ケース：期限切れ・issuer 違い・署名改竄）、`gamelift_provider`（フェイク SDK で AWS 無し検証）、`session_id`。実 I/O を伴うのは `server_loopback_test.go`（ループバック UDP 往復）と `db/integration_test.go`（`//go:build integration` タグ、LocalStack 必須）の 2 つだけ。
+
+### Q. `pkg/protocol/types.go` の `type TicketStatus string` + 定数群という書き方は何?
+A. Go に `enum` キーワードが無いための定石イディオム。「文字列を基底とする**定義型**」＋「その型を持つ定数群」で列挙型を代用する。`TicketStatus` / `SessionStatus` / `MatchResult` の 3 つが同じ形。
+
+**定義型であってエイリアスではない** — `type T string`（`=` なし）は基底型が `string` なだけの**別の型**。`var s string; t.Status = s` はコンパイルエラーになる。`type T = string`（`=` あり）だと `string` そのものになり、この防波堤は効かない。
+
+**`iota`（連番 int）を使わない理由** — この値は DynamoDB に保存され JSON で API を往復するため。
+
+| | int + iota | string |
+|---|---|---|
+| DynamoDB コンソール | `2` としか見えない | `MATCHED` と読める |
+| 定数の並び替え・途中挿入 | 既存データの意味が壊れる | 壊れない |
+| GSI キー（`questId-status`） | 判読不能 | そのまま使える |
+
+→ 永続化・外部公開される値は string、プロセス内で閉じる値は `iota`、という使い分け。
+
+**シリアライズは自動** — 基底型が `string` なので `encoding/json` も `dynamodbav` も追加実装なしで文字列として扱う。C# の `[JsonStringEnumConverter]` 相当が不要。
+
+**ただし閉じた enum ではない** — `t.Status = "BOGUS"`（未型付け定数の代入）も `TicketStatus(input)`（明示変換）も通る。守れるのは「変数経由の取り違え」までで、値の網羅性や `switch` の case 漏れはコンパイラが保証しない（`exhaustive` linter の領分）。不正値の検証は実行時に自前で書く前提。
+
+**定数名に型名を前置する理由** — Go の定数は型ではなくパッケージのスコープに属し、`TicketStatus.Waiting` のような修飾ができない（`protocol.StatusWaiting` になる）。そのため名前側に文脈を埋め込む。`Status*` / `Session*` / `Result*` の接頭辞がそれ。
+
+**メソッドを生やせる** — 定義型なので `func (s TicketStatus) IsTerminal() bool` のように振る舞いを付けられる（単なる string 定数群では不可）。現状は必要になっていないため未定義。
+
 ---
 
 ## 2. マッチメイキングの設計判断
@@ -94,6 +139,43 @@ A. はい。トランザクションは原子的。条件不一致が 1 件で�
 ### Q. マッチング成立処理をクライアントに任せることでインフラ構成が簡略化されている認識でいい?
 A. 正しい。専用のワーカーや EventBridge スケジューラを置かず、**クライアントのポーリングが matcher の実行契機**になる。チケットは受動的なデータ、Lambda が能動的なアクター、という役割分担でインフラを軽くしている。
 
+### Q. なぜ「悲観ロック」ではなく「楽観ロック」なのか?
+A. 前提が違う。
+
+| | 悲観ロック | 楽観ロック |
+|---|-----------|-----------|
+| 前提 | 競合は**よく起きる** | 競合は**めったに起きない** |
+| やり方 | 先にロックを取ってから作業 | 競合しない前提で進み、**書く瞬間に検証** |
+| 競合時 | 待たされる | 失敗を返し、**やり直す** |
+
+マッチメイキングでは大半のポーリングが空振り（4 人揃っていない）で、競合は「ちょうど同時に成立した」稀なケースだけ。低頻度の競合のために毎回ロックを取るコストは割に合わない。そもそも DynamoDB に行ロック（`SELECT ... FOR UPDATE` 相当）が無いので選択の余地もない。
+
+使える排他の道具は**条件付き書き込み**だけ = 「この属性がこうなっていたら書く、違えば書かずに失敗を返す」。比較と書き込みが**不可分**。C# の `Interlocked.CompareExchange`、EF Core の `RowVersion` / `[ConcurrencyCheck]` と同じ仕組み。
+
+### Q. 楽観ロックは Sessions テーブルに掛けるのでは?
+A. **違う。ロックは Tickets に掛ける。** 時間軸で見ると理由が分かる。
+
+```
+t0  A B C D E が全員 WAITING            ← チケットが 5 枚
+    Sessions テーブル … 空。まだ何も無い
+t1  Lambda-1 が {A,B,C,D} のチケット 4 枚を
+    TransactWriteItems で WAITING → MATCHING に確定   ← ★ 競合はここ
+    Lambda-2 は条件不成立で全ロールバック
+t2  勝った Lambda-1 だけが GameLift にセッション生成を依頼
+    返ってきた接続情報を Sessions に書く              ← 競合相手はもういない
+```
+
+争っているのは「**B・C・D という 4 人を自分のグループに入れる権利**」であり、その所有権を表すのがチケットの `status`。セッションを作る時点では勝者が 1 人に絞られているので、Sessions への書き込みに条件付き書き込みは不要。
+
+> **セッションは競争の結果であって、競争の対象ではない。**
+
+| | チケット | セッション |
+|---|---------|-----------|
+| いつ生まれる | 申請した瞬間 | **4 人揃った後** |
+| 生存期間 | 最大 90 秒（TTL） | 最大 20 分 |
+| 何を表す | 「待っている」という状態 | 「確定した」という結果 |
+| 競合するか | **する**（取り合いの対象） | しない（勝者だけが書く） |
+
 ---
 
 ## 3. DynamoDB
@@ -105,6 +187,90 @@ A.
 - **GSI（グローバルセカンダリインデックス）** … PK 以外の属性で検索するための「別の引き口」。本プロジェクトでは `questId-status-index` / `playerId-status-index`。**結果整合**である点に注意。
 - **TTL** … 指定した時刻（epoch 秒）を過ぎたレコードを DynamoDB が自動削除。MatchmakingTickets は 90 秒で消える短命データ。
 - **Global Tables** … 複数リージョン間で自動レプリケーションするマルチマスター構成。Players/Sessions/MatchHistory は対象、短命で region-local な MatchmakingTickets は対象外。
+
+### Q. Terraform でテーブル名を固定名（`Players`）にしているのはなぜ? 論理名との違いは?
+
+A. まず 1 テーブルに 3 レイヤーの名前がある点を区別する。
+
+- **Terraform 論理名**（`aws_dynamodb_table.players` の `players`）… state 内だけの識別子。AWS には送られない。
+- **実テーブル名**（`name = "Players"`）… AWS 上の実体。SDK が `GetItem(TableName:"Players")` で叩くのはこれ。
+- **出力マップのキー**（`table_arns = { players = ... }`）… 下流モジュールへ渡すときのキー。論理名に揃えてあるだけ。
+
+設計上の論点は **実テーブル名の付け方**で、選択肢は 2 つ。
+
+| | A. 固定名 `Players`（採用） | B. プレフィックス `raidync-dev-Players` |
+|---|---|---|
+| アプリ側コード | 名前をハードコードできる（Go `db.DefaultTables()`） | 環境変数で注入が必要 |
+| 1 アカウントに複数環境 | 共存不可（dev と prod が同名を奪い合う） | 共存可 |
+| LocalStack との一致 | 一致（localstack-init も `Players`） | ずれる |
+
+**dynamodb だけ固定名**で、lambda / cognito / api_gateway など他モジュールは全て `name_prefix` 方式。一貫していないように見えるが、DynamoDB を固定名にした理由は 3 つ:
+
+1. Go の `internal/db.DefaultTables()` が実名を直書きしている。B にすると「Lambda 環境変数で注入 → Go 側で `os.Getenv` 差し替え」の配線追加が必須になり、本体コードまで巻き込む。
+2. LocalStack（`localstack-init.sh`）も同名で作るため、固定名だとローカルで書いた Go がそのまま AWS で動く。
+3. 運用が「dev を destroy してから prod」の 1 アカウント 1 環境なので、同名衝突が起きにくい。
+
+**B に切り替えるべき転換点**: dev と prod を同一アカウントに同時常駐させたくなったとき、または Phase 5 の Global Tables を環境別に分けたいとき。その場合は「Terraform を B 化」+「Lambda に `TABLE_*` を渡す」+「Go を `os.Getenv` フォールバック付きに」の 3 点セットが必要。実益（複数環境同居）が出るまでは固定名が妥当。
+
+### Q. `internal/db/client.go` の `DYNAMODB_ENDPOINT` は、AWS 上ではどこから取得する?
+
+A. **取得しない。実 AWS では未設定のままが正解**で、この変数は「LocalStack へ向けるときだけ立てるスイッチ」。空文字のとき `NewClient` の分岐が両方 false になり、以下が全て SDK / ランタイム任せになる。
+
+| 要素 | 空（実 AWS）のときの解決元 |
+|---|---|
+| エンドポイント | `o.BaseEndpoint` を設定しない → SDK 既定の endpoint resolver が `region` から組み立てる（`https://dynamodb.ap-northeast-1.amazonaws.com`） |
+| 認証情報 | static credentials を挿さない → 既定クレデンシャルチェーン。Lambda ではランタイムが実行ロールの一時認証情報を `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN` に注入する |
+| リージョン | `AWS_REGION` は Lambda の**予約環境変数**でランタイムが自動設定（`getenv` の既定値 `ap-northeast-1` はローカル実行時の保険） |
+
+Terraform 側も `terraform/modules/lambda/main.tf` 冒頭コメントの通り、`env` マップに `DYNAMODB_ENDPOINT` も `AWS_REGION` も**意図的に入れていない**。
+
+この設計が Phase 5 のマルチリージョンでそのまま効いている: us-east-1 に同一の zip をデプロイするだけで、ランタイムが `AWS_REGION=us-east-1` を設定 → `NewClient` がそれを読む → us-east-1 のレプリカを叩く。Go 側にリージョン分岐が一切要らない（`terraform/environments/dev/main.tf` の該当コメント参照）。
+
+設定するのはローカルのみ: `.env.example`（`http://localhost:4566`）、`docs/phase4-e2e-runbook.md` の PowerShell 手順、`internal/db/integration_test.go`（未設定なら `t.Setenv` で LocalStack を既定に）。
+
+### Q. SK（ソートキー）は何のためにある? 一意性が確保できれば何でもいい?
+A. **SK には役割が 2 つある。**
+1. 同じ PK の中でレコードを**区別する**（一意性）
+2. 同じ PK の中の**並び順を決める**（ソート・範囲検索）
+
+名前が Sort Key なのは 2 のため。MatchHistory の SK に `sessionId` を置くと 1 は満たすが 2 で破綻する（ランダムな文字列なので並び順が無意味 → 「最近 20 件」を取るのに全件読んでソートが必要 = Scan）。
+
+`timestamp`(Number) を SK にすると SK の並びがそのまま時系列になり:
+```
+Query(playerId = "abc", ScanIndexForward = false, Limit = 20)
+```
+で**新しい方から 20 件だけ読んで止まれる**（読み取り 20 件ぶんしか課金されない）。`timestamp BETWEEN 月初 AND 月末` のような範囲指定も可能。
+
+**PK は完全一致しか引けない。SK は範囲指定・前方一致ができる。** これが決定的な違い。sessionId はキーにせず**属性として**持つ。
+
+### Q. MatchmakingTickets の SK に TicketStatus を置いてはいけないのはなぜ?
+A. **PK / SK は主キーであり、主キーは変更できない**から。TicketStatus は `WAITING → MATCHING → MATCHED` と遷移するので、SK に置くと状態変更のたびに**レコードを削除して作り直す**ことになり、削除と再作成の間に別の Lambda が割り込める。
+
+これは §2 の楽観ロック（`version` + 条件付き書き込みで「1 チケットを 1 回だけ WAITING→MATCHING に遷移」を保証）を根本から壊す。条件付き `UpdateItem` はキーが不変であることが前提。
+
+**キーには変わらないものを置く。変わるものは属性に置く。**
+
+ただし「status で引きたい」という要求自体は正しく、それに応えるのが **GSI**。GSI のキーは**変化する属性でも構わない**（ベーステーブルの主キーと違い、DynamoDB が裏で維持する射影なので元の属性が変われば自動で張り替わる）。よって status は「ベーステーブルの SK」ではなく「**GSI のキー**」として使う。
+
+| GSI | 用途 |
+|-----|------|
+| `questId-status` | matcher が「同じクエストで status=WAITING」のチケットを探す |
+| `playerId-status` | 同一プレイヤーの二重申請チェック、キャンセル処理 |
+
+### Q. MatchmakingTickets の PK に sessionId を使えない理由は?
+A. **時間軸が合わない。** マッチ申請した瞬間、セッションはまだ存在しない（4 人揃ってから GameLift に作らせる）。存在しないものの ID は主キーにできない。PK は申請の応答としてクライアントへ返す `ticketId`。
+
+チケットとセッションは**ライフサイクルが別**（チケット: 申請時に生成、最大 90 秒で TTL 消滅 / セッション: マッチ成立後に生成、最大 20 分）。だからテーブルもキーも分かれる。
+
+### Q. Players テーブルにメールアドレスとパスワードを持つべき?
+A. **持たない。** 持った瞬間 Cognito を選んだ意味が消える（ハッシュアルゴリズム選定・ソルト・ストレッチング・漏洩時の責任・リセットフローが全部自前になる）。
+
+| | 持ち主 | 中身 |
+|---|--------|------|
+| 認証情報 | **Cognito** | メールアドレス、パスワード、MFA 設定 |
+| ゲームデータ | **DynamoDB (Players)** | 表示名、ランク、統計、所持装備など |
+
+繋ぐのは ID。Cognito の JWT に含まれる `sub`（ユーザー一意 ID）を `playerId` として DynamoDB を引く。よって Players テーブルにはメールアドレスすら不要。**PII をマネージドサービス側に寄せ、自前テーブルには置かない**という設計。
 
 ---
 
@@ -134,6 +300,34 @@ A. 主語を 1 つ補正すると正確になる。
 - **毎回起動するわけでもない**: API Gateway は判定結果（トークン→Allow/Deny ポリシー）を **Authorizer result TTL** の間キャッシュする。TOKEN 型なので `Authorization` ヘッダ値がキャッシュキー。同一トークンで TTL 内の再アクセスは authorizer を起動せずキャッシュを使う。例外的な単独起動はコールドスタート初期化やテストの手動 invoke 程度。
 - **未実装**: どのルートに attach するか/キャッシュ TTL は Terraform（Phase 1 `api_gateway` モジュール）で定義予定。現状コードは authorizer 自体（JWT 検証＋Allow/Deny ポリシー生成、`deny` は `Resource:"*"` の Deny・principalID=anonymous）のみ。
 
+### Q. テストユーザーは 3 種類ある? mock-auth / Terraform の Cognito テストユーザー / 実ユーザーの違いは?
+
+A. 認証まわりの「ユーザー」は目的の違う 3 層があり、混同しやすい。
+
+| | ① mock-auth のユーザー | ② Terraform の Cognito テストユーザー | ③ 実ユーザー |
+|---|---|---|---|
+| 用途 | ローカル E2E（①・ロジック検証。**済**） | AWS dev E2E（②・本物のサービス連携検証。未） | 本番の実プレイヤー |
+| 認証基盤 | mock-auth（`docker/mock-auth`, :9229） | 実 Cognito（`modules/cognito`） | 実 Cognito |
+| 作り方 | クライアントが起動時に signup→login（`cmd/client`）。**インメモリ・使い捨て** | Terraform が `aws_cognito_user` で事前作成 | クライアントから正規 signup |
+| メール検証 | 独自実装で省略 | `email_verified=true`+`SUPPRESS` で飛ばす | 検証メールのリンククリックが必要 |
+| 生存期間 | プロセス終了で消える | `apply`〜`destroy` | 恒久 |
+
+要点:
+- **①で使ったユーザーは AWS に存在しない**（mock-auth のメモリ上だけ）。②は実 Cognito 上に実体が要るので、この Terraform が初めて作る。
+- 「E2E は済んだ」は①（ロジック検証）の話。②（Cognito・Lambda・API GW・DynamoDB・GameLift が**本物同士で繋がるか**の配線検証）はこれから。
+
+### Q. ②の E2E は、テストユーザーを作らず「実ユーザー」ではダメ?
+
+A. 技術的には可能。Gmail 等で 4 アドレスを用意し、正規に signup→メール検証→MFA 設定→パスワード管理をやれば実ユーザーでも②は成立する（Cognito から見れば合成テストユーザーと区別はなく、同じ `InitiateAuth` で JWT が出て authorizer が検証できる）。
+
+**それをやらずテストユーザーを合成する理由は「手間削減」＋「再現性」**:
+- 4 人要る（1 セッション最大 4 人 = `protocol.MaxPartySize`）。実メール 4 つの用意は非現実的。
+- 実ユーザーの正規 signup は**メール検証リンクのクリック**が挟まり、無人 E2E を壊す。`email_verified=true`+`SUPPRESS` はこの手作業を最初から飛ばすための合成。
+- パスワードは `random_password` で使い捨て自動生成。実アカウントに E2E 用パスワードを持たせて state/スクリプトに置くのは筋が悪い。
+- `apply`/`destroy` で丸ごと作れて消せる。自分の実アカウントを Terraform 管理下に置くと `destroy` で消す事故につながる。IaC 徹底（CLAUDE.md）とも整合。
+
+つまり②が見たいのは「本物のサービスが繋がるか（配線）」なので、認証の入口だけは摩擦をゼロにしたい。実ユーザーの正規 signup フロー自体の検証は目的が別で、スコープを切り離している。
+
 ---
 
 ## 6. テスト（単体・結合）
@@ -162,6 +356,22 @@ A.
 - ログは `log.Printf` 直書き（Phase 6 で構造化）。
 
 差し替え容易性: `SessionProvider` / `Store` インターフェースと `apigw.PlayerID` により、**簡略版を本番版へ無痛で挿せる構造**にしてある。
+
+### Q. IAM ロールの最小権限を「最大まで厳密に」しない理由は?
+
+A. Lambda 実行ロールは **2 本**（`terraform/modules/iam`）— authorizer 用（Logs のみ）と matchmaking 用（DynamoDB + GameLift + Logs）。後者は `match_request` / `match_status` / `match_cancel` / `match_history` / `session_end` の **5 関数で共有**している。
+
+厳密に最小権限を突き詰めれば、5 関数それぞれに専用ロールを作り「その関数が実際に呼ぶアクションだけ」に絞れる。例:
+- `session_end` は GameLift の `CreateGameSession` を呼ばない → GameLift 権限は不要。
+- `match_history` は `Query` しかしない → `PutItem` / `TransactWriteItems` は不要。
+
+それをやらず 2 分割で止めたのは **粒度の意図的な選択**:
+
+- **分割の主目的は達成済み**。「入口の authorizer を侵害されても DynamoDB/GameLift に到達できない」という attack surface の分離は、authorizer を切り出した時点で実現している。ここが最小権限で一番効く境界。
+- **5 分割は管理コストが実益を上回る**。ロール・ポリシー・変数・output が関数の数だけ増え、`lambda` モジュール側の配線も複雑化する。得られる追加の安全性（DynamoDB CRUD 系を触る一群の内側でのさらなる細分化）は、この一群が全て同じ信頼境界にある以上、限界的。
+- **アクション単位では既に絞ってある**。`DeleteItem` を外す（TTL 自動削除に委ねる）、GameLift を 2 アクションだけにする等、ロール内のアクションは最小化済み。粗いのは「ロールの本数」だけ。
+
+**さらに分割すべき転換点**: 特定関数だけ機微データ（決済・PII 等）を扱うようになったとき、または監査要件でアクションと関数の 1:1 対応を証明する必要が出たとき。現状のポートフォリオ用途では 2 分割で「最小権限を role で実証する」意図は十分伝わる。
 
 ---
 
@@ -782,3 +992,938 @@ client sendUDP: 受け取った psid を毎パケットの GameMessage.PlayerSes
 
 ### 実装メモ（Phase 4 G1-full：psid 上り配管 完了・2026-07-13）
 `GameMessage.PlayerSessionID` 追加 → `session.Ingest` で提示 psid 採用・書き戻し → `cmd/client` 提示 → `cmd/localapi` に `loggingObserver` 注入。ローカル E2E（LocalStack + mock-auth + localapi + client）で `gameserver: player join ... psid=psess-...` / `player leave ...（同一 psid）` を実パケット往復で確認。psid が「発行→配布→提示→採用→observer 到達」まで一気通貫。残り [[project_phase4_anywhere_plan]]: G4（実 Anywhere で observer→Bridge に替え AcceptPlayerSession 承認）／G3（Terraform 化）／AWS dev E2E。
+
+### Q. G4（Anywhere Runbook）着手に必要な AWS 認証項目は?
+「認証が通る」＝ `aws sts get-caller-identity` が成功する状態（CLI が資格情報を解決し IAM プリンシパルを確定）。必要項目は4つ: **アクセスキー ID / シークレットアクセスキー / リージョン（`ap-northeast-1`）/ 出力形式（`json`）**。`aws configure` で `%USERPROFILE%\.aws\` に保存。
+- **資格情報の入手**: (A) IAM ユーザーのアクセスキー発行→`aws configure`（個人ポートフォリオはこれで十分・推奨）、(B) IAM Identity Center `aws sso login`（一時資格情報・失効あり・組織向け）。
+- **必要な IAM 権限**: `gamelift:` の CreateLocation/CreateFleet/DescribeFleetAttributes/RegisterCompute/GetComputeAuthToken/CreateGameSession/CreatePlayerSessions/DeleteFleet/DeleteLocation ＋ `sts:GetCallerIdentity`。runbook 前提の `gamelift:*` で全カバー。専用 IAM ユーザーにインラインポリシー1本で足りる。
+- **重要**: runtime（ステップ5 の gameserver 実行）は IAM 資格情報を**使わない**。SDK 接続は `GAMELIFT_SDK_AUTH_TOKEN`（ステップ4 取得の短命トークン）で行う。IAM 資格情報が要るのは **ステップ1〜4・6 の `aws gamelift ...` を叩く CLI 側だけ**。
+- **セキュリティ/コスト**: アクセスキーはリポジトリにコミットしない（`.aws/` はリポジトリ外）。検証後はフリート/ロケーションを削除（月 $200 制約）。
+
+### Q. GameLift を GUI でも操作したい。ログイン主体はルートでいい?
+**ダメ。GUI 操作専用の IAM ユーザー（`raidync-admin`）を作る。** CLI 用の `raidync-cli` はコンソールアクセス無しで作ったため GUI ログイン不可。かといってルートで日常 GUI 操作するのは「ルート封印」方針に反する。よって責務分離で 3 層に:
+- **ルート**: 封印（請求・アカウント設定などルート専用のみ）。
+- **`raidync-admin`**: 人間の GUI 操作用。コンソール+パスワード+**MFA**、**長期キー無し**、AdministratorAccess（人間管理者は広め＋MFA 保護／サービス実行・IaC はロールで最小権限、という設計）。
+- **`raidync-cli`**: 自動化/CLI 用。アクセスキーのみ・最小権限スコープ。
+
+**作成は初回だけルートでコンソールログインして GUI で行う**（ユーザー作成に IAM 書き込み権限が要るが `raidync-cli` は IAM 権限を持たず、CLI 作成にはルートキーが要る＝封印方針に反するため）。手順は docs/aws-iam-user-setup.md「GUI 用 IAM ユーザー」節。
+
+### Q. GameLift を呼んだら `SubscriptionRequiredException`（GUI では "Complete your account setup / currently on free plan"）。原因と対処は?
+**AWS アカウント自体の本アクティベーション未完了**が原因。IAM 権限やポリシーの問題ではない（`sts:GetCallerIdentity` は通るのに GameLift だけ弾かれる）。GameLift のような従量課金サービスは、アカウントが完全有効化されるまで GUI/CLI どちらからも呼べない。
+- **対処（ルートで）**: ①支払い方法（クレカ）登録、②本人確認（電話/SMS・住所）、③サポートプラン選択（**Basic=無料**でOK）、④AWS からのメール依頼に応答（迷惑メール確認）、⑤"free plan" 表示なら**有料（従量課金）プランへ切替**。これらは請求/アカウント設定＝**正当なルート用途**（封印方針に反しない）。
+- **待ち**: カード検証で $1 前後の仮押さえ（3〜5 日・認証のみ）、サービス全有効化まで**最大 24 時間**。
+- **課金の心配**: 有料プラン切替＝即課金ではない。AWS は従量課金なので未使用なら $0。予算アラート $200/月 も別途。
+- **判定**: `aws gamelift list-locations --region ap-northeast-1` が `SubscriptionRequiredException` を返さなくなれば有効化完了→ステップ1（create-location）へ。
+
+---
+
+## 12. Phase 4：AWS dev E2E（本番同等環境）
+
+### Q. terraform は本番想定と同等の認識。その上で GameLift Anywhere の Terraform 化は必要?
+**本番構成としては不要。** Anywhere は「自 PC を compute にする**開発時の検証手段**」であって本番の部品ではない（本番は Managed EC2 + Spot）。§11 の2軸表で言えば Anywhere は「環境=ローカル寄り」側に属し、「環境=AWS dev × フリート種別=Anywhere」は *通常やらない* セルにあたる。
+- **ただしコードを捨てるのは別問題**：G3 の成果であり、Anywhere 疎通をやり直す際の再現性、「検証手段まで IaC 化した」証跡としての価値がある。→ **捨てずに置き場所を直す**のが正解。
+- **対応（2026-07-22）**：`environments/dev` から **`environments/anywhere`** へ分離。モジュールも `modules/gamelift` → **`modules/gamelift_anywhere`** にリネーム（ステップ6 で作る Managed EC2 用 `gamelift_ec2` との名前衝突・混同を避けるため）。
+- **分離の実益**：①`dev` が「本番同等」を名乗れる（開発専用リソースが混在しない）②`GAMELIFT_FLEET_ID` をどちらのフリートに向けるかの曖昧さが消える（E2E で使うのは Managed EC2 側のみ）③**state 分離**により dev の `apply`/`destroy` サイクルに無関係な検証用フリートを巻き込まない。
+- **タイミングの妙**：まだ一度も `apply` しておらず state が空だったため移動コストはゼロ。後からなら `terraform state mv` が必要だった。
+
+### Q. 計画時（spec-architecture.md §2.1）は VPC を作る想定だった。なぜ不採用にした?
+**実際の構成に VPC の使い所が無いと判明したため**（2026-07-22 決定）。計画時は VPC CIDR 10.0.0.0/16・パブリック/プライベート各2サブネット・**NAT Gateway を各 AZ に1台**まで設計し、roadmap Phase 1-2 に3日を割り当てていた。
+- **なぜ噛み合わなかったか**：計画時の想定は「AWS インフラなら VPC を切るもの」という**一般論ベース**だった。しかし RAIDYNC の実構成は **サーバーレス（Lambda）+ GameLift マネージド**であり、
+  - Lambda は DynamoDB・GameLift を**パブリックエンドポイント**で呼ぶ → VPC に入れる必要がない
+  - GameLift Managed EC2 は **GameLift 側が管理する VPC** で動く → 自前 VPC には置けない
+  - むしろ Lambda を VPC に入れると外部通信に NAT が要り、計画どおり各 AZ 1台＝**2台で月 $60 前後**の時間課金が乗る
+- **「IaC カバー率 100%」（overview.md §5）と矛盾しないか**：しない。カバー率100%は *存在する全リソースが Terraform 管理下にある* という意味であり、**不要なリソースを作らないこと**とは別軸。
+- **トレードオフの自覚**：VPC/サブネット/SG の設計力を見せる機会は1つ減る。それでも「使わないものを作らない」判断とコスト最適化（CLAUDE.md の $200 制約）を優先した。**この判断過程そのものをアピール材料にする**方針。
+- 将来 VPC が要るとしたら：RDS/ElastiCache など VPC 内でしか動かないリソースを足す時、または Lambda から VPC 内リソースへ閉域アクセスする要件が出た時。現状どちらも無い。
+
+### Q. AWS dev E2E に VPC / Route53 は要る?
+**最小構成では不要**（意図的にスコープ外）。
+- **VPC/NAT 不要**：Lambda は DynamoDB・GameLift を**パブリックエンドポイント**で呼べる。VPC に入れると外部通信に NAT Gateway が要り、**時間課金（概算 ~$30/月）**が発生する。dev の目的（統合検証）に VPC は寄与しないため置かない。
+- **Route53 不要**：API Gateway の実行 URL を直叩き、GameLift は IP 直接接続で E2E は成立する。レイテンシールーティングは Phase 5（マルチリージョン）の担当。ホストゾーンは月額固定課金（概算 $0.50/ゾーン）。
+- 方針の一貫性：「**立てているだけで課金されるもの**を dev に置かない」。唯一の例外が GameLift Managed EC2 フリート（E2E に必須）で、これは検証後に必ず destroy する。
+
+### Q. Lambda を `for_each` で 6 関数まとめて作ると、1 関数だけ直しても全部再デプロイになる?
+
+**ならない。** `for_each` は 6 個を DRY に *書く* ための記法で、生成されるのは独立した 6 リソース（`aws_lambda_function.this["authorizer"]` …）。`terraform plan` はリソース単位で差分するので、仲間だからといってライフサイクルは連動しない。
+- 更新トリガーは各関数の `source_code_hash = data.archive_file.this[each.key].output_base64sha256`（`modules/lambda/main.tf`）。`each.key` ごとに `build/lambda/<関数名>/` の zip ハッシュが**独立**して入る。
+- よって「中身が変わった関数（＋その変更を取り込む関数）だけ `~ update`、残りは No changes」。for_each は連動再デプロイの原因ではない。
+- 実際に何が再デプロイされるかは **ビルドの決定性**次第（次項）。
+
+### Q. `build-lambdas.sh` が毎回 `rm -rf` して 6 個とも作り直すのは無駄では?
+
+感覚は正しいが、**無駄はローカル数秒に圧縮されていて AWS には波及しない**ので、現状は割に合った割り切り。
+
+- **Go のビルドキャッシュ（`$GOCACHE`）で大半が消える**：`rm -rf` が捨てるのは出力先 `build/lambda/` だけで、コンパイル成果物のキャッシュは別の場所に残る。1 関数だけ直したときに実際に走るのは「変わったパッケージの再コンパイル＋各関数の最終リンク」だけ。フルリビルドではない。Lambda バイナリは小さく体感数秒。
+- **AWS 課金・デプロイには一切響かない**：決定的ビルド（`-trimpath` / `-ldflags="-s -w"` / `CGO_ENABLED=0`、Go はデフォルトで時刻を埋めない）なので、触っていない関数はバイト同一 → zip ハッシュ同一 → plan で No changes。アップロードもデプロイも発生しない。無駄なのは手元の CPU 秒だけ。
+- **全ビルドが買っているもの**：`rm -rf` + 全ビルドは①stale バイナリが残らない②関数を改名/削除したとき孤児が残らない③結果が毎回同じ、をノーコストで保証する。
+- **選択ビルドにしない理由**：「変わった関数だけ」を bash でやると推移的依存（`internal/*` を変えたら import 元も作り直す）の追跡が要る。間違えると *古いバイナリのままデプロイ* ＝再ビルドの無駄より遥かに悪い事故。依存追跡は本来 Go のビルドキャッシュの仕事なので bash で再実装しない。
+- **最適化が割に合う転換点**：関数が数十個 / CI のビルド時間が課金直結 の規模。そのときの定石は Makefile のタイムスタンプ依存、CI の `git diff` パス検知、または**コードデプロイを Terraform から分離**（下項）。
+
+### Q. コード更新のたびに `terraform apply` する運用でいい?
+
+dev/検証フェーズはそれでよい（`source_code_hash` があるので apply がコード更新も担う）。ただし本番運用では**インフラ更新（Terraform）とコードデプロイ（CI）を分離**するのが定石。
+- 分離する理由：アプリのコード変更のたびに Terraform state を触りたくない／ロールバック・カナリアを Lambda のバージョン/エイリアスでやりたい。
+- 分離後の分担：Terraform は関数の「器」だけ作り、中身は CI が `aws lambda update-function-code` やコンテナイメージのタグ更新で差し替える。
+- 現状は**ポートフォリオ dev・更新頻度低・再現性優先**なので archive_file 方式が妥当。更新が頻繁になったら CI 分離へ移す段階論。
+
+### Q. API Gateway で REST API(v1) を選んだ理由は? HTTP API(v2) との違いは?
+
+**TOKEN 型カスタムオーソライザとより細かい制御を取るため v1 を選択**（`modules/api_gateway`）。
+- **v1(REST) の代償**：リソース階層・メソッド・統合・デプロイを全部明示的に書く必要がある。パスパラメータ（`{ticketId}` 等）も個別リソース。`main.tf` が長いのはこの冗長さゆえ。
+- **v2(HTTP) なら**：記述量は大幅に減り単価も安い。ただし v1 ほど細かいオーソライザ制御ができない。
+- **書き分け**：リソース階層は動的化しにくいのでベタ書き、メソッド/統合/権限は規則的なので `local.endpoints` + for_each で量産。冗長さの必然性がある所だけ手書き。
+- **ポートフォリオ観点**：REST API を正しく手組みできることを見せる意味もある。
+
+### Q. `aws_api_gateway_deployment` の `triggers` はなぜ必要?
+
+**API Gateway は「構成を変えてもデプロイし直さないと古いスナップショットが配信され続ける」罠があるため**（実際にハマりやすい）。
+- 対処：`triggers` に authorizer ID・全メソッドの `key:method:authorization`・全統合の `key:uri` を `sha1(jsonencode(...))` で畳み、**構成が変われば必ず再デプロイ**させる。
+- `create_before_destroy = true` でデプロイ差し替え時のダウンタイムを避ける。
+- 対比：lambda の `for_each` は「連動させない」設計だが、API Gateway のデプロイは全体で 1 スナップショットなので、逆に**全構成を 1 ハッシュに畳んで意図的に連動**させる。
+- dev 固有：`authorizer_result_ttl_in_seconds = 0` で検証結果をキャッシュせず挙動を追いやすくしている（§5 の TTL を dev では 0 に）。
+
+### Q. GameLift Build はなぜ「更新」でなく「作り直し」なのか?
+
+**GameLift の Build が不変（immutable）リソースだから**（`modules/gamelift_ec2`）。更新 API が無いので、内容が変わったら置き換えるしかない。
+- 仕組み：S3 オブジェクトのキーに `output_md5` を含め（`gameserver-<md5>.zip`）、Build の `version` も `substr(md5,0,12)`。**md5 が変われば S3 キーと Build version が同時に変わり、Build が作り直される**という二重連動。
+- パターンの対比：lambda は `source_code_hash` で**更新**、gamelift_build はハッシュで**置換**。「更新できないリソースはハッシュで作り直す」という定石。
+
+### Q. gamelift_ec2 だけ destroy 前提の運用なのはなぜ?
+
+**他モジュール（DynamoDB/Lambda/API GW/Cognito）が実質従量課金なのに対し、Managed EC2 フリートだけが「ACTIVE な間ずっとインスタンス時間課金」される唯一の性質のため**（プレイヤー 0 でも課金）。
+- この非対称性が設計全体を規定：`force_destroy=true`（バケット中身ごと 1 コマンド後片付け）、`NoProtection`（Spot 中断・整理を妨げない）、capacity は desired=1 最小、E2E 後は必ず destroy。
+- CLAUDE.md の $200 制約／「立てているだけで課金されるものを dev に置かない」方針の唯一の例外で、E2E に必須だから置くが検証後は即畳む。
+
+### Q. フリートの capacity（desired/min/max・オートスケール）を Terraform で管理しないのはなぜ?
+
+**`aws_gamelift_fleet` に該当引数が無く、`UpdateFleetCapacity` API の領分だから**（Terraform の守備範囲外）。
+- 作成時は GameLift 既定の desired=1 になる。dev E2E はこれで足りるため追従しない。
+- オートスケール（spec §2.2 の min1/max20）は Phase 6 の担当。
+- 「IaC 100%」を掲げつつ、API の領分は正直に外す線引き。カバー率100%＝*存在するリソースが管理下にある*であって、*API 操作まで Terraform に押し込む*ことではない。
+
+### Q. 初回 apply が全リソース `AccessDenied`。どう対処した?（デプロイ用 IAM 権限）
+
+`raidync-cli` は Anywhere 検証・読み取り中心で先行作成したユーザーで、フル構成をプロビジョニングする権限が無かった。`AdministratorAccess` は使わず、**使う 8 サービスに絞った最小権限ポリシー**（`terraform/bootstrap/raidync-cli-deploy-policy.json`）を作成してアタッチした。
+- 許可: `dynamodb/cognito-idp/apigateway/lambda/gamelift/logs`（フルアクション・Resource `*`）、`s3`（Build バケット限定）、`iam`（`raidync-dev-*` ロール限定＋`PassRole`）、`sts:GetCallerIdentity`。
+- **CREATE 権限は plan では検証できない**（plan は作成 API を呼ばない）。事前検証は **IAM Policy Simulator**（`simulate-principal-policy`。副作用なし）を使う。
+- Administrator より大幅に狭く「EC2/RDS/課金/他ユーザーに触れない」ことを担保。ポートフォリオ上「デプロイ identity を最小権限設計した」証跡になる。
+
+### Q. awscc とはそもそも何?（classic aws provider との違い）
+
+**`hashicorp/awscc` = AWS Cloud Control provider。classic `hashicorp/aws` とは別物の、もう一つの公式 AWS provider**（HashiCorp と AWS の共同）。同じ AWS リソースを作る手段が 2 系統ある。
+
+| | `aws`(classic) | `awscc`(Cloud Control) |
+|---|---|---|
+| 中身の作られ方 | **人間が手書き** | **CloudFormation リソーススキーマから自動生成** |
+| 呼ぶ API | `CreateBuild` 等サービス固有 API | **Cloud Control API** の汎用 CRUD（`CreateResource`/`GetResource`/`UpdateResource`/`DeleteResource`） |
+| 新機能への追従 | 遅い（実装待ち） | **速い**（CFN スキーマ更新に自動追従） |
+| 書き心地・成熟度 | 良い / 高い | 悪い / 粗い |
+
+- **今回まさにこのトレードオフを踏んだ**: `server_sdk_version` は比較的新しく classic 未実装、awscc は自動生成ゆえ最初から所持 → Build のみ awscc に切替。
+- **書式差は自動生成の副作用**: nested block でなく object 属性（`storage_location = { ... }`）、`tags` は map でなく **CFN 生表現の `[{key,value}]` リスト**（classic なら人間が map に整えている部分が素通しになる）。本プロジェクトは `tags = [for k, v in var.tags : { key = k, value = v }]` で変換。命名も `awscc_` と別名前空間。
+- **CloudFormation スタックは作られない**: Cloud Control API は「CFN が内部で使うリソース定義と操作」をスタック抜きで単体実行できるよう外出しした API。CFN コンソールには何も出ず、state は従来どおり Terraform が持つ。**IAM の権限名だけが `cloudformation:*` で顔を出す**（下記 AccessDenied の理由）。
+- **IAM は二重に要る**: Cloud Control 権限だけでは不足で、実際に作る裏側のサービス権限（`gamelift:CreateBuild` 等）も併せて必要。
+- **混在が正解**: 同一構成で併用・相互参照可（`aws_gamelift_fleet.build_id = awscc_gamelift_build.this.build_id`）。awscc はデータソースが少なく `aws_iam_policy_document` 相当も無いため、**「classic に無い属性が要るリソースだけ awscc」の部分採用**が定石。全面移行はしない。
+
+### Q. awscc を使うと `cloudformation:CreateResource` が AccessDenied になった。なぜ?
+
+**awscc(Cloud Control) provider は内部で CloudFormation の Cloud Control API を経由する**ため。絞り込みポリシーに `cloudformation` の Cloud Control 7 アクション（`CreateResource`/`GetResource`/`UpdateResource`/`DeleteResource`/`ListResources`/`GetResourceRequestStatus`/`CancelResourceRequest`）を足して解決。awscc を 1 つでも使うと必要になる、provider 全般の性質。
+
+### Q. `aws_gamelift_build` の CreateBuild が「AL2023 は SDK 5.0 未満で非対応」で失敗。原因は?
+
+**classic `aws_gamelift_build` は `server_sdk_version` を公開しておらず**（属性は name/operating_system/version/tags/storage_location のみ）、既定 4.0.2 扱いになるため。AL2023 × SDK 5.x（本プロジェクトの Go サーバー SDK 5.3.0）の Build を作れない。
+- 対策: **Build のみ `awscc_gamelift_build`** に切替（`server_sdk_version` を持つ）。Fleet は EC2 専用引数のため classic `aws_gamelift_fleet` のまま、`build_id` で参照。
+- これで CLAUDE.md の「Anywhere だけが awscc を要する」は不正確と判明。**Managed EC2 の Build も awscc が要る**。
+- awscc は `storage_location`/`tags` が nested block でなく object 属性、tags は `{key,value}` のリスト形式で、aws provider と書式が違う点に注意。
+
+### Q. Fleet が `SERVER_PROCESS_INVALID_PATH` で ERROR。原因は?
+
+**Windows で生成したファイルは実行ビットを持たず、`archive_file` がそのまま zip 化するため展開後 `gameserver`/`start.sh` が非実行**になり、GameLift が起動できない。
+- 対策: `data "archive_file"` に **`output_file_mode = "0755"`**（全ファイルに実行権限を保証する archive_file の正規機能。install.sh の chmod に依存しなくなる）。
+- 前段の installer 失敗（`FLEET_CREATION_FAILED_INSTALLER` exit 1）は install.sh の `set -e`+chmod が部分失敗で全体を落としていたもので、堅牢化（`|| true; exit 0`）で回避済み。
+- 失敗の段階順: installer(exit1) → INVALID_PATH → SERVER_PROCESS_CRASHED/SDK_INIT_TIMEOUT、と一段ずつ表面化した。
+
+### Q. Managed EC2 で gameserver が SDK 初期化に失敗（CRASHED/SDK_INIT_TIMEOUT）。コードのバグ?
+
+**バグではない。** GameLift Anywhere で切り分けて実証した:
+- Anywhere（Windows, `go run`）で `InitSDK→ProcessReady→OnStartGameSession` 成功 ＝ **コードは正しい**（G4 達成）。
+- 同じ **linux/amd64 バイナリを WSL Ubuntu で実行**しても実 GameLift に ProcessReady 成功 ＝ **バイナリも正しい**。
+- 同一バイナリが Managed EC2 上でのみ失敗 → 一旦「環境固有（ローカルエージェント接続）」と切り分けた。
+- **真の原因は結局 `output_file_mode` だった（2026-08-05 解決）**: 実行ビットを付けた新 Build（output_file_mode=0755）でフリートを作り直したら **一発で ACTIVE・健全**（SERVER_PROCESS エラー皆無、ACTIVE=1/IDLE=1）。旧 Build の非実行ビットが CRASHED/SDK_INIT_TIMEOUT の元凶で、INVALID_PATH と同じパッケージング問題の別症状だった。**「環境固有の謎」ではなくパッケージング**と確定。インスタンスログ取得（TCP22+get-instance-access）は不要になった。
+  - 補足: SDK 5+ フリートは `get-instance-access`(SSH) 非対応で `get-compute-access`(SSM) を使う。その一時認証は `ssm:StartSession` のみ許可で `send-command` 不可、かつインスタンスは GameLift アカウント(902107009410)配下＝自 SSM 在庫外。SSM 経由ログ取得は session-manager-plugin 必須で手間。結局 output_file_mode で解決したため不要。
+
+### Q. AWS dev E2E（実 Cognito→実 API GW→実 GameLift）は通った?
+
+**ほぼ完走（2026-08-05）。Phase 4 の核心「実 GameLift での psid 承認」を達成**。
+- cmd/client に `-token` を追加（mock-auth を迂回し実 Cognito の id_token を注入）。トークンは `aws cognito-idp initiate-auth --auth-flow USER_PASSWORD_AUTH` で取得（client の ExplicitAuthFlows に USER_PASSWORD_AUTH あり）。
+- 通った経路: 実 Cognito 認証（playerId=Cognito sub）→ match/request（API GW→Lambda→DynamoDB）→ マッチ成立で Lambda が実 GameLift に **CreateGameSession + CreatePlayerSessions** → connect=`52.195.186.162:7777` / psid 取得 → UDP 接続 → **SESSION_STATE ×24 受信**（＝サーバーが roster 登録し `AcceptPlayerSession(psid)` を実 GameLift で承認・状態配信）→ プレイ送信。**AcceptPlayerSession の実承認確認が Phase 4 最大の未検証項目で、ここで達成**。
+- **残り 1 手だったバグ（修正済み）**: `POST /session/{sessionId}/end` が 403 "Missing Authentication Token"。認証でなくルーティング問題。実 GameLift の `GameSessionId` は `arn:aws:gamelift:...::gamesession/fleet-.../gsess-...` と**スラッシュ入り ARN**で、`/session/{sessionId}/end` のパスに入れると余分セグメントになり API GW がルート不一致→403。ローカルは `sess-xxx`（スラッシュ無し）で顕在化せず。
+  - **修正（2026-08-14）**: `NormalizeGameSessionID` を `pkg/protocol` に追加し、ARN 末尾の `gsess-xxx` をショート ID として抽出。Lambda 側（`gamelift_provider.go`: CreatePlayerSessions 後に正規化して返す）とゲームサーバ側（`gamelift.go`: onStartGameSession で Hub 登録前に正規化）の 2 箇所で適用。Hub のルーティングキー（`msg.SessionID` で lookup）・DynamoDB PK・HTTP パス・UDP メッセージの SessionID が一貫してショート ID になり、フリート再作成は不要。
+
+### Q. 失敗フリートの後始末で詰まった点は?（運用ハマり）
+
+- **ERROR フリートがフリート枠(quota)を占有**し、次の Fleet 作成（CreateFleet）がリトライループで進まない（「Still creating」のまま）。古い ERROR フリートを `delete-fleet` すると枠が空いて新フリート作成が成立した。
+- **`ACTIVATING` 中のフリートは `delete-fleet` も `update-fleet-capacity` での縮退も効かない**（`InvalidRequestException`）。リトライを使い切って ERROR になるまで（起動から最大 ~60 分）待つしかなく、その間インスタンス課金が続く。監視して ERROR/DELETING 到達で自動削除する運用にした。
+- Managed EC2 の 1 サイクル（build→fleet→ERROR）は 5〜15 分と重く、ログも取りにくい。**SDK 契約の検証は Anywhere（手元・フルログ・無料）で先に済ませる**のが正しい順序、という教訓。
+
+### Q. `terraform/` ディレクトリの全体を、構成要素ごとに解説すると?
+A. `environments/`（2 つ＝適用単位・state 単位）＋ `modules/`（8 つ＝部品）＋ `bootstrap/`（デプロイ用 IAM ポリシー JSON）。合計 1,905 行。
+
+**environments — 「何を作るか」を決める層**
+- **`dev/`**（本番同等）— `main.tf` がモジュールを 9 個呼ぶだけの組み立て図。provider は 3 つ（`aws` プライマリ／`aws.secondary`=us-east-1／`awscc`）。Phase 5 で `lambda` と `api_gateway` を `providers = { aws = aws.secondary }` で**もう一組**インスタンス化し、同じモジュール・同じビルド成果物を使い回してマルチリージョン化している。`variables.tf` の `enable_gamelift`（既定 false）が唯一の時間課金リソースの ON/OFF スイッチ。
+- **`anywhere/`**（開発検証専用）— モジュールを 1 つ呼ぶだけの 20 行。dev と **state を分離**することが目的で、dev の apply/destroy サイクルに検証用フリートを巻き込まない。
+
+**modules — 「どう作るか」を閉じ込める層**
+| モジュール | 要点 |
+|---|---|
+| `dynamodb` | Players/Sessions/MatchHistory。`replica_regions` が非空なら Streams(NEW_AND_OLD_IMAGES) を有効化して `dynamic "replica"` で Global Tables 化 |
+| `dynamodb_tickets` | MatchmakingTickets を**分離**（楽観ロックが結果整合のマルチライターで壊れるため region-local）。GSI 2 本 + TTL |
+| `iam` | Lambda 実行ロールを 2 分割（authorizer=Logs のみ／matchmaking=DynamoDB 5 アクション + GameLift 2 アクション）。GSI 用に `${arn}/index/*` も許可対象に含める |
+| `cognito` | mock-auth の置き換え。`random_password` でテストユーザーのパスワードを自動生成（平文をリポジトリに置かない）。`message_action=SUPPRESS` + 永続パスワードで E2E の手数を減らす |
+| `lambda` | `for_each` で 6 関数。関数ごとに違うのは role と環境変数だけ。zip 出力先にリージョン名を混ぜてマルチリージョンでの衝突を回避 |
+| `api_gateway` | REST v1。リソース階層を明示定義し、メソッド/統合/権限は `local.endpoints` で `for_each`。`session_end` だけ `authorization = NONE` |
+| `gamelift_ec2` | S3 バケット + Build(awscc) + Fleet。`output_file_mode="0755"` が Phase 4 のハマりどころの最終解 |
+| `gamelift_anywhere` | location + ANYWHERE フリート。awscc 単独 |
+
+**横断する判断**
+- **provider の使い分け**: 原則 classic `aws`。`awscc` は「classic に無い属性/リソース」だけ（`gamelift_build.server_sdk_version`、`gamelift_location`、`compute_type=ANYWHERE`）。混在は意図的で、理由が各ファイル冒頭に書いてある。
+- **コスト設計がコードに埋まっている**: 従量課金のみのモジュール群と、唯一時間課金の `gamelift_ec2` を `count` で分離。ロググループも Lambda の自動作成に任せず `retention_in_days` を明示。
+- **state はローカル**（`.gitignore` で `*.tfstate` 除外、S3 backend 未設定）。個人ポートフォリオで単独作業のため。CI/チーム開発に移すなら S3 + DynamoDB ロックの追加が最初の一手。
+- **ビルドは Terraform 外**: `local-exec` を使わず `scripts/*.sh` → `archive_file` の分業。apply 前のビルドが前提条件になる。
+
+---
+
+## 13. Phase 5：マルチリージョン化
+
+### Q. Global Tables の対象テーブルをどう選んだ?
+
+**Players / Sessions / MatchHistory の 3 つのみ。MatchmakingTickets は除外**（spec-architecture.md §2.5 の方針を実装で追認）。
+
+除外の理由は「region-local だから」ではなく**不変条件が壊れるから**:
+- マッチメイキングは楽観ロック（`version` 属性 + 条件付き書き込み）で「1 チケットを 1 回だけ `WAITING`→`MATCHING` に遷移させる」ことで成立している。
+- Global Tables は**結果整合のマルチライター**（last-writer-wins）。東京とバージニアで同一チケットが同時に確保され得るため、この排他が保証できない。
+- よってマッチングは region-local に閉じ、リージョンをまたぐ待機列の統合は行わない。プレイヤーは自分が繋いだリージョン内でのみマッチングされる。
+
+### Q. Terraform で Global Tables を作るとき、セカンダリ用の provider alias は要る?
+
+**不要。** `aws_dynamodb_table` の `replica` ブロックが「レプリカ作成の指示」までを担い、実際のレプリカ生成は AWS 側（DynamoDB サービス）が行う。プライマリリージョンの provider だけで完結する。
+
+- 前提要件として **DynamoDB Streams（`NEW_AND_OLD_IMAGES`）が必須**。本モジュールは `replica_regions` が空でない時だけ Streams を有効化する（単一リージョン構成では無効のまま）。
+- `replica_regions`（既定 `[]`）で opt-in にしたため、Phase 4 までの単一リージョン構成を壊さずに拡張できた。空に戻せばレプリカ削除の apply が走る。
+
+### Q. Global Tables の apply が `iam:CreateServiceLinkedRole` 不足で失敗した。なぜ?
+
+**Global Tables はレプリケーション実行のためにサービスリンクロール `AWSServiceRoleForDynamoDBReplication` を必要とする**が、アカウントに未作成で、`raidync-cli` の絞り込みポリシーは IAM を `raidync-dev-*` ロール限定にしていたため `aws-service-role/` 配下が対象外だった。
+
+対策として最小権限を維持したまま 1 Statement を追加（`terraform/bootstrap/raidync-cli-deploy-policy.json`）:
+- Resource を**そのロール 1 個の ARN だけ**に限定
+- さらに `Condition: iam:AWSServiceName = replication.dynamodb.amazonaws.com` で二重に絞る
+- 汎用の `iam:CreateServiceLinkedRole` on `*` は付けない
+
+### Q. 権限を足した後も 1 テーブルだけ `UnrecognizedClientException` で失敗した。原因は?
+
+**サービスリンクロールの伝播ラグ**。3 テーブルのレプリカ作成が並行実行され、ロールが作られた直後のウィンドウに当たった 1 つ（MatchHistory）が「security token invalid」で弾かれた。IAM/STS は結果整合のため、ロール作成直後に別リージョンへ assume すると稀に起こる。**権限設定もコードも正しい**。
+
+- 失敗したリソースは Terraform が **tainted**（作成はしたが完了しなかった印）にする。次の apply で `1 to add, 1 to destroy`＝作り直しになる。安全側の挙動。
+- 対処は**再 apply するだけ**。2 回目は伝播済みで成功した。
+- 教訓: サービスリンクロールを新規作成する apply は、初回だけ一部が失敗し得る。冪等なので再実行で解消する。
+
+### Q. レプリケーションは実際に機能した? どう検証した?
+
+**双方向とも成功（2026-08-17）**。CLI で実データを流して確認した。
+
+| 方向 | 結果 |
+|------|------|
+| ap-northeast-1 → us-east-1（put-item→get-item） | **2 秒以内**に到達 |
+| us-east-1 → ap-northeast-1（逆方向 put→get） | 約 4 秒で到達 |
+| 削除（delete-item）の伝播 | 両リージョンで 0 件を確認 |
+
+- レプリカ状態は `describe-table --query 'Table.Replicas'` で全 3 テーブル `ACTIVE` を確認。MatchmakingTickets は `None`（意図どおりレプリカ無し）。
+- Global Tables は**マルチライター**なので、どちらのリージョンに書いても他方へ伝播する（プライマリ/セカンダリの区別はアプリ側の運用上の呼び方であり、DynamoDB 側に主従は無い）。
+
+### Q. Global Tables のコストは?
+
+**固定費は無い。** レプリカテーブルの「存在」自体に時間課金は発生せず、以下の従量課金のみ:
+- **rWCU（replicated write capacity unit）**: レプリケーションされる書き込み。通常の書き込みとほぼ同単価が、レプリカ数ぶん加算される。
+- **保存量**: 各リージョンで個別に課金（データが 2 か所にあるため実質 2 倍）。
+- **クロスリージョンのデータ転送**。
+
+dev は PAY_PER_REQUEST・データ量ほぼ 0 のため、実質無視できる。**GameLift フリートのような「立てているだけで課金」とは性質が異なり、destroy を急ぐ必要はない**。
+
+### Q. Global Tables は「本番 DB のレプリカ」という認識でいい?
+
+**半分正しいが、RDB の読み取りレプリカとは性質が違う。** AWS の用語が "replica" なので誤解しやすい。
+
+| 認識 | 正誤 |
+|------|------|
+| 別リージョンにデータの複製がある | ⭕ |
+| 読み取り専用の写し | ❌ **両リージョンとも書き込み可能** |
+| 主（マスター）と従がある | ❌ **対等。DynamoDB 側に主従の概念が無い** |
+| バックアップになる | ❌ **削除も伝播するため保険にならない** |
+| リージョン障害への備え / レイテンシー改善 | ⭕ |
+
+- **マルチアクティブ（マルチマスター）**: どのリージョンにも書ける。検証で逆方向（us-east-1→ap-northeast-1）の書き込み伝播も確認済み。読み取りレプリカならここで拒否される。SQL Server で言えば Always On の読み取り専用セカンダリではなく**マージレプリケーション**に近い。
+- **「プライマリ」は運用上の呼び方**: Terraform で主に見えるのは単に最初にテーブルを作った側というだけ。DynamoDB 内部に主従は無い。
+- **バックアップではない**: 東京での削除がバージニアにも伝播することを実測。**オペミスやアプリのバグには無力**で、その用途には PITR / オンデマンドバックアップが別途必要（dev は現在 `point_in_time_recovery = false`）。守れるのは**リージョン単位の障害**であって**データの誤操作**ではない。
+- **競合は last writer wins**: 同一項目をほぼ同時に両リージョンで更新すると後勝ちで片方が黙って消える。エラーにも競合検出にもならない。
+- **クロスリージョンのトランザクションは不可**: `TransactWriteItems` の原子性は同一リージョン内のみ。レプリケーションは項目ごとに個別・非同期。`ConsistentRead`（強整合読み取り）も同一リージョン内でのみ有効。
+
+**この性質が MatchmakingTickets 除外の直接の理由**。楽観ロックによる「1 チケットを 1 回だけ MATCHING に遷移」は last-writer-wins のマルチマスターでは保証できず、4 テーブル全部をレプリカ化していたら「同じプレイヤーが両リージョンで別セッションにマッチされる」バグを埋め込んでいた。
+
+### Q. Route 53 で「各地域が地理的に近い DynamoDB にアクセスする」という理解でいい?
+
+**結果はその通りだが、経路が違う。Route 53 は DynamoDB を指さない。**
+
+- DynamoDB には自分で管理する DNS レコードが無い（エンドポイントは `dynamodb.<region>.amazonaws.com` で AWS 固定）。**Route 53 のレイテンシールーティングの対象にできない**。
+- Route 53 が振り分けるのは **API Gateway のリージョナルエンドポイント**。
+
+```
+クライアント → Route53(レイテンシー) → 近い方の API Gateway
+                                          → 同リージョンの Lambda
+                                          → 同リージョンの DynamoDB レプリカ ← ここは Route53 と無関係
+```
+
+**最寄り DynamoDB になるのは「Lambda がそのリージョンにいるから」**。`server/internal/db/client.go` が `AWS_REGION`（Lambda ランタイムが自動設定）を読んで SDK のリージョンにしているため、us-east-1 にデプロイされた Lambda は自動で us-east-1 の DynamoDB を掴む。**Go のコード変更は不要**（Phase 2 の実装がそのまま効く）。
+
+各ステップの役割分担:
+
+| ステップ | 何を解決するか |
+|---|---|
+| ① Global Tables | データがバージニアにも**存在する** |
+| ② us-east-1 に Lambda/API GW | バージニアで**処理できる**。DynamoDB 局所性はここで自動達成 |
+| ③ Route 53 | クライアントが近い方へ**自動で繋がる**（入口の選択のみ） |
+
+②の時点で「バージニアの API を直接叩けばバージニアの DB を使う」状態は完成する。
+
+**③ で必要になるもの**: ドメイン、**ACM 証明書 ×2**（リージョナルカスタムドメインは同一リージョンの証明書が必須。CloudFront と違い us-east-1 の証明書を使い回せない）、API GW カスタムドメイン ×2、同一名で region 違いのレイテンシーレコード ×2、ヘルスチェック。
+
+### Q. MatchmakingTickets をリージョンごとに別テーブルにして不都合は無い?
+
+**3 つある。うち 1 つは Route 53 導入時に実害が出る。**
+
+**① 待機プールの分断 — 意図的なトレードオフ（対処不要）**
+東京のプレイヤーは東京としかマッチしない。合計 4 人いても各リージョン 3 人/1 人なら 4 人パーティは組めない。
+ただし統合すると太平洋横断 RTT（150ms+）を強いられアクションゲームとして成立しない。**プールを分けること自体がマルチリージョン化の目的**。1,000 同時セッション規模なら影響は小さく、`soloAllowed` と 60 秒見切り発車（`MinMatchSize=2`）も実装済み。
+
+**② 「1 プレイヤー 1 チケット」がリージョンをまたいで効かない — 低リスク**
+`db/tickets.go` の `FindWaitingByPlayer` は自リージョンのテーブルしか Query しない。同一プレイヤーが両リージョンの API を叩けばチケットを 2 枚持て、2 セッションにマッチされ得る。通常クライアントは 1 エンドポイントしか使わないため実影響は小さいが、**不正クライアントが意図的に両方を叩ける穴**。Phase 6 のセキュリティ強化で扱う価値がある。
+（`session_end` は Sessions が Global Tables なのでどちらのリージョンからでも正しく終了処理できる。）
+
+**③ Route 53 導入時にポーリングが 404 で落ちる — 実害あり。要対処**
+`handlers/match_status.go` はチケット未発見で **404** を返し、`cmd/client` の `pollMatch` は 404 を受けると即座に打ち切る。
+
+```
+match/request → Route53 → 東京にチケット作成
+  ↓ 0.5 秒後のポーリング（最大 70 秒・500ms 間隔）
+  ↓ DNS TTL 切れ / ヘルスチェック変動でバージニアへ振られる
+バージニアに tkt-xxx は無い → 404 → クライアント即エラー終了
+```
+
+ポーリングが長いぶん切り替わる窓が何度も存在する。
+
+対処方針（ステップ ③ の作業項目に含める）:
+
+| 案 | 内容 | 評価 |
+|----|------|------|
+| A. チケット ID にリージョンを埋める（`tkt-apne1-xxx`） | 別リージョン到達時に判別できる | 実装が要る |
+| **B. マッチング中はエンドポイントを固定** | match/request の応答にリージョン固有 URL を返し、以降はそれを使う | **推奨。ゲームで一般的なセッションアフィニティ** |
+| C. 404 をリトライ扱い | 対症療法。リージョンが戻らないと解決しない | 不十分 |
+
+**Route 53 は「最初の入口を決める」役割に徹し、マッチング開始後はそのリージョンに留まる**設計（案 B）が本筋。
+
+### Q. セッションアフィニティ（案B）では、どの API を同一リージョンに固定する?
+
+**API 単位ではなく「触るテーブルが region-local かどうか」で決まる。** Tickets を触る 3 つが対象。
+
+| API | 触るテーブル | 性質 | 固定 |
+|-----|------------|------|------|
+| `POST /match/request` | MatchmakingTickets | region-local | **固定される側でなく決める側**（Route 53 がここで行き先を選ぶ） |
+| `GET /match/status/{ticketId}` | MatchmakingTickets | region-local | ⭕ 必要 |
+| `DELETE /match/cancel/{ticketId}` | MatchmakingTickets | region-local | ⭕ 必要 |
+| `GET /player/{playerId}/history` | MatchHistory | Global Tables | ❌ 不要（どこでも同じ答え） |
+| `POST /session/{sessionId}/end` | Sessions + MatchHistory | Global Tables | ❌ 不要（どこでも動く） |
+
+**線引きの理由はデータがレプリケーションされているか一点**。Global Tables 側はバージニアに聞いても東京と同じ答えが返るのでどこへ投げてもよい。Tickets は東京のものが東京にしか無いので、行き先を間違えると 404 になる。
+→ 先に決めた「どのデータを共有し、どれを分離するか」の設計が、そのまま「どの API を固定すべきか」を決めている。
+
+**実装上の単純化**: API ごとに向き先を出し分けるのは煩雑。Global Tables 側の API はどちらに投げても正しく動くので、**「マッチング〜セッション終了までの一連の流れを、最初に選ばれたリージョンへ全部投げる」で構わない**（固定が必要なのは 3 つだが、実装は全部固定でも害が無い）。
+
+### Q. マルチリージョン構成（Phase 5-2）は実際に動いた? 何を実証した?
+
+**両リージョンで独立稼働することを実 API で確認（2026-08-18）。** 設計上の主張を 4 つとも実機で裏取りした。
+
+構成: `ap-northeast-1` / `us-east-1` に Lambda 6 関数 + REST API を 1 組ずつ（計 100 リソース）。Cognito は東京の 1 プールを共用。GameLift は `enable_gamelift=false` で未作成。
+
+**① 東京発行の Cognito トークンがバージニアの authorizer で通る**
+東京の User Pool で `initiate-auth` して得た id_token で、us-east-1 の `POST /match/request` が 200。**Cognito 共用（プールを複製しない）方針が成立**することの実証。JWT 検証は JWKS を引いて署名を見るだけでリージョン親和性が無い、という前提どおり。
+
+**② MatchmakingTickets はリージョンごとに完全分離**
+同一プレイヤーが両リージョンに request → **別々の ticketId が 2 枚発行**された。region-local が効いている証拠であり、同時に「1 プレイヤー 1 チケットがリージョンを跨がない」（不都合②）の実証でもある。
+
+**③ 不都合③（Route 53 導入時の 404）を実機で再現**
+
+| 問い合わせ | 結果 |
+|-----------|------|
+| 東京のチケット → 東京の API | 200 |
+| **東京のチケット → バージニアの API** | **404 `ticket not found`** |
+| バージニアのチケット → バージニアの API | 200 |
+
+ポーリング中にリージョンが切り替わると確実に落ちる。**セッションアフィニティ（案B）は Route 53 導入前に必須**と確定。
+
+**④ Global Tables 側はどちらの API からでも同一の答え**
+東京の MatchHistory に 1 件書き込み → 東京・バージニア両方の `GET /player/{id}/history` が**完全に同一の JSON** を返した。Lambda 経由でも Global Tables が機能し、「history / session_end は固定不要」の裏付けになった。
+
+**副次的な確認**: us-east-1 の Lambda が us-east-1 の DynamoDB を掴んでいる（Go の変更ゼロ）。`internal/db.NewClient` が Lambda ランタイムの `AWS_REGION` を読む実装がそのまま効いた。
+
+### Q. セッションアフィニティ（③-a）はどう実装した? 効果は確認できた?
+
+**`match/request` の応答に「以降のリクエスト先」を含めてクライアントに固定させる方式で実装し、実機で確認（2026-08-18）。**
+
+**解決の優先順位**（`internal/apigw/endpoint.go` の `RegionEndpoint`）:
+1. 環境変数 `API_BASE_URL` … Route 53 導入後にリージョン固有カスタムドメインを注入する口
+2. リクエストの `requestContext` から導出 … `https://<domainName>/<stage>`
+
+**2 を主経路にした理由は Terraform の循環依存回避**。api_gateway モジュールは lambda の ARN を必要とするため、逆に lambda が API の URL を output 経由で受け取ると循環する。リクエストから読めば依存が要らない。execute-api のドメインは `<api-id>.execute-api.<region>.amazonaws.com` と**元々リージョン固有**なので、カスタムドメイン導入前でも固定先として十分機能する。
+
+**実機確認**:
+
+```
+東京       → {"endpoint":"https://0eyv….execute-api.ap-northeast-1.amazonaws.com/dev","region":"ap-northeast-1"}
+バージニア → {"endpoint":"https://zpyt….execute-api.us-east-1.amazonaws.com/dev","region":"us-east-1"}
+```
+
+| 経路 | 結果 |
+|------|------|
+| 東京のチケット → 返された endpoint（東京） | **200** |
+| 東京のチケット → バージニア（endpoint を無視した場合） | **404**（＝対策前の挙動） |
+
+cmd/client で `-api` にバージニアを渡した実行ログ:
+`ticket status=WAITING region=us-east-1 pinned=https://zpyt….us-east-1.amazonaws.com/dev`
+→ 応答の endpoint を採用して以降のポーリングを固定していることを確認。
+
+**固定しない API**: `session/end` と `player/history` は Sessions / MatchHistory が Global Tables でどのリージョンからでも同じ結果になるため `cfg.apiURL` のまま（コードにも理由をコメント）。
+
+**ローカルへの影響なし**: localapi は `RequestContext` を埋めないため `RegionEndpoint` は空を返し、クライアントは従来どおり自分の URL を使い続ける。
+
+**検証中の余談（バグではない挙動）**:
+- 同一プレイヤーの 2 回目の `match/request` は冪等性により既存 WAITING チケットを返す。先に `soloAllowed=false` で作ったチケットが再利用され、`-solo=true` を付けてもソロマッチしない。
+- 60 秒（`MaxWaitSeconds`）経過したチケットは `TIMEOUT` に遷移済みで、`match/cancel` は **409** を返す。どちらも仕様どおり。
+
+### Q. `API_BASE_URL` は AWS ではどこから入る?
+
+A. **現時点の dev では空文字が入る**（＝優先順位 2 のリクエスト導出が動く）。`DYNAMODB_ENDPOINT` と違い環境変数のキー自体は Terraform に存在するが、値を渡していない。
+
+値の流れ:
+
+1. `modules/lambda/main.tf` … `match_request` の env に `API_BASE_URL = var.api_base_url`
+2. `modules/lambda/variables.tf` … `default = ""`
+3. `environments/dev/main.tf` … `module.lambda`（東京）／`module.lambda_secondary`（us-east-1）**どちらも `api_base_url` を渡していない** → 既定値 `""`
+
+空なので `apigw.RegionEndpoint` は `https://<requestContext.domainName>/<requestContext.stage>` を組み立てる。`domainName` は API Gateway がリクエストごとに埋める値で、カスタムドメイン未使用なら `<api-id>.execute-api.<region>.amazonaws.com` ＝**元々リージョン固有**のため、これで固定先として機能する。
+
+**Terraform から注入しない理由**は循環依存（api_gateway が lambda の ARN を必要とするので、逆向きに URL を output で受け取れない）。
+
+**環境変数が実際に埋まるのは Route 53 + カスタムドメイン導入時**。そのとき各モジュール呼び出しにリージョン固有名を明示する:
+
+```hcl
+module "lambda"           { api_base_url = "https://apne1.api.example.com/dev" }
+module "lambda_secondary" { api_base_url = "https://use1.api.example.com/dev" }
+```
+
+共通名（`api.example.com`）を入れてはいけない。レイテンシールーティングで別リージョンに飛び、固定したはずのアフィニティが壊れる。
+
+### Q. デプロイ用ポリシーが「2048 文字を超えています」で保存できない。どうする?
+
+**インラインポリシーの上限に当たった。カスタマー管理ポリシーへ移行する。**
+
+| 種別 | 上限（非空白文字） | 本ポリシー 2370 文字 |
+|------|------------------|--------------------|
+| インラインポリシー（ユーザー） | **2,048** | ❌ 322 文字超過 |
+| カスタマー管理ポリシー | **6,144** | ⭕ 余裕あり |
+
+- **注意点**: インラインの 2048 は「そのプリンシパルに付いた**全インラインポリシーの合計**」。分割しても回避できない。
+- 空白は数えないので、JSON を圧縮しても意味が無い。
+- 権限を削って縮めることもできるが、`route53:*` のようなワイルドカードに寄せることになり最小権限の方針に反する。**管理ポリシーへの移行が正解**。
+
+**管理ポリシーの方が本来は適切**でもある:
+- バージョン管理される（最大 5 版を保持し、ロールバック可能）
+- 複数のユーザー/ロールに再利用できる
+- IAM のポリシー一覧に独立して現れ、監査しやすい
+
+インラインは「そのプリンシパル専用で、消えるときに一緒に消えてほしい」場合に使うもので、**デプロイ用の共通ポリシーは管理ポリシー向き**。Phase 4 の時点では 8 サービスで 2048 に収まっていたため気づかなかった。
+
+**移行手順（コンソール）**: IAM → ポリシー → ポリシーを作成 → JSON に `terraform/bootstrap/raidync-cli-deploy-policy.json` を貼付 → 名前を付けて作成 → IAM → ユーザー → raidync-cli → 許可を追加 → ポリシーを直接アタッチ → 作成したポリシーを選択 → **最後に古いインラインポリシーを削除**（両方残すと合計文字数の制限に再び触れる）。
+
+### Q. Route 53 レイテンシールーティング（③-b）はどう組んだ? 効果は測れた?
+
+**独自ドメイン `raidync.com` を Route 53 で取得し、API Gateway リージョナルカスタムドメイン + レイテンシールーティングで構築（2026-08-24）。**
+
+**名前の設計**
+
+| 名前 | 役割 | ルーティング |
+|------|------|------------|
+| `api.raidync.com` | クライアントの入口 | **レイテンシー**（同名レコードを 2 本置き `set_identifier` で区別） |
+| `apne1.api.raidync.com` | 東京固定 | 単純 alias |
+| `use1.api.raidync.com` | バージニア固定 | 単純 alias |
+
+**同じカスタムドメイン名を両リージョンに作る**のが AWS のマルチリージョン API パターン。API Gateway 側は同名でもリージョンごとに別のリージョナルエンドポイント（`d-xxxx.execute-api.<region>.amazonaws.com`）を持ち、DNS 側で振り分ける。
+
+**構築の 4 段階**（`terraform/environments/dev/dns.tf`）
+1. 証明書を要求（`api_cert` モジュール。REGIONAL は同一リージョンの証明書しか使えないので 2 枚）
+2. 検証用 CNAME を作り ISSUED を待つ（**重複排除が必須**。下記）
+3. 検証済み証明書でカスタムドメイン作成（`api_domain` モジュール）
+4. Route 53 レコード（固定名 → レイテンシー）
+
+2 を挟むためモジュールを 2 つに割っている。検証レコードはホストゾーン（グローバル）側の作業でリージョンモジュール内に閉じない。
+
+**実測（日本から）**
+
+| 名前 | 応答時間 |
+|------|---------|
+| `api.raidync.com` | **0.13s** |
+| `apne1.api.raidync.com` | 0.16s |
+| `use1.api.raidync.com` | **0.57s**（約 4 倍） |
+
+共通名が東京固定名とほぼ同速＝最寄りへ正しく振られている。名前解決も `api.raidync.com → 35.78.43.27`（東京の帯）を確認。
+
+**セッションアフィニティとの噛み合わせ（本番同等の経路で確認）**
+
+```
+POST https://api.raidync.com/match/request   ← レイテンシーで東京へ
+  → {"endpoint":"https://apne1.api.raidync.com","region":"ap-northeast-1"}
+GET  https://apne1.api.raidync.com/match/status/{id}  → 200 ⭕
+GET  https://use1.api.raidync.com/match/status/{id}   → 404 ❌（endpoint を無視した場合）
+```
+
+入口で近いリージョンに振られ、以降は固定名に貼り付く。③-a の仕組みが execute-api URL からカスタムドメインへ問題なく引き継がれた（`API_BASE_URL` にリージョン固定名を注入）。
+
+### Q. ヘルスチェック用の `/health` はなぜ MOCK 統合にした?
+
+Route 53 のヘルスチェックは **2xx/3xx を返す URL** を要求するが、業務 API はすべて認証必須か POST で流用できない（401 は「異常」と判定される）。
+
+**MOCK 統合**は API Gateway がバックエンドを呼ばずに応答を組み立てる方式で、**Lambda を呼ばないため実行課金もコールドスタートも無い**。ヘルスチェックが判定したいのは「API Gateway がそのリージョンで生きているか」なので、Lambda や DynamoDB まで到達する必要はなく、この浅さがむしろ適切（深く探ると DynamoDB の一時的な遅延でリージョン全体を切り離しかねない）。
+
+**注意点**: `/health` を足したら `aws_api_gateway_deployment` の `triggers` にも含めること。含め忘れると再デプロイされずステージに反映されない（ヘルスチェックが 403 を見続ける）。
+
+**ヘルスチェックの監視先はリージョン固定名にする**。共通名 `api.<domain>` を指すと、世界中に散らばる Route 53 のヘルスチェッカーがそれぞれ自分の最寄りへ解決してしまい「特定リージョンの生死」を測れない。
+
+**opt-in にした理由（コスト）**: レイテンシールーティング自体はヘルスチェック無しでも動く。ヘルスチェックが足すのは**自動フェイルオーバー**で、月 $3.00（$0.50/個 + HTTPS オプション $1.00/個 × 2。API Gateway は HTTPS 専用なのでオプション必須）。ホストゾーン $0.50/月 に対して支配的なため `enable_health_checks`（既定 false）で必要時のみ有効化する。`enable_gamelift` と同じ考え方。
+
+### Q. Phase 5-4 の CloudFront + S3 はなぜ作らなかった?
+
+**配信すべき静的アセットが存在しないため。空の CDN を建てても品質の証明にならない。**
+
+当初計画（spec-architecture.md §2.6）では「ゲームクライアント・アップデートファイルの配信」を想定していたが、実態は次のとおり:
+
+| 配信候補 | 実態 |
+|---------|------|
+| Unity クライアント本体 | **未実装**。本プロジェクトの焦点はインフラ品質でゲームの完成度ではない（CLAUDE.md） |
+| ゲームサーバーのバイナリ | GameLift Build として S3 から各インスタンスへ配布される。**CloudFront を通らない経路**で、CDN を挟む余地が無い |
+| Web フロント | 存在しない（クライアントはネイティブ、API は REST） |
+
+**「作れるが作らない」判断**。中身が無い CDN で確認できるのは「空の箱が空を返すこと」だけで、
+オリジン設定・キャッシュ戦略・無効化運用といった CloudFront の本質的な難所には何も触れない。
+ポートフォリオとしても、動いていないものを構成図に足すのは減点要素になり得る。
+
+**VPC を不採用にしたのと同じ判断基準**（docs/qa-log.md §12）。使い所が無いものは作らず、
+「検討した上で不要と判断した」ことを記録する方が設計判断として示せる。
+
+**必要になった時の見通し**: オリジンは S3、証明書は **us-east-1 固定**（CloudFront は
+リージョナルと違い us-east-1 の証明書しか使えない）。Route 53 / ACM の実装で得た知見が
+そのまま使えるので、着手コストは低い。
+
+---
+
+### Q. 「セッション最大 20 分」という要件は、サービス選定にどう効く?
+A. **20 分という数字そのものはサービス選定を決めない。** 選定を決めるのは長さではなく「その 20 分間、接続が張りっぱなしで状態を持ち続ける」という**性質**のほう。ここから「UDP が要る → API Gateway も ALB も UDP を通せない → NLB か GameLift」という分岐が出る（§10 の UDP 採用判断につながる）。
+
+20 分という数字が実際に効くのは、アーキテクチャ選定ではなく**可用性設計とコスト計算**:
+
+| 効く箇所 | 内容 |
+|---------|------|
+| スケールインの猶予 | 進行中セッションを殺せない。縮退完了まで最大 20 分かかる前提で設計する（GameLift のドレイン） |
+| Spot 中断との関係 | Spot の中断通知は 2 分前。20 分のセッションには足りない → **On-Demand フォールバックが必要**な根拠 |
+| Sessions テーブルの TTL | 終了済みセッションレコードをいつ消すかの基準 |
+| 必要インスタンス数 | 1 インスタンスあたりの同時セッション数 × 回転率 で見積る |
+
+### Q. ゲームサーバー基盤に GameLift を選ぶ理由は「管理が最小だから」でいい?
+A. **不十分。**「ECS Fargate の方が管理は少ない」で崩れる。本当の決定打は管理コストではなく**スケーリングの軸**。
+
+- ECS / EKS のオートスケーリングは **CPU 使用率やリクエスト数**が基準。
+- ゲームサーバーで見るべき指標は「**空きセッションスロット数**」。CPU 30% でも 4/4 人埋まっていれば新規は受けられず、CPU 80% でも空きがあれば受けられる。**CPU とプレイヤー収容能力が相関しない**。
+
+汎用コンテナ基盤を選ぶと、以下 4 つを自前実装する必要が出る:
+1. **セッション配置** — 新規マッチをどの空きインスタンスに割り当てるか（GameLift の placement）
+2. **ドレイン** — スケールイン時、進行中セッションを殺さず新規受付だけ止めて終了を待つ
+3. **Spot 中断ハンドリング** — 2 分前通知を受けてセッションを退避
+4. **マッチメイキング** — FlexMatch 相当
+
+「これらを自作するか GameLift に任せるか」という比較にして初めて選定に説得力が出る。
+
+### Q. 認証に Cognito を選ぶ理由は「AWS と連携が取りやすいから」でいい?
+A. 弱い。具体的な利点を挙げる:
+- **パスワードハッシュの保管責任を自分で負わない**（自前 JWT + DynamoDB だとここを背負う）
+- 発行された **JWT を API Gateway / Lambda Authorizer 側で検証できる**（§5 参照）
+- **TOTP による MFA が標準で付く**
+
+### Q. このシステムの「サーバー」は 1 種類ではない?
+A. 性質の異なる **2 系統**がある。同じ基盤に載せてはいけない。
+
+| | データプレーン | コントロールプレーン |
+|---|---|---|
+| 中身 | ゲームサーバー本体 | ログイン・マッチ申請・セッション一覧・戦績 |
+| プロトコル | UDP | HTTP / REST |
+| 状態 | ステートフル、接続張りっぱなし | ステートレス |
+| 寿命 | 最大 20 分で消える | 1 リクエスト数十 ms |
+| 基盤 | GameLift | API Gateway + Lambda |
+
+分離する理由: ゲームサーバーに REST を生やすと「20 分で死ぬプロセス」に永続 API を同居させることになり、スケール単位も障害の影響範囲も混ざる。逆に Lambda では UDP のゲームループを回せない（実行時間上限があり、状態を持てない）。
+
+この分離を出発点に置くと「Lambda と GameLift の間で誰がセッション情報を持つのか → DynamoDB」「4 人揃うまでの待機状態をどこに置くか → MatchmakingTickets」まで自然に降りられる。
+
+---
+
+### Q. Phase 5 は完了という認識でいい?
+
+**ロードマップ上の 5-1〜5-4 は完了（5-4 は不採用の判断で確定）。ただし 1 点だけ「IaC は書けたが実機検証をしていない」項目が残っていた。**
+
+| # | 項目 | 状況 |
+|---|------|------|
+| 5-1 | DynamoDB Global Tables | ✅ 双方向レプリケーションを実測 |
+| 5-2 | us-east-1 に API 層追加 | ✅ 実 API で 4 点を実証（2026-08-18） |
+| 5-3 | Route 53 レイテンシールーティング + セッションアフィニティ | ✅ 東京 0.13s / us-east-1 0.57s を実測 |
+| 5-4 | CloudFront + S3 | **不採用**（配信すべき静的アセットが無い） |
+
+**残っていたもの**: セカンダリ（us-east-1）の GameLift フリート。commit `b1ef17a` で両リージョンに配置できるようにしたが、記録されているのは `plan` の確認（`enable_gamelift=true` で 14 add / 2 change）までで、**apply して us-east-1 でマッチ〜ゲームサーバー接続を通した記録が無い**。実際フリートは両リージョンとも 0 のまま。
+
+**判断: Phase 6-6 / 6-7（k6 負荷テスト・オートスケーリング確認）に合流させる。** 理由はフリートの起動回数を減らすため。GameLift フリートはこのプロジェクトで唯一の時間課金リソース（2 基で約 $0.06/時）で、負荷テストではどのみち起動する。ここで単独の E2E のために一度起動し、Phase 6 でもう一度起動するのは、同じ検証に二重に課金することになる。
+
+一般化すると **「時間課金リソースを使う検証は、起動の機会をまとめる」** という運用方針。`enable_gamelift` を両リージョン連動の単一フラグにした（片方だけ残る事故を防ぐ）のと同じ発想で、「起動している時間」を管理単位として扱っている。
+
+したがって Phase 5 は **「IaC 完了・実機検証は Phase 6 に合流」** で締める。
+
+---
+
+## 14. IAM とトラブルシュート
+
+> 「IAM 権限を 1 つ意図的に削って壊し、CloudWatch Logs から自力で原因を特定する」演習の記録。
+> 壊した箇所: `modules/iam` の DynamoDB ステートメントから `"${arn}/index/*"` を除去。
+
+### Q. テーブルへの `dynamodb:Query` 権限はあるのに、GSI への Query が `AccessDeniedException` で落ちるのはなぜか
+
+**ARN は階層ではなく、IAM のリソース照合はワイルドカード付きの単純な文字列マッチだから。**
+
+```
+arn:aws:dynamodb:ap-northeast-1:<acct>:table/MatchmakingTickets
+arn:aws:dynamodb:ap-northeast-1:<acct>:table/MatchmakingTickets/index/playerId-status-index
+```
+
+見た目は「テーブルの下に index がある」構造だが、IAM に「配下も自動的に許可」というルールは無い。**GSI は独立した IAM リソース**であり、テーブル ARN は index ARN を含まない。
+
+さらに DynamoDB 側の挙動として、`IndexName` を指定した `Query` は**テーブル ARN ではなく index ARN に対して**認可される。ゆえに「テーブルへの Query 権限はあるのに落ちる」が成立する。
+
+```hcl
+# 正: テーブル本体と index の両方を列挙する
+resources = concat(
+  var.dynamodb_table_arns,
+  [for arn in var.dynamodb_table_arns : "${arn}/index/*"],
+)
+```
+
+`table/MatchmakingTickets*`（末尾ワイルドカード）でも通るが、`MatchmakingTicketsBackup` のような別テーブルにも当たるため使わない。
+
+### Q. 権限エラーなのに、なぜ HTTP 403 ではなく 500 が返るのか
+
+**IAM の文脈が 2 つあり、失敗しているのが「呼び出した人」ではなく「Lambda 自身」だから。**
+
+| | 誰の権限か | 何を判定するか | この事故での結果 |
+|---|---|---|---|
+| ① API Gateway 層 | **プレイヤー**（JWT の `sub`） | `execute-api:Invoke` してよいか | 成功（authorizer は通る） |
+| ② Lambda 実行層 | **Lambda 自身**（実行ロール） | DynamoDB を Query してよいか | **失敗** |
+
+403 は ① の文脈のコード。今回は JWT 検証も authorizer も通っており、落ちているのは ②。クライアントから見れば「サーバー側の都合で失敗した」ので 5xx が正しい。ここで 403 を返すと、クライアントが「ログインし直す」という誤った回復動作をしてしまう。
+
+```go
+// handlers/match_request.go
+if existing, err := h.db.FindWaitingByPlayer(ctx, playerID); err != nil {
+    return apigw.Error(500, "ticket lookup failed"), nil
+}
+```
+
+**帰結: HTTP ステータスだけでは原因を切り分けられない。ログを見に行くしかない。**
+
+診断手順:
+
+```bash
+# Lambda のロググループ名は /aws/lambda/<関数名> で決まる
+aws logs tail /aws/lambda/raidync-dev-match_request --since 5m --region ap-northeast-1
+```
+
+`AccessDeniedException` のメッセージには「どの Principal が・どの Action を・どの Resource に」拒否されたかが全て入っており、末尾の ARN が `.../index/playerId-status-index` を名指しする。
+
+### Q. この権限漏れはいつ混入し、なぜテストをすり抜けるのか
+
+**混入と発覚のタイミングが大きくズレる。**
+
+混入の典型は「**後から GSI を 1 本追加する**」作業。本来 3 つやるべきところ、2 つしかやらない。
+
+| # | 作業 | 実際 |
+|---|---|---|
+| 1 | Terraform に `global_secondary_index` を追加 | やる |
+| 2 | Go に `IndexName` 付き Query を書く | やる |
+| 3 | IAM に index ARN を追加 | **忘れる** |
+
+忘れる理由は 2 つ。
+
+- ポリシーを見ると `dynamodb:Query` が既にあり、**権限が足りているように見える**。追加が必要なのは Action ではなく Resource
+- **IAM ファイルは変更されないので PR の diff に現れない**。「変更していないファイルが原因」という最も見つけにくい形になる
+
+他の混入経路: セキュリティ強化で `Resource = "*"` を明示 ARN に絞る作業、モジュールの別環境への使い回し。
+
+すり抜ける理由:
+
+```
+ローカル E2E : 通る（LocalStack は IAM を評価しない）
+CI 単体テスト: 通る（DynamoDB はモック）
+AWS dev      : 実行された経路だけ落ちる
+本番         : レアな経路が初めて落ちる
+```
+
+**IAM の権限不足は「そのコードパスが実行された瞬間」にしか発覚しない。** 今回壊した `playerId-status-index` は `match_request` の冒頭で使われるため最初の 1 リクエストで落ちるが、`match_cancel` の所有者確認だけが使う GSI なら、キャンセルを試すまで誰も気づかない。カバレッジの低い経路の権限不足は本番まで生き残る。
+
+対策（Phase 6 へつながる）:
+
+1. **AWS dev で実 E2E を回す** — Phase 4 でこれをやった理由がここにある
+2. **CloudTrail の `AccessDenied` を監視してアラート** — 発覚を「ユーザーの苦情」ではなく「メトリクス」にする
+3. IAM Access Analyzer の policy validation
+
+### Q. `terraform plan` で身に覚えのない destroy 差分（19 個）が出た
+
+**`-var-file=dev.tfvars` の付け忘れ。** 変更履歴とは無関係の、見かけ上の差分。
+
+```hcl
+# variables.tf
+variable "domain_name" {
+  type    = string
+  default = ""      # ← 未指定ならこれ
+}
+
+# dns.tf:19
+dns_enabled = var.domain_name != ""
+```
+
+DNS・ACM 証明書・カスタムドメイン一式は `dns_enabled` で `count` ゲートされているため、`domain_name` が空になると全部 destroy 対象になる。
+
+| 実行方法 | `domain_name` | 結果 |
+|---|---|---|
+| `terraform plan` | `""`（default） | DNS 系 **19 個を destroy** |
+| `terraform plan -var-file=dev.tfvars` | `"raidync.com"` | 差分なし |
+
+同時に出る `2 to change` は `match_request`（primary/secondary）の環境変数 `API_BASE_URL`。`apigw.RegionEndpoint()` がここからリージョン固定エンドポイントを読むため、ドメインが消えると値が空になる。**`match_request` だけが対象なのは偶然ではなく、セッションアフィニティ用エンドポイントを返すのがこの関数だけだから**（§13 参照）。
+
+`default = ""` は「ドメイン未取得でも apply できる」ための意図的な設計だが、その柔軟性と引き換えに**付け忘れ事故のリスク**を負っている。回避策は `terraform.tfvars` にリネームして自動読み込みさせるか、`default` を消して必須変数にするか。
+
+### Q. Windows でシェルを変えたら同じコマンドが通らなくなった（Git Bash / PowerShell）
+
+**引数の分解ルールがシェルごとに違う。** この演習中に 2 つ踏んだので記録する。
+
+#### ① Git Bash（MSYS）: `/` 始まりの引数を Windows パスに変換する
+
+```bash
+aws logs tail /aws/lambda/raidync-dev-match_request --region ap-northeast-1
+# → InvalidParameterException: logGroupName failed to satisfy constraint: [\.\-_/#A-Za-z0-9]+
+```
+
+MSYS が `/aws/lambda/...` を Windows パスとみなし、`C:/Program Files/Git/aws/lambda/...` に書き換える。変換後は**スペース**を含むため AWS 側の正規表現に落ちる。ロググループ名自体は正しい。
+
+```bash
+# 回避
+MSYS_NO_PATHCONV=1 aws logs tail /aws/lambda/raidync-dev-match_request --region ap-northeast-1
+```
+
+CloudWatch Logs のロググループ、IAM のパス、S3 のキーなど「`/` 始まりの識別子」全般で起きる。
+
+#### ② PowerShell: `-name=value` の値にあるドットで引数が分断される
+
+```powershell
+terraform ... -target=module.iam.aws_iam_role_policy.matchmaking
+# → Error: Invalid target "module"
+# → Error: Too many command line arguments
+```
+
+実測した分解結果:
+
+| 書き方 | 分解結果 |
+|---|---|
+| `-a=foo.bar` | `[-a=foo]` `[.bar]` ← **割れる** |
+| `-a=foo_bar.baz` | `[-a=foo_bar]` `[.baz]` ← 割れる |
+| `-a=C:/x/foo.bar` | `[-a=C:/x/foo.bar]` ← 割れない |
+| `foo.bar`（先頭に `-` なし） | `[foo.bar]` ← 割れない |
+
+**規則:** トークンが `-` で始まり `=` を含むと、PowerShell は `=` の右側を式として読み始める。bareword の直後の `.` が**メンバーアクセス演算子**と解釈され、そこで引数が切れる。`-var-file=C:/.../dev.tfvars` が無傷なのは、値に `:` と `/` があり「パスらしい」ため bareword 扱いされるから。Git Bash では `.` に特別な意味がないのでそのまま渡る。
+
+回避策（いずれも実測で有効）:
+
+```powershell
+terraform ... -target="module.iam.aws_iam_role_policy.matchmaking"   # A. 値だけ引用（推奨）
+terraform ... "-target=module.iam.aws_iam_role_policy.matchmaking"   # B. 全体を引用
+terraform ... -target module.iam.aws_iam_role_policy.matchmaking     # C. = をやめる
+terraform --% apply -target=module.iam...                            # D. stop-parsing トークン
+```
+
+**危険性:** 今回は terraform が両方エラーにしたが、壊れた `-target` が単に無視される作りだったら**ターゲット指定なしの全体 apply** が走り得た。`-var-file` 付け忘れと重なれば DNS 19 個が消える。`-target` は必ずドットを含むので、**常に引用符で囲む**のを習慣にする。
+
+### Q. IAM ポリシーの 1 行を消したら diff が 8 行出た。影響範囲をどう読むか
+
+**`for` 式は「ソース 1 行」と「展開後の権限」が一致しない。**
+
+```hcl
+[for arn in var.dynamodb_table_arns : "${arn}/index/*"]
+# → 4 テーブル × 2 リージョン = 8 本の index ARN を生成
+```
+
+変更されるリソースは `aws_iam_role_policy` 1 個（`Plan: 1 to change`）だが、権限としては 8 本が消える。**HCL のソースだけを見て「1 行だから安全」と判断すると事故る。plan の出力こそがレビュー対象。**
+
+副次的な発見として、**元のポリシー自体がやや過剰付与だった**。GSI を持つのは `MatchmakingTickets` のみで、`Players` / `Sessions` / `MatchHistory` には index が無い。存在しないリソースへの権限なので今は無害だが、将来それらに GSI を足した瞬間に意図せず権限が付く。`for` で楽をした代償として「どのテーブルに index 権限が要るか」を人間が考えなくなっている、という構造的な指摘ができる。
+
+---
+
+> ここから下は、上の演習中に**演習とは無関係の実在の欠陥**が見つかったため、その修正記録。
+> 欠陥: 全ハンドラが `err` を握り潰しており、500 が起きても CloudWatch に何も残らなかった。
+
+### Q. 500 を返しているのに CloudWatch Logs に何も出ないのはなぜか
+
+**アプリが一度もログを書いていなかったから。** そのうえで、監視の穴が三重になっていた。
+
+| 経路 | 状態 |
+|---|---|
+| クライアントへの応答 | `{"error":"ticket lookup failed"}` — 原因を含まない（これは正しい） |
+| CloudWatch Logs | **空**。`START`/`END`/`REPORT` のみ |
+| Lambda の `Errors` メトリクス | **0**。`return apigw.Error(500, ...), nil` は Lambda 的には「成功」 |
+
+唯一反応するのは API Gateway の `5XXError` だが、これは「どこかで 500 が出た」しか教えてくれない。**原因を持っている唯一の場所（`err`）が、コード上で捨てられていた**のが根本。
+
+```go
+if existing, err := h.db.FindWaitingByPlayer(ctx, playerID); err != nil {
+    return apigw.Error(500, "ticket lookup failed"), nil   // err がここで消える
+}
+```
+
+`err` を捨てているのは 6 ハンドラすべて。ログ出力が存在したのは `authorizer` の 1 行のみだった。
+
+### Q. エラーログはどこに書くべきか。各ハンドラか、共通関数か
+
+**「規律で守る」のではなく「型で守る」形にした。** `apigw.Error()` のシグネチャに `err` を必須引数として足す。
+
+```go
+// 変更前: err を渡す口が無い。だから捨てるしかなかった
+func Error(status int, message string) events.APIGatewayProxyResponse
+
+// 変更後: 渡さないとコンパイルが通らない
+func Error(ctx context.Context, status int, message string, err error) events.APIGatewayProxyResponse
+```
+
+各ハンドラに `log.Printf` を書いて回る案（＝規律）は、次にハンドラを足した人がまた忘れる。**忘れることをコンパイルエラーにする**のがこの変更の狙い。エラーを持たない 4xx では `nil` を明示的に渡すことになり、その `nil` が「ここは意図的にログ不要」というレビュー可能な意思表示になる。
+
+### Q. `requestId` も引数で渡すべきか
+
+**渡すべきではない。`ctx` の中にすでに入っているため。**
+
+```go
+reqID := ""
+if lc, ok := lambdacontext.FromContext(ctx); ok {
+    reqID = lc.AwsRequestID
+}
+```
+
+引数にすると、24 か所すべてで `lambdacontext` の定型コードを書き、渡し直すことになる。しかも `""` を渡してもコンパイルは通るので、**「型で守る」どころか間違える口を 24 個増やす**。`ctx` はリクエストスコープの値を運ぶ袋であり、中身を取り出すのはそれを使う側（＝`Error()` の中）の仕事。
+
+> C# で言えば、`HttpContext` を渡しておきながら `TraceIdentifier` も別引数で渡すようなもので、片方が嘘をつける状態になる。
+
+### Q. `slog.Error(err.Error())` の何が問題だったか（2 つ）
+
+**① `err == nil` で panic する。** `err.Error()` は nil インターフェースへのメソッド呼び出し。`nil` を渡す箇所が 15 あるため、**`questId` を空にして叩くだけで Lambda がクラッシュ**した。
+
+そしてプロキシ統合の帰結として、**クライアントの入力ミス（400）がサーバー障害（502）に化ける**。元の欠陥より悪化していた。`go build` も `go vet` も通ったが、`internal/handlers` にテストが 1 つも無いため誰も気づけない。
+
+**② `slog` の引数はキーと値のペアで、奇数個だと最後が捨てられる。**
+
+```
+現在:  ...,"requestId":"abc-123","!BADKEY":"operation error DynamoDB: Query, AccessDenied..."
+正しい: ...,"requestId":"abc-123","err":"operation error DynamoDB: Query, AccessDenied..."
+```
+
+`!BADKEY` になると `err` というキーで検索できず、**構造化した目的そのものが失われる**。`err.Error()` ではなく `err` をそのまま渡せば、JSON ハンドラが文字列化する。
+
+なお `msg` にエラー本文を入れるのも避ける。エラーごとに `msg` が変わると `stats count() by msg` のような集計ができない。**`msg` は低カーディナリティの固定文字列、変動値は属性**。
+
+### Q. 4xx にも `err` を渡してよいか
+
+**渡さない。ERROR レベルは「人が起きて対応すべきこと」に限る。**
+
+当初 4 か所で 4xx に `err` を渡していた。
+
+| 場所 | 状況 | 実態 |
+|---|---|---|
+| 400 invalid request body | `json.Unmarshal` 失敗 | 不正なクライアントが投げれば出る |
+| 404 ticket not found | `ErrTicketNotFound` | TTL 90 秒で消えるので**日常的に出る** |
+| 409 not cancellable | `db.ErrConflict` | **楽観ロックが設計どおり効いた証拠** |
+
+これらを ERROR にすると、Phase 6 で作る「ERROR が出たらアラート」が四六時中鳴り、やがて誰も見なくなる。そのとき本物の `AccessDeniedException` が埋もれる。**アラート疲れは運用でいちばん多い失敗**。4xx はクライアントの問題であってサーバーの障害ではない。
+
+### Q. `slog.SetDefault` はどこに置くか
+
+**各 `cmd/lambda/*/main.go`。`apigw` パッケージの `init()` には置かない。**
+
+`init()` に置くと、`apigw` を import しただけでそのプロセスのログ形式が変わる。**import した側はコードからその副作用を読み取れない。** Go の慣習は「ライブラリはログを設定しない。設定するのは `main` だけ」。C# でクラスライブラリの静的コンストラクタがアプリの `ILoggerFactory` を上書きしたら事故なのと同じ。
+
+```go
+func main() {
+    slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
+    ...
+}
+```
+
+### Q. `return apigw.Error(500, ...), nil` の `nil` を `err` に変えるべきか
+
+**変えない。** Lambda の `Errors` メトリクスは立つが、代償が大きい。
+
+| | `..., nil`（採用） | `nil, err` |
+|---|---|---|
+| Lambda `Errors` | 0 | 1 |
+| クライアントのコード | **500**（自分で決めた値） | **502 Bad Gateway** |
+| クライアントのボディ | `{"error":"ticket lookup failed"}` | `{"message":"Internal server error"}` |
+
+**Lambda プロキシ統合は、関数エラーが返った時点でこちらのレスポンスを捨てる。** ステータスもボディも制御を失ううえ、502 は「ゲートウェイの先が不正」という**嘘**になる（壊れているのは DynamoDB の権限で、ゲートウェイは正常）。
+
+代わりに、アラートは**ログから作る**。① CloudWatch Logs のメトリクスフィルタ（`{ $.level = "ERROR" }`）か、② EMF（決められた形の JSON を出すと自動でメトリクス化される。フィルタ設定も `PutMetricData` も不要）。**どちらも JSON ログが前提**で、これが `slog` を選ぶ実務上の理由。Phase 6 で実装する。
+
+> なお API Gateway → Lambda は**同期**呼び出しなので、エラーを返してもリトライは起きない（非同期なら自動で 2 回リトライされる）。
+
+### Q. 修正は実際に効いたか（AWS dev での検証結果）
+
+IAM を再び壊して同じ経路を踏ませた。**前回は空だった場所に、原因が名指しで出た。**
+
+```json
+{"time":"2026-09-02T13:52:55.699699825Z","level":"ERROR","msg":"ticket lookup failed",
+ "status":500,"requestId":"8ee19780-36cf-4e82-849c-f480a969f8b3",
+ "err":"operation error DynamoDB: Query, ... AccessDeniedException: User: arn:aws:sts::<acct>:assumed-role/raidync-dev-matchmaking/raidync-dev-match_request is not authorized to perform: dynamodb:Query on resource: arn:aws:dynamodb:ap-northeast-1:<acct>:table/MatchmakingTickets/index/playerId-status-index because no identity-based policy allows the dynamodb:Query action"}
+```
+
+クライアントが受け取ったのは `{"error":"ticket lookup failed"}` のみで、アカウント ID もロール名も漏れていない。**詳細はログへ、クライアントへは曖昧に**が成立。
+
+CloudWatch Logs Insights でフィールドとして引けることも確認した。
+
+```
+fields @timestamp, msg, status, requestId, err | filter level = "ERROR" | sort @timestamp desc
+```
+
+4xx（`questId` 空 → 400）では ERROR 行が出ないことも確認済み。
+
+### Q. `-target` を付けた apply の後、何に注意すべきか
+
+**`-target` は「今は触らない」ではなく「後で必ず追いつかせる」という借金。**
+
+デプロイを `-target=module.lambda` に絞った結果、**`module.lambda_secondary`（us-east-1）に古いバイナリが残った**。`terraform plan`（`-target` なし）に `6 to change` として現れて発覚。
+
+マルチリージョン構成で片肺だけ古いコードが動く状態は、本番なら事故のもと。Terraform が毎回 `Resource targeting is in effect` と警告するのはこのため。**`-target` を使ったら、必ず素の `plan` で `No changes` まで戻す。**

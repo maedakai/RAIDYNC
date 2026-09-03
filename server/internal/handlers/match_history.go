@@ -28,14 +28,14 @@ func NewMatchHistory(client *db.Client) *MatchHistory {
 func (h *MatchHistory) Handle(ctx context.Context, req events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
 	playerID := req.PathParameters["playerId"]
 	if playerID == "" {
-		return apigw.Error(400, "playerId is required"), nil
+		return apigw.Error(ctx, 400, "playerId is required", nil), nil
 	}
 
 	entries, err := h.db.QueryByPlayer(ctx, playerID, historyLimit)
 	if err != nil {
-		return apigw.Error(500, "history lookup failed"), nil
+		return apigw.Error(ctx, 500, "history lookup failed", err), nil
 	}
-	return apigw.JSON(200, protocol.MatchHistoryOutput{
+	return apigw.JSON(ctx, 200, protocol.MatchHistoryOutput{
 		PlayerID: playerID,
 		Entries:  entries,
 	}), nil

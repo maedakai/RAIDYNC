@@ -118,11 +118,18 @@ type MatchRequestInput struct {
 }
 
 // MatchRequestOutput は POST /match/request のレスポンス。
+//
+// Endpoint / Region はマルチリージョン構成でのセッションアフィニティ用。
+// チケットは region-local なので、以降の match/status・match/cancel は
+// このチケットを作ったリージョンへ送らなければ 404 になる。クライアントは
+// Endpoint が返ってきたら、以降のポーリングをそちらへ向けること。
 type MatchRequestOutput struct {
 	TicketID  string       `json:"ticketId"`
 	Status    TicketStatus `json:"status"`
 	CreatedAt int64        `json:"createdAt"` // UnixTime ms
 	ExpiresAt int64        `json:"expiresAt"` // UnixTime ms
+	Endpoint  string       `json:"endpoint,omitempty"`
+	Region    string       `json:"region,omitempty"`
 }
 
 // MatchStatusOutput は GET /match/status/{ticketId} のレスポンス。

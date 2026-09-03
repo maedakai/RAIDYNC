@@ -28,17 +28,17 @@ func NewMatchStatus(matcher *matchmaking.Matcher) *MatchStatus {
 func (h *MatchStatus) Handle(ctx context.Context, req events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
 	ticketID := req.PathParameters["ticketId"]
 	if ticketID == "" {
-		return apigw.Error(400, "ticketId is required"), nil
+		return apigw.Error(ctx, 400, "ticketId is required", nil), nil
 	}
 
 	t, err := h.matcher.TryMatch(ctx, ticketID)
 	if err != nil {
 		if errors.Is(err, matchmaking.ErrTicketNotFound) {
-			return apigw.Error(404, "ticket not found"), nil
+			return apigw.Error(ctx, 404, "ticket not found", nil), nil
 		}
-		return apigw.Error(500, "match processing failed"), nil
+		return apigw.Error(ctx, 500, "match processing failed", err), nil
 	}
-	return apigw.JSON(200, statusOutput(t, time.Now().UnixMilli())), nil
+	return apigw.JSON(ctx, 200, statusOutput(t, time.Now().UnixMilli())), nil
 }
 
 // statusOutput は状態に応じて有効なフィールドだけを埋めた応答を作る。
