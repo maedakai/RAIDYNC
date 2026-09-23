@@ -33,31 +33,7 @@ func JSON(ctx context.Context, status int, body any) events.APIGatewayProxyRespo
 func Error(ctx context.Context, status int, message string, err error) events.APIGatewayProxyResponse {
 	b, _ := json.Marshal(map[string]string{"error": message})
 	if err != nil && status >= 500 {
-		reqID := ""
-		if lc, ok := lambdacontext.FromContext(ctx); ok {
-			reqID = lc.AwsRequestID
-		}
-
-		// FunctionName を取得する。Lambda ランタイムが自動設定するため AWS 上では必ず値が入る。
-		// 空になるのは cmd/localapi から呼ばれたときだけなので、そのバイナリ名を既定値にする。
-		functionName := getenv("AWS_LAMBDA_FUNCTION_NAME", "localapi")
-
-		// message をディメンション値に正規化する
-		errorKind := errorKindOf(message, "unknown")
-
-		metrics := []emfMetric{{Name: "HandlerError", Unit: "Count"}}
-		dimensions := [][]string{{"FunctionName"}, {"FunctionName", "ErrorKind"}}
-		directives := []emfDirective{{Namespace: "RAIDYNC/Handlers", Dimensions: dimensions, Metrics: metrics}}
-		metadata := emfMetadata{Timestamp: time.Now().UnixMilli(), CloudWatchMetrics: directives}
-
-		slog.ErrorContext(ctx, message,
-			"status", status,
-			"requestId", reqID,
-			"err", err,
-			"_aws", metadata,
-			"FunctionName", functionName,
-			"ErrorKind", errorKind,
-			"HandlerError", 1)
+		emitError(ctx, status, message, err)
 	}
 
 	return events.APIGatewayProxyResponse{
@@ -65,6 +41,35 @@ func Error(ctx context.Context, status int, message string, err error) events.AP
 		Headers:    jsonHeaders,
 		Body:       string(b),
 	}
+}
+
+func JWTError(ctx context.Context, message string, err error) {
+	emitError(ctx, 500, message, err)
+}
+
+func emitError(ctx context.Context, status int, message string, err error) {
+	reqID := ""
+	if lc, ok := lambdacontext.FromContext(ctx); ok {
+		reqID = lc.AwsRequestID
+	}
+	functionName := getenv("AWS_LAMBDA_FUNCTION_NAME", "localapi")
+
+	// message をディメンション値に正規化する
+	errorKind := errorKindOf(message, "unknown")
+
+	metrics := []emfMetric{{Name: "HandlerError", Unit: "Count"}}
+	dimensions := [][]string{{"FunctionName"}, {"FunctionName", "ErrorKind"}}
+	directives := []emfDirective{{Namespace: "RAIDYNC/Handlers", Dimensions: dimensions, Metrics: metrics}}
+	metadata := emfMetadata{Timestamp: time.Now().UnixMilli(), CloudWatchMetrics: directives}
+
+	slog.ErrorContext(ctx, message,
+		"status", status,
+		"requestId", reqID,
+		"err", err,
+		"_aws", metadata,
+		"FunctionName", functionName,
+		"ErrorKind", errorKind,
+		"HandlerError", 1)
 }
 
 func getenv(key, fallback string) string {

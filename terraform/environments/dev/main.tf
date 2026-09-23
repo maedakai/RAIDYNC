@@ -206,3 +206,22 @@ module "api_gateway_secondary" {
 
   tags = var.tags
 }
+
+
+# monitoring
+module "monitoring" {
+  source               = "../../modules/monitoring"
+  alarm_function_names = module.lambda.function_names
+  notification_email   = var.notification_email
+  tags                 = var.tags
+}
+
+module "monitoring_secondary" {
+  source = "../../modules/monitoring"
+  providers = {
+    aws = aws.secondary
+  }
+  alarm_function_names = module.lambda_secondary.function_names
+  notification_email   = var.notification_email
+  tags                 = var.tags
+}

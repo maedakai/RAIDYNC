@@ -1103,7 +1103,7 @@ dev/検証フェーズはそれでよい（`source_code_hash` があるので ap
 
 ### Q. 初回 apply が全リソース `AccessDenied`。どう対処した?（デプロイ用 IAM 権限）
 
-`raidync-cli` は Anywhere 検証・読み取り中心で先行作成したユーザーで、フル構成をプロビジョニングする権限が無かった。`AdministratorAccess` は使わず、**使う 8 サービスに絞った最小権限ポリシー**（`terraform/bootstrap/raidync-cli-deploy-policy.json`）を作成してアタッチした。
+`raidync-cli` は Anywhere 検証・読み取り中心で先行作成したユーザーで、フル構成をプロビジョニングする権限が無かった。`AdministratorAccess` は使わず、**使うサービスに絞った最小権限ポリシー**（`terraform/bootstrap/raidync-cli-deploy-policy.json`）を作成してアタッチした。
 - 許可: `dynamodb/cognito-idp/apigateway/lambda/gamelift/logs`（フルアクション・Resource `*`）、`s3`（Build バケット限定）、`iam`（`raidync-dev-*` ロール限定＋`PassRole`）、`sts:GetCallerIdentity`。
 - **CREATE 権限は plan では検証できない**（plan は作成 API を呼ばない）。事前検証は **IAM Policy Simulator**（`simulate-principal-policy`。副作用なし）を使う。
 - Administrator より大幅に狭く「EC2/RDS/課金/他ユーザーに触れない」ことを担保。ポートフォリオ上「デプロイ identity を最小権限設計した」証跡になる。
@@ -1996,4 +1996,80 @@ fields @timestamp, msg, status, requestId, err | filter level = "ERROR" | sort @
 **`FunctionName` を RequestId から取ろうとしてはいけない**: `lambdacontext` の `AwsRequestID` は呼び出しごとのランダム UUID で、関数名の情報を含まない。ディメンションにすれば呼び出しのたびに新しいメトリクスが生成され、コストが青天井になる。
 
 **唯一の落とし穴**: `_aws.Timestamp` は**エポックミリ秒の数値**（`time.Now().UnixMilli()`）。slog が出す `time` は RFC3339 文字列で別物。**忘れてもログは正常に出力され、メトリクスだけが静かに作られない。**
+
+### Q. EMF の実装は実際にメトリクスになった? 何を確認したか
+
+**なった（2026-09-20、AWS dev で実測）。** `aws cloudwatch list-metrics --namespace "RAIDYNC/Handlers"` の結果:
+
+```
+HandlerError { FunctionName: raidync-dev-match_request }
+HandlerError { FunctionName: raidync-dev-match_request, ErrorKind: ticket_lookup_failed }
+```
+
+**1 回のエラーで 2 メトリクスが同時に生成された**ことが、ディメンションセットを 2 段階で宣言した設計（粗い方＝アラーム用／細かい方＝切り分け用）の実証になった。エラーは IAM 破壊演習と同じ手（`modules/iam` から `/index/*` を外す）で起こした。
+
+**「CloudWatch を先に作る」作業は存在しない。** ロググループは `modules/lambda` で作成済み、メトリクスは Terraform のリソースではなく **CloudWatch Logs が EMF を取り込んだ瞬間に生成される**。そのため `cloudwatch:PutMetricData` 権限も不要（変換はサービス側の仕事）。実際 IAM を一切変更せずにメトリクスが出た。
+
+**ただし CLI から読むには `cloudwatch:*` が必要だった。** `raidync-cli-deploy` ポリシーは `logs:*` を持っていたが `cloudwatch:*` が無く、`list-metrics` が AccessDenied。**CloudWatch Logs（`logs:`）と CloudWatch Metrics/Alarms（`cloudwatch:`）は IAM 上は別サービス**である点に注意。Phase 6 でアラーム・ダッシュボード・SNS を作るため、`cloudwatch:*` と `sns:*` をまとめて追加した。
+
+### Q. authorizer を EMF 対応させるとき、何が論点になったか
+
+**「JWT の検証失敗」の大半は異常ではない**ことが論点。期限切れ・署名不正・形式不正はクライアント起因で、サーバーは正しく拒否している＝正常動作。これを `HandlerError` に計上すると**期限切れトークンが届くたびにアラームが鳴る**。
+
+一方、**JWKS の取得失敗や設定ミス**（issuer / client_id 不一致で全リクエストが拒否される）は重大障害。しかし `jwt.Parse` は両者を**同じ `error` にまとめて返す**。
+
+**採用した分類**: `golang-jwt/jwt/v5` のセンチネル（`ErrTokenExpired` / `ErrTokenMalformed` / `ErrTokenSignatureInvalid` / `ErrTokenInvalidIssuer`）に `errors.Is` で一致すればクライアント起因。**一致しない未知のエラーはサーバー起因に倒す**（見逃さない方を優先）。
+
+**責務の分担**:
+
+| パッケージ | 責務 |
+|---|---|
+| `internal/auth` | **分類**。クライアント起因なら `ErrInvalidToken` を `%w` で巻き込んで返す。サーバー起因は原因だけ包む |
+| `internal/apigw` | **出力**。`emitError` が EMF を組み立てる。`Error`（5xx 判定あり）と `JWTError`（authorizer 用）が共有 |
+| `cmd/lambda/authorizer` | **判断**。`errors.Is(err, auth.ErrInvalidToken)` が偽のときだけ `apigw.JWTError` を呼ぶ |
+
+**`auth` に監視を持ち込まない理由**: `auth` から `apigw` を import すると依存が逆向きになり、`Verify` が `ctx` を持たないため `slog.ErrorContext(nil, ...)` になる。分岐を authorizer（`ctx` を持つ）に置けば自然に解決する。
+
+**`authorizer` には `slog.SetDefault` も必要**だった（他 5 関数は Phase 5 で移行済み、ここだけ `log.Printf` のまま＝Phase 6 backlog 3）。JSON でなければ EMF は解釈されない。
+
+### Q. 実装中に何が壊れ、何が検知したか
+
+**すべてテストか `go vet` が捕まえた。** EMF は壊れても Terraform の plan に出ないという弱点があるため、この事実自体が「テストを先に書いた」判断の裏付けになる。
+
+| 壊れたもの | 検知したもの |
+|---|---|
+| `emitError` 切り出し時に発火条件（`err != nil && status >= 500`）が消え、**400 でも EMF が出る**状態になった | `TestErrorEMF`（400 / err==nil のケース） |
+| `fmt.Errorf` の戻り値を捨てていた（4 箇所） | `go vet`（result of fmt.Errorf call not used） |
+| センチネル導入時にエラーの原因文字列が消えた | 既存の `verifier_test.go` 4 件 |
+| ディメンション値に `each.key`（短縮名）を使った | — **レビューでのみ発見**。動くが存在しないメトリクスを監視し、永久に `INSUFFICIENT_DATA` になる |
+
+400 で EMF が出る状態は、**気づかずに本番へ上がればクライアントの不正リクエストでアラームが鳴り続けていた**。
+
+### Q. アラームと SNS はどう構成した? 通知の確認で何が要るか
+
+**`modules/monitoring` を新設し、両リージョンで 2 回インスタンス化**（`providers = { aws = aws.secondary }`）。
+
+| 設定 | 値 | 理由 |
+|---|---|---|
+| 対象メトリクス | 粗い方（`FunctionName` のみ） | 新しい `ErrorKind` が増えてもアラームを足す必要がない。細かい方に張ると「足し忘れた種別は無検知」になり、EMF を選んだ動機と矛盾する |
+| 統計 / 期間 / しきい値 | `Sum` / 300 秒 / 1 件以上 | 正常時の `HandlerError` は 0 件なので 1 件で十分異常。期間を 1 時間にすると**検知が最大 1 時間遅れる**（セッション 20 分 × 3 回分） |
+| `treat_missing_data` | `notBreaching` | EMF はエラー時しかデータを出さないため、既定の `missing` だと**一度鳴ると OK に戻らない**。`breaching` なら常時 ALARM |
+| アラームの生成 | `for_each = module.lambda.function_names` | 関数を追加したらアラームも自動で増える。真実の情報源を lambda モジュールの output 1 つに寄せる |
+
+**名前の分離は不要だった**。GameLift モジュールを 2 回インスタンス化したときは S3 バケット名・IAM ロール名が**グローバル一意**で分離が必要だったが、`aws_sns_topic` / `aws_cloudwatch_metric_alarm` は**アカウント × リージョン**で一意なので、両リージョンに同名で作れる。
+
+**通知先のメールは tfvars に書かない**。`dev.tfvars` は Git 管理下で Phase 7 に公開するため、環境変数 `TF_VAR_notification_email` で渡す。`default = ""` + `count` で「空なら購読を作らない」ようにし、監視と無関係な apply が止まらないようにした。`sensitive = true` は plan 出力を伏せるだけで、**state には平文で入る**（state は `.gitignore` 済み）。
+
+**購読は人間の確認が要る（二重オプトイン）**。他人のアドレスを勝手に登録できてしまうのを防ぐ仕組み。確認するまで `SubscriptionArn` は文字列 `"PendingConfirmation"` のままで、**アラームが鳴ってもメールは届かず、未達分は保存されないので後から遡っても届かない**。`terraform apply` の成功は通知到達を何も保証しない。
+
+**実際に Gmail の迷惑メールに入っていた**（2026-09-23）。確認リンクを踏んだ後、`SubscriptionArn` が UUID 付きの ARN に変われば有効。**迷惑メール判定は解除しておくこと**——しないと以後のアラートも同じ扱いになり、監視が「届いているのに気づかない」状態になる。
+
+**通知経路の検証は `set-alarm-state` で行う**（エラーを起こす必要がない）:
+
+```bash
+aws cloudwatch set-alarm-state --alarm-name "raidync-dev-match_request-errors" \
+  --state-value ALARM --state-reason "notification path test" --region ap-northeast-1
+```
+
+2026-09-23 に実施し、`alarm_description` が本文に載った状態でメール到達を確認。**6-2 の完了基準（テストアラートの通知確認）を満たした。** `notBreaching` により、次の評価タイミングで自動的に OK へ戻る。
 

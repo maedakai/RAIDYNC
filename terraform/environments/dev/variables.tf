@@ -77,3 +77,19 @@ variable "tags" {
     Phase   = "4"
   }
 }
+
+variable "notification_email" {
+  description = <<-EOT
+    CloudWatch アラームの通知先メールアドレス。monitoring モジュールへ渡す。
+
+    渡し方（tfvars には書かない。dev.tfvars は Git 管理下のため）:
+      PowerShell> $env:TF_VAR_notification_email = "you@example.com"
+      bash$       export TF_VAR_notification_email="you@example.com"
+
+    空（既定）なら SNS の購読を作らない。監視と無関係な apply のたびに
+    値を要求されないよう、あえて必須変数にしていない。
+  EOT
+  type        = string
+  default     = ""
+  sensitive   = true
+}

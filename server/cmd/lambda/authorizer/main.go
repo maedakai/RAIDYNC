@@ -8,12 +8,14 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"log/slog"
 	"os"
 	"strings"
 
 	"github.com/aws/aws-lambda-go/events"
 	"github.com/aws/aws-lambda-go/lambda"
 
+	"github.com/raidync/server/internal/apigw"
 	"github.com/raidync/server/internal/auth"
 )
 
@@ -21,7 +23,7 @@ type handler struct {
 	verifier *auth.Verifier
 }
 
-func (h *handler) handle(_ context.Context, event events.APIGatewayCustomAuthorizerRequest) (events.APIGatewayCustomAuthorizerResponse, error) {
+func (h *handler) handle(ctx context.Context, event events.APIGatewayCustomAuthorizerRequest) (events.APIGatewayCustomAuthorizerResponse, error) {
 	token, err := extractBearer(event.AuthorizationToken)
 	if err != nil {
 		return deny(""), nil
@@ -29,7 +31,9 @@ func (h *handler) handle(_ context.Context, event events.APIGatewayCustomAuthori
 
 	claims, err := h.verifier.Verify(token)
 	if err != nil {
-		log.Printf("authorizer: verify failed: %v", err)
+		if !errors.Is(err, auth.ErrInvalidToken) {
+			apigw.JWTError(ctx, "token verification unavailable", err)
+		}
 		return deny(""), nil
 	}
 
@@ -83,6 +87,8 @@ func mustEnv(key string) string {
 }
 
 func main() {
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
+
 	ctx := context.Background()
 	cfg := auth.Config{
 		JWKSURL:  mustEnv("AUTH_JWKS_URL"),

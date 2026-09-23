@@ -10,7 +10,9 @@
         "apigateway:*",
         "lambda:*",
         "gamelift:*",
-        "logs:*"
+        "logs:*",
+        "cloudwatch:*",
+        "sns:*"
       ],
       "Resource": "*"
     },
