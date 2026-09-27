@@ -114,3 +114,116 @@ func TestEmitError(t *testing.T) {
 		}
 	})
 }
+
+func TestMatchFormed(t *testing.T) {
+	capture := func(t *testing.T, fn func()) string {
+		t.Helper()
+		var buf bytes.Buffer
+		old := slog.Default()
+		slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, nil)))
+		defer slog.SetDefault(old)
+		fn()
+		return buf.String()
+	}
+	t.Run("PartySizeが文字列", func(t *testing.T) {
+		out := capture(t, func() {
+			MatchFormed(context.Background(), "test-quest", 4, 1000)
+		})
+
+		var got map[string]any
+		if err := json.Unmarshal([]byte(out), &got); err != nil {
+			t.Fatalf("出力が JSON として不正: %v (out=%q)", err, out)
+		}
+
+		// partySize は文字列として出力されることを確認する。
+		if got["PartySize"] != "4" {
+			t.Errorf("PartySize = %v", got["PartySize"])
+		}
+		// MatichWaitTime は数値として出力されることを確認する。
+		if got["MatchWaitTime"] != float64(1000) {
+			t.Errorf("MatchWaitTime = %v", got["MatchWaitTime"])
+		}
+		aws, ok := got["_aws"].(map[string]any)
+		if !ok {
+			t.Fatalf("_aws が オブジェクトでない: %v", got["_aws"])
+		}
+		if _, ok := aws["Timestamp"].(float64); !ok {
+			t.Errorf("Timestamp が数値でない: %v", aws["Timestamp"])
+		}
+		b, err := json.Marshal(aws["CloudWatchMetrics"])
+		if err != nil {
+			t.Fatalf("再シリアライズ失敗: %v", err)
+		}
+		want := `[{"Dimensions":[["PartySize"],["QuestID","PartySize"]],"Metrics":[{"Name":"MatchFormed","Unit":"Count"},{"Name":"MatchWaitTime","Unit":"Milliseconds"}],"Namespace":"RAIDYNC/Matchmaking"}]`
+		if string(b) != want {
+			t.Errorf("CloudWatchMetrics =\n %s\nwant\n %s", b, want)
+		}
+	})
+}
+
+func TestMatchTimeout(t *testing.T) {
+	capture := func(t *testing.T, fn func()) string {
+		t.Helper()
+		var buf bytes.Buffer
+		old := slog.Default()
+		slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, nil)))
+		defer slog.SetDefault(old)
+		fn()
+		return buf.String()
+	}
+
+	t.Run("EMF スキーマが仕様どおり", func(t *testing.T) {
+		out := capture(t, func() {
+			MatchTimeout(context.Background(), "test-quest")
+		})
+
+		var got map[string]any
+		if err := json.Unmarshal([]byte(out), &got); err != nil {
+			t.Fatalf("出力が JSON として不正: %v (out=%q)", err, out)
+		}
+
+		// ディメンション値は文字列、メトリクス値は数値で出ること。
+		if got["QuestID"] != "test-quest" {
+			t.Errorf("QuestID = %v (%T)", got["QuestID"], got["QuestID"])
+		}
+		if got["MatchTimeout"] != float64(1) {
+			t.Errorf("MatchTimeout = %v (%T), want 1 (float64)", got["MatchTimeout"], got["MatchTimeout"])
+		}
+
+		aws, ok := got["_aws"].(map[string]any)
+		if !ok {
+			t.Fatalf("_aws がオブジェクトでない: %v", got["_aws"])
+		}
+		if _, ok := aws["Timestamp"].(float64); !ok {
+			t.Errorf("Timestamp が数値でない: %v", aws["Timestamp"])
+		}
+
+		// MatchFormed と違いディメンションセットは 1 つだけ。ここが崩れると
+		// QuestID 別の集計ができなくなるため、丸ごと文字列で固定する。
+		b, err := json.Marshal(aws["CloudWatchMetrics"])
+		if err != nil {
+			t.Fatalf("再シリアライズ失敗: %v", err)
+		}
+		want := `[{"Dimensions":[["QuestID"]],"Metrics":[{"Name":"MatchTimeout","Unit":"Count"}],"Namespace":"RAIDYNC/Matchmaking"}]`
+		if string(b) != want {
+			t.Errorf("CloudWatchMetrics = %s, want %s", b, want)
+		}
+	})
+
+	t.Run("エラーではないので ERROR で出さない", func(t *testing.T) {
+		out := capture(t, func() {
+			MatchTimeout(context.Background(), "test-quest")
+		})
+
+		var got map[string]any
+		if err := json.Unmarshal([]byte(out), &got); err != nil {
+			t.Fatalf("出力が JSON として不正: %v (out=%q)", err, out)
+		}
+
+		// level=ERROR は「サーバー側の異常」の印として使っている（qa-log §14）。
+		// マッチのタイムアウトを ERROR で出すと障害調査の邪魔になる。
+		if got["level"] != "INFO" {
+			t.Errorf("level = %v, want INFO", got["level"])
+		}
+	})
+}

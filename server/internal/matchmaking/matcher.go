@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/raidync/server/internal/db"
+	"github.com/raidync/server/internal/metrics"
 	"github.com/raidync/server/pkg/protocol"
 )
 
@@ -98,6 +99,7 @@ func (m *Matcher) handleExpired(ctx context.Context, t *protocol.Ticket) (*proto
 		return nil, err
 	}
 	t.Status = protocol.StatusTimeout
+	metrics.MatchTimeout(ctx, t.QuestID)
 	return t, nil
 }
 
@@ -172,6 +174,8 @@ func (m *Matcher) finalize(ctx context.Context, self *protocol.Ticket, group []p
 	self.Status = protocol.StatusMatched
 	self.SessionID = sessionID
 	self.ConnectionInfo = &selfConn
+
+	metrics.MatchFormed(ctx, self.QuestID, len(group), m.nowMs()-self.CreatedAt)
 	return self, nil
 }
 
