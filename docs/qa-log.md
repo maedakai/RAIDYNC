@@ -2073,3 +2073,155 @@ aws cloudwatch set-alarm-state --alarm-name "raidync-dev-match_request-errors" \
 
 2026-09-23 に実施し、`alarm_description` が本文に載った状態でメール到達を確認。**6-2 の完了基準（テストアラートの通知確認）を満たした。** `notBreaching` により、次の評価タイミングで自動的に OK へ戻る。
 
+### Q. 負荷テスト（6-6）の合格基準をどう決めたか
+
+**「毎回必ず不合格になる基準」は判定として機能しない**——これを軸に 5 項目を決めた（2026-09-27）。
+
+| 項目 | 基準 | 決めた理由 |
+|---|---|---|
+| API レイテンシ | API Gateway `Latency` の **p99 < 1,000ms** | 平常時の実測（東京 0.13 秒）の約 8 倍まで許容。**最大値を門にすると 1 件の外れ値で不合格**になるため p99。最初に挙げた 30,000ms は **API Gateway の統合タイムアウト上限 29 秒**により到達不能で、門として機能しなかった |
+| エラー率 | `HandlerError` **0 件**（出たら調査対象、テスト自体の不合格にはしない） | `HandlerError` はリトライ後も失敗した 5xx しか計上しないため、一時エラーは混ざらない。正常時 0 件なので 1 件で異常 |
+| 詰まり | Lambda `Throttles` / DynamoDB `ThrottledRequests` **0 件** | DynamoDB は `PAY_PER_REQUEST`（自動スケール）なので、出るならスケーリングが追いつかなかった証拠。Lambda は**アカウント同時実行クォータ既定 1,000** に当たる可能性が現実的 |
+| TIMEOUT | 投入人数から計算した**期待値ちょうど** | `MinMatchSize = 2` のため、余りが 2〜3 人なら見切り発車で成立し TIMEOUT にならない。**余りが 1 のときだけ 1 件**出る |
+| パーティ人数 | 成立セッションが**すべて 4 人** | ↓ |
+
+**CPU 使用率では測れない。** Lambda / API Gateway / DynamoDB はいずれも CPU メトリクスを公開せず、GameLift Managed EC2 のインスタンスは AWS 側アカウントで動くため `CPUUtilization` も見えない。サーバーレス構成では「サーバーの健康状態」ではなく**流量（Invocations / Count）と詰まり（Throttles）と処理時間（Duration / Latency）**で測る。
+
+**パーティ人数を基準に入れた理由（TIMEOUT 数だけでは見えない失敗モード）**: 負荷でマッチングが遅れても、60 秒時点で 2〜3 人集まれば**セッションは成立し TIMEOUT は 0 件**になる。つまり「1,000 セッションのほとんどが 2 人パーティで開始」でも TIMEOUT 基準では合格してしまう。4 人協力プレイのゲームとして明確な失敗なので、**プレイヤーが潤沢な負荷テストでは全セッションが 4 人であるべき**という二値の基準を足した。恣意的なしきい値が要らず、待ち時間の劣化を間接的に検出できる。
+
+**API Gateway の詳細メトリクス（メソッド別）は当面無効のまま**。有効にすると 6 エンドポイント × 5 メトリクス × 2 リージョン ≒ 月 $18。ステージ集計でも p99 の合否判定はでき、**どの関数が遅いかは Lambda `Duration`（関数ごと・無料）で分かる**ため。ただし**メトリクスは遡って生成されない**ので、「異常が出てから有効化」ではテストのやり直しが必要になる。**6-6 の直前に opt-in で有効化し、終了後に戻す**（カスタムメトリクスは時間按分課金なので数時間なら数セント）。GameLift と同じ opt-in パターン。
+
+### Q. EMF の出力を internal/metrics に切り出した理由
+
+**マッチング計装を足す段になって、`matchmaking → apigw` という依存が必要になったため**（2026-09-27）。これは authorizer で `auth → apigw` を却下したのと同じ構図で、`apigw` は「API Gateway プロキシ統合向けヘルパー」なので、その下の層が依存してはならない。
+
+```
+internal/metrics     ← 何にも依存しない最下層（EMF の組み立てと slog 出力だけ）
+   ↑         ↑
+apigw    matchmaking
+```
+
+**`slog.ErrorContext` → `slog.Log` に変えた**のは、レベルを引数で受け取る必要があったから。`ErrorContext` はレベル固定の糖衣で、`Log` が本体。エラー系は ERROR、マッチ成立は **INFO** で出す。**マッチ成立を ERROR で出すと、1,000 セッションの負荷テストで ERROR が数千行出て本物の障害が埋もれる**（`level=ERROR` をサーバー異常の印として使う運用が崩れる）。
+
+**共通関数 `emit` の責務**: `Timestamp` の生成・`_aws` 属性の付与・指定レベルでの出力。可変長引数 `attrs ...any` は**キーと値が交互に並んだリスト**なので、添字で取り出さず `append([]any{"_aws", metadata}, attrs...)` でそのまま流す（キー名を `emit` が知っていると汎用にならない）。
+
+**確定した計装**（namespace は `RAIDYNC/Handlers` と分離）:
+
+| メトリクス | 単位 | ディメンション | 出力箇所 |
+|---|---|---|---|
+| `MatchFormed` + `MatchWaitTime` | Count / Milliseconds | `[["PartySize"], ["QuestID","PartySize"]]` | `matcher.go` の `finalize`（全成立経路の合流点） |
+| `MatchTimeout` | Count | `[["QuestID"]]` | `handleExpired` の `TimeoutTicket` **成功後** |
+
+`PartySize = 1`（ソロ）も普通に出す。負荷テストは `soloAllowed=false` で回すので集計を汚さず、逆にローカルで計装の動作確認ができる。待ち時間は `m.nowMs() - self.CreatedAt` で「**最後に到着した本人**の待ち時間」に近い値（他メンバーはより長く待っている）。
+
+### Q. EMF で追加のメトリクスを足すときに踏む落とし穴
+
+**① ディメンション値は文字列でなければならない。** `"PartySize": 4` と数値で出すと CloudWatch はメトリクス候補と解釈し、ディメンションとして機能しない。`strconv.Itoa` で `"4"` にする。`HandlerError` のディメンション（`FunctionName` / `ErrorKind`）は元々文字列だったので、この問題に当たっていなかった。
+
+**② `Dimensions` はディレクティブ単位の設定。** 同じディレクティブに入れたメトリクスは全て同じディメンションセットを共有する。異なるセットを持たせたいなら `CloudWatchMetrics` 配列に複数のディレクティブを入れる（配列である理由がこれ）。RAIDYNC では `MatchFormed` と `MatchWaitTime` を 1 ディレクティブに統一した（「2 人で始まったセッションは待ち時間も長かった」という相関を同じディメンションで見られる）。
+
+**③ ログレベルのフィルタがメトリクスの存在に直結する。** EMF はログに乗って運ばれるため、`slog.SetDefault` に `&slog.HandlerOptions{Level: slog.LevelWarn}` を入れると **INFO の行自体が出力されず、マッチング系メトリクスが静かに消える**（エラー系だけ残る）。ログ量を絞るならレベルではなく出力箇所を減らす。この注意は `internal/metrics` のパッケージコメントに具体的なコード付きで残した。
+
+**実装中に壊れたもの（すべてテストか目視が検知）**:
+
+| 壊れたもの | 症状 | 検知 |
+|---|---|---|
+| `MatchTimeout` を `TimeoutTicket` の **err != nil ブロック内**に置いた | タイムアウト成功時に出ず、書き込み失敗時に出る（期待値と一致しなくなる） | レビュー |
+| `emit` が `attrs` を**添字で値として**取り出した | `"ErrorKind":"err"` のようにキー文字列が値の位置に入る | `TestEmitError` |
+| `emit` が `level` 引数を無視し `ErrorContext` 固定 | INFO で出せない | レビュー |
+| `msg` にクエスト ID を渡した | `msg` が可変値になり Logs Insights で絞れない | レビュー |
+
+**ローカル E2E での実測（2026-09-27）**: `localapi` + `cmd/client` で `MatchFormed`（`PartySize:"1"`、`MatchWaitTime:269`）と、`-solo=false` で 60 秒待って `MatchTimeout`（**1 件のみ**＝二重カウントなし）を確認。テストは固定値を渡すため、**待ち時間の計算式が機能することはここで初めて確認できた**。
+
+### Q. ダッシュボードに映った「外部からの探索アクセス」とは何か
+
+**人ではなく自動化されたプログラムが、公開エンドポイントを片端から叩いて回る背景ノイズ**（偵察 / スキャン）。2026-09-28、6-1 のダッシュボードを apply した直後に us-east-1 側だけトラフィックが映り、心当たりが無かったため調査した。
+
+**実測（us-east-1、直近 6 時間）**:
+
+| 指標 | 値 |
+|---|---|
+| `Count` | 1 / 15 / 1（計 17 件） |
+| `4XXError` | 1 / 15 / 1 ← **`Count` と完全一致** |
+| `5XXError` | 0 |
+| `raidync-dev-authorizer` の `Invocations`（24h） | **データなし＝1 度も起動していない** |
+
+**全件 4xx かつ Lambda 未到達**。`/health` は MOCK 統合で 200 を返すので正規の疎通ではなく、`enable_health_checks` も既定の `false` なので Route 53 ヘルスチェッカーでもない。定義の無いパスを叩かれ、**API Gateway がルーティング段階で弾いている**状態で、コードは 1 行も動いていない。
+
+**なぜ us-east-1 に偏るか**: `api.raidync.com` はレイテンシールーティングで両リージョンに振られており、探索元は北米に多いため DNS が us-east-1 を返す。東京も 0 ではなく、24 時間で見ると 2 件あった（ダッシュボードの表示範囲が 3 時間だったので画面から外れていただけ）。
+
+**発見経路として最も可能性が高いのは Certificate Transparency ログ**（確認ではなく推定。断定にはアクセスログが要る）。HTTPS 証明書は公開ログへの記録が必須で、ACM 証明書を発行した時点で `api.raidync.com` / `apne1.*` / `use1.*` が世界中から検索可能になる。CT ログを監視して新規ホスト名を即座に叩くスキャナは多数あり、発行から数分〜数時間で最初のアクセスが来る。ほかに IPv4 全域の総当たり（約 43 億個＝数時間〜数日で舐められる。AWS は `ip-ranges.json` で自社レンジを公開しているのでリージョン単位の狙い撃ちも可能）がある。**「まだ誰にも URL を教えていない」は防御にならない。**
+
+**監視設計への帰結**:
+
+- **`4XXError` にアラームを張ってはいけない**ことが実データで裏付けられた。探索は常時来るので毎日誤報になる。6-2 で `HandlerError`（自前計装・5xx 起因のみ）をアラーム対象に選んだのは結果的に正しかった
+- 負荷テストの `Count` / `Latency` の分母にノイズが乗るが、17 件/3 時間は 1,000 VU に対して誤差。`HandlerError` は 5xx 起因なので 4xx は混ざらず、6-6 の合否には影響しない
+- **観測の穴**: `modules/api_gateway` に `access_log_settings` が無く、送信元 IP・パス・User-Agent が一切分からない。「4xx だった」以上のことが言えないため、**6-4 の WAF ルールを設計する前にアクセスログを出す**必要がある
+- **6-4 の位置づけ**: 実害は現状ゼロ（Lambda 未起動・5xx ゼロ・課金は API Gateway のリクエスト料金 $3.50/100 万件のみ）。一方 WAF は月 $5〜（Web ACL $5 + ルール $1 + リクエスト $0.60/100 万）かかる。**守るためというより Phase 6 の学習項目**であり、ポートフォリオでもそう書く
+
+### Q. ダッシュボード（6-1）はどう設計した?
+
+**負荷テスト（6-6）の合否を 1 画面で判定するためのもの**として作った（2026-10-04、`modules/monitoring_dashboard`）。y=0 の行が**合否そのもの**（「負荷テストの合格基準」の 5 項目に対応）、y=4 以降が**基準を割ったときの原因切り分け**。
+
+| 段 | ウィジェット | 対応する基準 / 役割 |
+|---|---|---|
+| y=0 | Handler Errors / Lambda Throttles / DynamoDB Throttles（singleValue） | 基準①③。全関数・全テーブル × 両リージョンを `SUM(METRICS())` で 1 つの数字に畳む |
+| y=0 | MatchTimeout（singleValue、リージョン別 2 値） | 基準④。SEARCH はリージョンをまたげないので式をリージョンごとに分けた |
+| y=4 | MatchFormed（東京 / us-east-1） | 基準⑤。PartySize ごとに線が立つ |
+| y=8 | MatchWaitTime（東京 / us-east-1） | ⑤が崩れたときの原因側。p95 と Maximum |
+| y=12 | API Latency / Count（東京 / us-east-1） | 基準②。p99 目標 1,000ms を水平線で引く。Count は負荷が掛かっていた時間帯の確認用 |
+| y=16 | Lambda Duration p99 / Invocations（全関数、両リージョン 2 本ずつ） | 「Lambda 側が遅いのか」の切り分けと、`--` を 0 件と読む根拠 |
+
+**ダッシュボードは 1 つで両リージョンを並べた。** アラームはリージョンをまたげないので `modules/monitoring` は 2 セット作ったが、ダッシュボードのウィジェットはメトリクスごとに `region` を指定できる。
+
+**設計中に避けた誤り**:
+
+- **パーセンタイルは合算できない。** 関数ごとの `Duration` p99 を `SUM(METRICS())` で畳むと「6 関数の p99 の足し算」という無意味な値になる（`Invocations` の合計は正しいので、同じやり方が使えると思いやすい）。全関数の真の p99 は、**ディメンションを一切指定しない `AWS/Lambda` の集計メトリクス**（コンソールの "Across All Functions"）で取る。母集団は「このアカウント・このリージョンの全 Lambda」なので、**RAIDYNC 以外の関数が増えると意味が静かに変わる**（コメントで明記）。両リージョンとも RAIDYNC の 6 関数しか無いことは `aws lambda list-functions` で確認済み
+- **関数別に並べなかった。** 6 関数 × 2 リージョン = 12 本ではダッシュボードで合否が読めない。**ダッシュボードは合否判定用の合計、原因の切り分けはメトリクスコンソールで関数別 `Duration`** という役割分担にした（関数別メトリクスは常に存在する）。「API Gateway の詳細メトリクスを有効にしない代わりに Lambda `Duration` で分かる」という前の判断とはこれで整合する
+- **`MAX(SEARCH(..., 'p95'))` は全体の p95 ではない**（PartySize ごとの p95 の最大値）。EMF が PartySize を含まない集計セットを持たないため、これが唯一の手段。負荷テストは `soloAllowed=false` なので PartySize=4 だけになり、実質一致する
+- **HCL のコメントは `dashboard_body` の差分にならない。** `jsonencode` の外にあるため、コメントを大量に足しても plan には出ない
+
+### Q. ダッシュボードが正しく機能するかをどう確かめたか
+
+**AWS dev に実データを流し、12 枚すべての描画を確認した**（2026-10-04）。apply 直後は画面がほぼ空で、「空なのか壊れているのか」が区別できなかった。6-1 の完了基準は「主要メトリクスが 1 画面で**確認できる**」なので、空のまま締めると基準を満たさないうえ、6-6 本番で計器の故障に気づく羽目になる。
+
+**手順**（`scripts/call-api.sh`、GameLift フリートは起動せず `GameLiftStub` にフォールバック＝時間課金なし）:
+
+1. player1〜4 が同じクエストに `match/request` → player1 で `match/status` をポーリング → `MATCHED`（PartySize=4）
+2. 別クエスト `quest-timeout` に 1 人だけ `match/request` → 60 秒後に `match/status` → `TIMEOUT`
+3. 1・2 を `TARGET=secondary`（us-east-1）でも実行
+
+**結果**:
+
+| 確認対象 | 結果 |
+|---|---|
+| ①②③ のクロスリージョン `SUM(METRICS())` | ✅ 合算される。プローブ（`AWS/ApiGateway Count` を両リージョン分 SUM）が 33 を表示し、CLI で取った**東京 14 + us-east-1 19** と一致 |
+| Lambda Duration p99（ディメンション無し） | ✅ 値が出る。パーセンタイルが取れる |
+| MatchFormed / MatchWaitTime / MatchTimeout | ✅ 5 枚とも値が出る。SEARCH 式の namespace・ディメンションセットが実データと一致 |
+| Handler Errors / DynamoDB Throttles | `--` のまま。**これが正常**（後述） |
+
+**クロスリージョン合算は当初「できない可能性が高い」と見ていたが、誤りだった。** `GetMetricData` API は `MetricDataQuery` に Region を持たないため、数式はリージョン単位でしか評価できないと推論したが、**コンソールのダッシュボードはリージョンをまたぐ数式も評価する**。推論ではなく実測で決着させた。判定には**両リージョンとも非ゼロ**のメトリクスが要る（Lambda Throttles は両方 0 なので、合算されていてもいなくても 0 になり判別できない）。
+
+**`--` の 2 枚が正常な理由**:
+
+- Handler Errors … 実走で 5xx が 1 件も出なかった。エラーが無ければデータポイント自体が生まれない
+- DynamoDB Throttles … DynamoDB はスロットル未発生時に **0 を publish しない**ので、平常時は原理的に `--` にしかならない
+
+CloudWatch のメトリクス数式には「系列が 1 本も無い状態から 0 の系列を作る」手段が無い（`FILL` は既存系列の欠損を埋めるもの）ので、`--` と `0` は画面上で区別できない。そこで **Invocations を同じ画面に置いた**。Invocations に値が出ていれば「テストは確かに流れた」と言えるので、`--` を 0 件と読める。出ていなければ判定不能。今回はこの読み分けが実際に機能した。
+
+### Q. 実走の途中で何に詰まったか
+
+**① `match/status` は `POST` ではなく `GET /match/status/{ticketId}` だった。** `call-api.sh` は `POST` 固定で、冒頭の使用例（`match/status '{"ticketId":"..."}'`）も**最初から誤っていた**。存在しないルートに `Authorization` ヘッダ付きで投げると、API Gateway は SigV4 として解釈しようとして `Invalid key=value pair (missing equal-sign) in Authorization header` の 403 を返す。オーソライザーには到達しない（探索アクセスの 4xx と同じ仕組み）。ルートの正は `modules/api_gateway` の `locals.endpoints`。
+
+**② マッチングの判定は `match/status` の中でしか動かない。** `matchmaking.Matcher` を使うのは `match_status` ハンドラだけで（`TryMatch` のコメントに「GET /match/status 契機で呼ばれ」とある）、定期実行のワーカーも DynamoDB Streams のコンシューマも無い。つまり `match/request` を投げただけでは成立も TIMEOUT も起こらず、チケットは TTL で静かに消える。`MatchFormed` / `MatchWaitTime` / `MatchTimeout` もポーリングしなければ永久に出ない。**6-5 / 6-6 の k6 シナリオも request → status のポーリングまで含める必要がある。**
+
+**③ `call-api.sh` に足した切り替え。**
+
+| 変数 | 値 | 設計上の注意 |
+|---|---|---|
+| `TARGET` | `primary` / `secondary` | **output 名を直接受け取らない。** 受け取ると任意の terraform output を URL 位置に流し込め、`cognito_test_user_password` を渡すと `echo` で画面に出てしまう。`case` で 2 択に絞る |
+| `METHOD` | `POST` / `GET` / `DELETE` | ボディは POST のときだけ付ける |
+| `AUTH_REGION` | 常に `ap-northeast-1` | 旧名 `REGION` は「API のリージョン」と誤読される。**Cognito は東京の 1 プールを両リージョンで共用**しているので、ここを us-east-1 にすると認証そのものが失敗する |
+
+不正値は**黙ってフォールバックさせずに `exit 1`** する。タイポで東京にフォールバックすると「us-east-1 を叩いたつもりで東京を叩く」事故になり、「us-east-1 のウィジェットが空だ」と悩むことになる。また `match/request` と `match/status` は**同じ `TARGET`** で投げる必要がある（MatchmakingTickets が region-local のため）。正しい接続先はレスポンスの `endpoint` に入っている。
+

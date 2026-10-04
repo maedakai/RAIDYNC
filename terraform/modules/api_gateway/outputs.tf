@@ -12,3 +12,8 @@ output "execution_arn" {
   description = "execute-api の実行 ARN（追加の権限付与が必要になった場合に使う）。"
   value       = aws_api_gateway_rest_api.this.execution_arn
 }
+
+output "rest_api_name" {
+  description = "REST API 名。CloudWatch の ApiName ディメンションに使う。"
+  value       = aws_api_gateway_rest_api.this.name
+}

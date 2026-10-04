@@ -225,3 +225,22 @@ module "monitoring_secondary" {
   notification_email   = var.notification_email
   tags                 = var.tags
 }
+
+# monitoring_dashboard
+module "monitoring_dashboard" {
+  source                   = "../../modules/monitoring_dashboard"
+  dashboard_name           = "raidync-dev-loadtest"
+  function_names_primary   = module.lambda.function_names
+  function_names_secondary = module.lambda_secondary.function_names
+  primary_region           = var.region
+  secondary_region         = var.secondary_region
+
+  table_names = concat(
+    values(module.dynamodb.table_names),
+    [module.dynamodb_tickets.table_name]
+  )
+
+  rest_api_name_primary   = module.api_gateway.rest_api_name
+  rest_api_name_secondary = module.api_gateway_secondary.rest_api_name
+  stage_name              = "dev"
+}
