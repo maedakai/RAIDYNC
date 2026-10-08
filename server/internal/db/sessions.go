@@ -64,3 +64,29 @@ func sessionKey(sessionID string) map[string]ddbtypes.AttributeValue {
 		"sessionId": &ddbtypes.AttributeValueMemberS{Value: sessionID},
 	}
 }
+
+// ScanByQuest は questId が一致するセッションを全件返す（ページングを辿る）。
+// Sessions に questId の索引は無く全件 Scan になるため、負荷テストの検証専用。本番経路では使わない。
+func (c *Client) ScanByQuest(ctx context.Context, questID string) ([]protocol.Session, error) {
+	p := dynamodb.NewScanPaginator(c.ddb, &dynamodb.ScanInput{
+		TableName:        aws.String(c.tables.Sessions),
+		FilterExpression: aws.String("questId = :q"),
+		ExpressionAttributeValues: map[string]ddbtypes.AttributeValue{
+			":q": &ddbtypes.AttributeValueMemberS{Value: questID},
+		},
+	})
+	var sessions []protocol.Session
+	for p.HasMorePages() {
+		var pageSessions []protocol.Session
+		page, err := p.NextPage(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("scan sessions: %w", err)
+		}
+		err = attributevalue.UnmarshalListOfMaps(page.Items, &pageSessions)
+		if err != nil {
+			return nil, fmt.Errorf("unmarshal sessions: %w", err)
+		}
+		sessions = append(sessions, pageSessions...)
+	}
+	return sessions, nil
+}
