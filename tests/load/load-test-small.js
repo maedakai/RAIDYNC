@@ -3,14 +3,14 @@ import {check, sleep } from 'k6';
 import exec from 'k6/execution';
 import{Rate} from 'k6/metrics';
 
-const VUS = 8;
+const VUS = 40;
 export const options = {
     scenarios: {
-        once: {
-            executor: 'per-vu-iterations',
+        loop: {
+            executor: 'constant-vus',
             vus: VUS,
-            iterations: 1,
-            maxDuration: '2m',
+            duration: '3m',
+            gracefulStop: '80s',
         }
     },
     thresholds: {
