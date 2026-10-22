@@ -8,6 +8,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/gamelift"
 	gltypes "github.com/aws/aws-sdk-go-v2/service/gamelift/types"
+	"go.opentelemetry.io/contrib/instrumentation/github.com/aws/aws-sdk-go-v2/otelaws"
 
 	"github.com/raidync/server/pkg/protocol"
 )
@@ -42,6 +43,7 @@ func NewGameLiftProvider(api gameLiftAPI, fleetID, location string) *GameLiftPro
 
 // NewGameLiftProviderFromConfig は aws.Config から実 SDK クライアントを組んで Provider を生成する。
 func NewGameLiftProviderFromConfig(cfg aws.Config, fleetID, location string) *GameLiftProvider {
+	otelaws.AppendMiddlewares(&cfg.APIOptions)
 	return NewGameLiftProvider(gamelift.NewFromConfig(cfg), fleetID, location)
 }
 

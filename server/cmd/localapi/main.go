@@ -28,6 +28,8 @@ import (
 	"github.com/raidync/server/internal/db"
 	"github.com/raidync/server/internal/handlers"
 	"github.com/raidync/server/internal/matchmaking"
+	"github.com/raidync/server/internal/telemetry"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
 
 type server struct {
@@ -37,6 +39,11 @@ type server struct {
 func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
 	ctx := context.Background()
+
+	shutdown, err := telemetry.Init(ctx, "localapi")
+	if err != nil {
+		log.Fatalf("localapi: init telemetry: %v", err)
+	}
 
 	client, err := db.NewClient(ctx)
 	if err != nil {
@@ -84,14 +91,14 @@ func main() {
 	})
 
 	// /match・/player 配下は本番の authorizer Lambda 相当（JWT 検証 → sub 注入）を前段に置く。
-	mux.Handle("POST /match/request", s.withAuth(adapt(matchRequest.Handle)))
-	mux.Handle("GET /match/status/{ticketId}", s.withAuth(adapt(matchStatus.Handle, "ticketId")))
-	mux.Handle("DELETE /match/cancel/{ticketId}", s.withAuth(adapt(matchCancel.Handle, "ticketId")))
-	mux.Handle("GET /player/{playerId}/history", s.withAuth(adapt(matchHistory.Handle, "playerId")))
+	handleTraced(mux, "POST /match/request", s.withAuth(adapt(matchRequest.Handle)))
+	handleTraced(mux, "GET /match/status/{ticketId}", s.withAuth(adapt(matchStatus.Handle, "ticketId")))
+	handleTraced(mux, "DELETE /match/cancel/{ticketId}", s.withAuth(adapt(matchCancel.Handle, "ticketId")))
+	handleTraced(mux, "GET /player/{playerId}/history", s.withAuth(adapt(matchHistory.Handle, "playerId")))
 
 	// /session/end は server-to-server 経路（ゲームサーバが呼ぶ）。本番ではフリートの
 	// IAM ロール／内部ネットワークで保護する前提のため、プレイヤー JWT は要求しない。
-	mux.Handle("POST /session/{sessionId}/end", adapt(sessionEnd.Handle, "sessionId"))
+	handleTraced(mux, "POST /session/{sessionId}/end", adapt(sessionEnd.Handle, "sessionId"))
 
 	addr := getenv("LOCALAPI_ADDR", ":8080")
 	srv := &http.Server{
@@ -113,6 +120,10 @@ func main() {
 	defer cancel()
 	if err := srv.Shutdown(timeout); err != nil {
 		log.Printf("localapi: shutdown: %v", err)
+	}
+	// HTTP を止めた後に、溜まった Span を送り切る（逆順だと HTTP 終了中の Span が欠ける）。
+	if err := shutdown(timeout); err != nil {
+		log.Printf("localapi: shutdown telemetry: %v", err)
 	}
 }
 
@@ -168,4 +179,10 @@ func getenv(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// handleTraced は mux.Handle と同じくルートを登録し、OTel の HTTP 計測で包む。
+// Span 名にはルートのパターンを使う（パスそのままだと ID ごとに名前が分かれてしまうため）。
+func handleTraced(mux *http.ServeMux, pattern string, handler http.Handler) {
+	mux.Handle(pattern, otelhttp.NewHandler(handler, pattern))
 }

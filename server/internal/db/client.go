@@ -11,6 +11,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
+	"go.opentelemetry.io/contrib/instrumentation/github.com/aws/aws-sdk-go-v2/otelaws"
 )
 
 // Tables は各論理テーブルの実名を保持する（環境別プレフィックス等に将来対応するため値で保持）。
@@ -59,6 +60,8 @@ func NewClient(ctx context.Context) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	otelaws.AppendMiddlewares(&cfg.APIOptions)
 
 	ddb := dynamodb.NewFromConfig(cfg, func(o *dynamodb.Options) {
 		if endpoint != "" {

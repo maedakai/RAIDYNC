@@ -70,6 +70,7 @@ $env:AWS_SECRET_ACCESS_KEY = "test"
 $env:AUTH_JWKS_URL         = "http://localhost:9229/.well-known/jwks.json"
 $env:AUTH_ISSUER           = "http://localhost:9229"
 $env:AUTH_CLIENT_ID        = "raidync-local-client"
+$env:OTEL_EXPORTER_OTLP_INSECURE = "true"   # ローカルの Jaeger は平文で待ち受ける（OTLP gRPC は既定で TLS）
 .\bin\localapi.exe
 ```
 

@@ -13,10 +13,10 @@ import (
 	"strings"
 
 	"github.com/aws/aws-lambda-go/events"
-	"github.com/aws/aws-lambda-go/lambda"
 
 	"github.com/raidync/server/internal/apigw"
 	"github.com/raidync/server/internal/auth"
+	"github.com/raidync/server/internal/telemetry"
 )
 
 type handler struct {
@@ -100,5 +100,5 @@ func main() {
 		log.Fatalf("authorizer: init verifier: %v", fmt.Errorf("%w", err))
 	}
 	h := &handler{verifier: v}
-	lambda.Start(h.handle)
+	telemetry.StartLambda("authorizer", h.handle)
 }

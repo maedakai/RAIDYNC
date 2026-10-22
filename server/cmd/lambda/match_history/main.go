@@ -1,5 +1,5 @@
 // match_history Lambda: GET /player/{playerId}/history
-// ハンドラ本体は internal/handlers にあり、本ファイルは lambda.Start への配線のみを担う。
+// ハンドラ本体は internal/handlers にあり、本ファイルは telemetry.StartLambda（OTel 計測付きの lambda.Start）への配線のみを担う。
 package main
 
 import (
@@ -8,10 +8,9 @@ import (
 	"log/slog"
 	"os"
 
-	"github.com/aws/aws-lambda-go/lambda"
-
 	"github.com/raidync/server/internal/db"
 	"github.com/raidync/server/internal/handlers"
+	"github.com/raidync/server/internal/telemetry"
 )
 
 func main() {
@@ -26,5 +25,5 @@ func main() {
 		log.Fatalf("init db client: %v", err)
 	}
 	h := handlers.NewMatchHistory(client)
-	lambda.Start(h.Handle)
+	telemetry.StartLambda("match_history", h.Handle)
 }

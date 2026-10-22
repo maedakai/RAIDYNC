@@ -2346,3 +2346,64 @@ k6 の `matched` 100% は「各 VU が MATCHED を受け取った」ことしか
 - `rate>0.99` のように緩めると、本当のバグで 1% 失敗しても見逃す
 - そこで厳しいまま残し、不合格になった回は TIMEOUT の数と時刻を見て「終わり際の余り（最大 1 人）か」を人が判断する
 - マッチングの全体の正しさは、k6 のしきい値ではなく検証スクリプト（`cmd/sessions`、枠の合計 = 成功回数）が保証する。TIMEOUT はセッションを作らないので、検証スクリプトの結果には影響しない
+
+### Q. X-Ray（6-3）は何をするもので、RAIDYNC に必要か
+
+**X-Ray は「1 リクエストが、どこで何ミリ秒使ったか」を時系列で見せる分散トレーシング。** メトリクス（全体の集計）やログ（各部品の自己申告）では見えない、**1 リクエストの内訳**が見える。RAIDYNC の 1 リクエストは API Gateway → authorizer → Lambda → DynamoDB（複数回）→ GameLift と多段なので、遅延やエラーの原因がどの段かを切り分けるのに効く。
+
+- **効く場面**: 6-6（1,000 人）で p95 が悪化したとき、コールドスタート・DynamoDB の競合・GameLift API のどれが原因か切り分けられる
+- **効かない場面**: 「40 人でマッチ成立までの時間が伸びた」はほぼ説明できない。その大半は 2 秒ごとのポーリングの何回目で 4 人揃うかという**呼び出しの間の待ち時間**で、X-Ray は 1 回の呼び出しの中身しか見ない
+- **費用**: 無料枠は月 10 万トレース。既定のサンプリング（毎秒 1 件 + 5%）なら、6-6 の約 500 req/s を 30 分回して約 5 万トレースで、無料枠に収まる見込み
+- **作業量**: API Gateway・Lambda のトレース有効化と IAM は Terraform だけで済む。DynamoDB の呼び出しを個別に見るには Go コードで SDK を計測する必要がある
+- **注意**: Go 用 X-Ray SDK は 2026-02-25 にメンテナンスモード入り、2027-02-25 にサポート終了。新規に入れるなら OpenTelemetry（ADOT）が推奨
+- **検証場所**: LocalStack 無料版は X-Ray 非対応なので AWS dev
+
+| 案 | やること | 見えるもの |
+|---|---|---|
+| A. フル実装 | Terraform + OpenTelemetry | API GW → Lambda → DynamoDB の各呼び出し |
+| B. Terraform だけ | API GW・Lambda のトレース有効化 | 各段の時間とコールドスタート。DynamoDB は Lambda 内の 1 塊 |
+| C. やらない | 判断理由を記録して見送る | なし |
+
+**判断（2026-10-18）: A（OpenTelemetry でフル実装）を採る。** 見積もりは 3〜4 日（概念 半日〜1 日、コード 1〜2 日、AWS 検証 1 日）で、ロードマップの 1 日を超える。それでも採る理由:
+
+- X-Ray SDK はサポート終了が決まっており、新規に入れる理由が無い。OTel は Datadog・Grafana などでも使える業界標準で、知識が使い回せる
+- 送り先を選べるので、ローカルでは Jaeger、AWS では X-Ray に送れる。**ローカルファーストの方針のままトレースを見られ**、AWS へのデプロイ回数を減らせる
+- コードはすでに全部 `ctx` を引き回しているので、OTel で一番面倒な Context の受け渡しが済んでいる。DynamoDB の計測は `db.NewClient` に `otelaws` を足すだけで全呼び出しに効く
+- 一番読めないのは AWS 側（Collector レイヤーか OTLP 直送か、Lambda 凍結前の flush）。ローカルで先に仕組みを固めてから AWS に出す
+
+### Q. localapi を OTel で計測したのに、Jaeger の Service に出てこなかったのはなぜか
+
+**`otlptracegrpc` は既定で TLS で接続するが、ローカルの Jaeger の `:4317` は平文で待ち受けているため。** 接続の最初（TLS ハンドシェイク）で失敗し、Span は捨てられる。`Init` は送信失敗では失敗しない作りなので、localapi は動き続け、気づきにくい。
+
+- **直し方**: 標準の環境変数 `OTEL_EXPORTER_OTLP_INSECURE=true` をローカルだけで設定する。コードに `WithInsecure()` を書くと AWS でも常に平文になるため、送り先（`OTEL_EXPORTER_OTLP_ENDPOINT`）と同じく外から切り替える
+- **確かめ方**: Jaeger 側のログで OTLP の受け口が起動していること、Jaeger の API（`/api/v3/services`）に自分のサービス名が無いことを見て、「作っているが届いていない」と切り分けた
+
+### Q. ローカルのトレース（6-3 ステップ 4）で何が見えたか
+
+40 人ループを短く回した 500 トレースで、**全トレースの親が HTTP の Span 1 つで、DynamoDB の呼び出しがその子にぶら下がる**形になった（`adapter.go` がハンドラーに `r.Context()` を渡し、それが `db.Client` → `otelaws` へ引き継がれるため）。トレースは次の 4 種類に分かれた。
+
+| 件数 | 親 Span | 子 Span | 意味 |
+|---|---|---|---|
+| 192 | `POST /match/request` | Query, PutItem | 既存 WAITING の確認 → チケット作成 |
+| 167 | `GET /match/status/{ticketId}` | GetItem | 既に MATCHED 等で、見るだけ |
+| 93 | `GET /match/status/{ticketId}` | GetItem, Query, TransactWriteItems | グループを組んで確保を試み、**楽観ロックの競合で負けた** |
+| 48 | `GET /match/status/{ticketId}` | GetItem, Query, TransactWriteItems, PutItem, UpdateItem × 4 | マッチ成立 |
+
+- **競合の多さ**: 成立 48 回に対し、確保の競合負けが 93 回。同じ 4 枚を複数の status ポーリングが同時に確保しにいき、1 つだけが勝つ。メトリクスやログには出ていなかった事実で、トレースで初めて数えられた
+- **成立時の内訳**: 合計 418ms のうち、`finalize` で各チケットを MATCHED にする `UpdateItem` が**4 回直列**で約 220ms。LocalStack は 1 呼び出し約 50ms と遅いので、AWS での実際の比率は 6-6 で確かめる
+
+### Q. 確保の競合が多いのは問題か。マッチ成立時の UpdateItem × 4 は並列にしてよいか
+
+**競合で増えるのは API の回数ではなく、1 回あたりの無駄な仕事。** ポーリングは競合の有無に関係なく 2 秒ごとに 1 回で、負けた回も Query と TransactWriteItems をやり切ってから失敗する（**失敗したトランザクションも書き込み料金がかかる**）。自分のチケットが勝ったグループに入っていなければ、成立も次のポーリングまで遅れる。
+
+- **構造的な原因**: `selectGroup` は残りの席を `createdAt` の古い順（FIFO）で埋めるため、待っている全員が**同じ古い数枚を奪い合う**。人数が増えるほど競合の割合が上がると考えられ、「人数が増えるとマッチ成立までの時間が伸びる」原因の有力な仮説。6-6 の実測で確かめる
+
+**UpdateItem × 4（`MarkMatched`）を並列にしても、別のセッションに同じチケットを取られるリスクは増えない。** 奪い合いを防ぐのは前段の `ClaimTickets`（WAITING → MATCHING を 4 枚まとめて原子的に、条件は `status = WAITING` かつ `version` 一致）の仕事で、他のマッチングは WAITING しか候補に取らない。`MarkMatched` は確保済み（MATCHING）の自分のチケットに書くだけ。
+
+| 方法 | 往復 | 途中で失敗したとき |
+|---|---|---|
+| 今（直列） | 5 回（PutSession + MarkMatched × 4） | 一部だけ MATCHED、残りが MATCHING のまま残る |
+| 並列 | 実質 1 回分 | 同じく中途半端になりうる |
+| 1 トランザクションにまとめる | 1 回 | 全部成功か全部失敗 |
+
+`CreateGameSession`（GameLift）は DynamoDB のトランザクションに入れられないので、確保とセッション作成の間はどの方法でも別になる。

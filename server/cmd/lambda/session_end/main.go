@@ -1,5 +1,5 @@
 // session_end Lambda: POST /session/{sessionId}/end
-// ハンドラ本体は internal/handlers にあり、本ファイルは lambda.Start への配線のみを担う。
+// ハンドラ本体は internal/handlers にあり、本ファイルは telemetry.StartLambda（OTel 計測付きの lambda.Start）への配線のみを担う。
 //
 // 認証注記: プレイヤーではなくゲームサーバ（GameLift プロセス）が呼ぶ server-to-server
 // 経路のため、API Gateway 側でも authorizer を通さない。
@@ -11,10 +11,9 @@ import (
 	"log/slog"
 	"os"
 
-	"github.com/aws/aws-lambda-go/lambda"
-
 	"github.com/raidync/server/internal/db"
 	"github.com/raidync/server/internal/handlers"
+	"github.com/raidync/server/internal/telemetry"
 )
 
 func main() {
@@ -29,5 +28,5 @@ func main() {
 		log.Fatalf("init db client: %v", err)
 	}
 	h := handlers.NewSessionEnd(client)
-	lambda.Start(h.Handle)
+	telemetry.StartLambda("session_end", h.Handle)
 }
