@@ -1040,6 +1040,20 @@ client sendUDP: 受け取った psid を毎パケットの GameMessage.PlayerSes
 - **課金の心配**: 有料プラン切替＝即課金ではない。AWS は従量課金なので未使用なら $0。予算アラート $200/月 も別途。
 - **判定**: `aws gamelift list-locations --region ap-northeast-1` が `SubscriptionRequiredException` を返さなくなれば有効化完了→ステップ1（create-location）へ。
 
+### Q. `server/cmd/lambda/*/main.go` はローカルでは使っていないのか
+**使っていない（2026-10-27 時点）。** `main.go` が実行されるのは、`scripts/build-lambdas.sh` でビルドして Terraform（`modules/lambda`）で AWS にデプロイした Lambda の中だけ。
+
+| | ローカル | AWS |
+|---|---|---|
+| 入口 | `cmd/localapi`（net/http） | `cmd/lambda/*/main.go`（`telemetry.StartLambda` → `lambda.Start`） |
+| ハンドラ本体 | `internal/handlers` | `internal/handlers`（同じもの） |
+| 認証 | `localapi` の `withAuth`（`internal/auth.Verifier` を直接呼ぶ） | `cmd/lambda/authorizer` |
+| OTel | `telemetry.Init` | `telemetry.StartLambda` |
+
+- `main.go` は「依存を組み立てて `Handle` を Lambda ランタイムに渡す」だけの薄い殻にしてあり、ロジックは `internal/handlers` に寄せてある。そのため、ローカルで動かしていない部分は配線（環境変数の読み取り・クライアント生成・`selectSessionProvider` など）だけになる。
+- `docker-compose.yml` の LocalStack は `SERVICES` に `lambda,apigateway` を含むが、init スクリプトは Lambda を登録しない。LocalStack に実デプロイする案（案 C）は採らず、案 A（`localapi`）を選んだ（§11 の比較表）。
+- **代償**: `main.go` の配線ミスや `authorizer` の Lambda としての挙動（TOKEN 型の入出力、`StartLambda` の Flush）は、ローカルでは検出できない。`go build ./...` と `go vet ./...` を通すことと、AWS dev での E2E で確認する。
+
 ---
 
 ## 12. Phase 4：AWS dev E2E（本番同等環境）
@@ -2392,6 +2406,37 @@ k6 の `matched` 100% は「各 VU が MATCHED を受け取った」ことしか
 - **競合の多さ**: 成立 48 回に対し、確保の競合負けが 93 回。同じ 4 枚を複数の status ポーリングが同時に確保しにいき、1 つだけが勝つ。メトリクスやログには出ていなかった事実で、トレースで初めて数えられた
 - **成立時の内訳**: 合計 418ms のうち、`finalize` で各チケットを MATCHED にする `UpdateItem` が**4 回直列**で約 220ms。LocalStack は 1 呼び出し約 50ms と遅いので、AWS での実際の比率は 6-6 で確かめる
 
+### Q. Jaeger ではどのように確認したのか
+
+1. **計測**: localapi はルートごとに `otelhttp.NewHandler(handler, pattern)` で包む（親 Span、名前はルートのパターン）。DynamoDB / GameLift の SDK 呼び出しは `otelaws.AppendMiddlewares` で子 Span になる。`adapter.go` が `r.Context()` をハンドラーに渡すので親子がつながる。サービス名は `telemetry.Init(ctx, "localapi")` の `localapi`
+2. **受け手**: docker-compose の `jaegertracing/jaeger:2.22.0`。`4317` が OTLP gRPC（Exporter の既定の送り先）、`16686` が UI と API
+3. **起動**: runbook の環境変数に `OTEL_EXPORTER_OTLP_INSECURE=true` を足して localapi を起動。最初はこれが無く Service に出なかった（前の Q）。`/api/v3/services` に `localapi` があるかで届いたことを確かめる
+4. **観察**: 40 人ループの k6 を短く回し、`localapi` のトレース 500 件を、親 Span 名と子 Span の並びで 4 種類に分類（前の Q の表）。成立のトレースはタイムラインで開き、`finalize` の `UpdateItem` × 4 が直列で約 220ms であることを読んだ
+
+- **記録漏れ**: 500 件を数え上げた具体的なコマンドはリポジトリに残っていない。やり直すなら Jaeger の API（`/api/v3/traces`、service=`localapi`）で JSON を取り、Span 名の並びで集計する
+
+### Q. Jaeger で確認したのは何か（何が確かめられ、何が確かめられていないか）
+
+**確かめたのは「localapi の計測が正しく組めているか」と、それを使って見えたアプリの挙動。**
+
+| 確かめたこと | 根拠 |
+|---|---|
+| Span が送り先に届く | `localapi` が Service に出る（`OTEL_EXPORTER_OTLP_INSECURE=true` が効いている） |
+| 親子がつながる | DynamoDB の Span が HTTP の Span の子になる（`r.Context()` → `handlers` → `db.Client` → `otelaws` と context が切れていない） |
+| Span 名がルートのパターン | `GET /match/status/{ticketId}` のように ID を含まない名前で集計できる |
+| アプリの挙動 | 確保の競合負け 93 回 / 成立 48 回、成立時の `UpdateItem` × 4 が直列で約 220ms |
+
+- **確かめていないこと**: Lambda の経路（`StartLambda`）、API Gateway → authorizer → 本体のつながり、GameLift の Span（ローカルは Stub）、AWS での時間の比率（LocalStack は 1 呼び出し約 50ms と遅い）
+
+### Q. `StartLambda` はもう確認したのか
+
+**していない（2026-10-27 時点）。** 確かめたのは `go build` / `go vet` が通ることだけ。Jaeger で見たのは localapi の `Init` の経路で、`StartLambda` は一度も実行していない。
+
+- **未確認 1: 起動するか**: `otellambda.InstrumentHandler` はハンドラーの形を実行時に検査する。Lambda の中で初めて分かる
+- **未確認 2: 送り先が無いと遅くならないか**: AWS には `localhost:4317` の受け手がまだ無い。`WithFlusher` は呼び出しのたびに `ForceFlush` するが、`otlptracegrpc` は既定で送信失敗をリトライするので、毎回の応答がその分待たされる可能性がある。「送信失敗で捨てられ、Lambda 本体は動く」（前の Q）は推測で、検証していない
+- **未確認 3: Span が届くか**: authorizer と本体 Lambda の Span が出るか、`ForceFlush` で凍結前に送り切れているか
+- **確かめ方の候補**: (a) Lambda Runtime Interface Emulator（RIE）で `bootstrap` をローカル起動し、送り先を Jaeger にする（ローカルファースト）、(b) AWS dev にデプロイし、CloudWatch の Duration とログを見る
+
 ### Q. 確保の競合が多いのは問題か。マッチ成立時の UpdateItem × 4 は並列にしてよいか
 
 **競合で増えるのは API の回数ではなく、1 回あたりの無駄な仕事。** ポーリングは競合の有無に関係なく 2 秒ごとに 1 回で、負けた回も Query と TransactWriteItems をやり切ってから失敗する（**失敗したトランザクションも書き込み料金がかかる**）。自分のチケットが勝ったグループに入っていなければ、成立も次のポーリングまで遅れる。
@@ -2407,3 +2452,116 @@ k6 の `matched` 100% は「各 VU が MATCHED を受け取った」ことしか
 | 1 トランザクションにまとめる | 1 回 | 全部成功か全部失敗 |
 
 `CreateGameSession`（GameLift）は DynamoDB のトランザクションに入れられないので、確保とセッション作成の間はどの方法でも別になる。
+
+### Q. Lambda から X-Ray へ Span を届けるとき、Collector のレイヤーを挟むのと、OTLP エンドポイントへ直接送るのは何が違うか
+
+**違いは「届ける作業を誰がやるか」。** A は Lambda の中に Collector（拡張機能＝別プロセス）を同居させ、アプリは `localhost:4317` に投げるだけ。B はアプリ自身が `https://xray.<region>.amazonaws.com/v1/traces` に署名付きで送る。
+
+| 観点 | A. Collector のレイヤー | B. OTLP エンドポイントへ直接 |
+|---|---|---|
+| Go のコード | ほぼ不要（今の `localhost:4317` gRPC のまま。ローカルの Jaeger と同じ形） | 必要。エンドポイントは **HTTP のみ（gRPC 非対応）**で **SigV4 署名**が要る。OTel Go SDK は署名を標準で持たないので自分で足す |
+| AWS 側の準備 | レイヤー ARN と Collector 設定、IAM | **CloudWatch Transaction Search の有効化が前提**、IAM |
+| データの行き先 | 従来の X-Ray | Span は CloudWatch Logs の `aws/spans` に全件入り、一部が X-Ray のトレースとして索引される |
+| 性能 | 別プロセスが動くのでコールドスタートが伸び、メモリも使う | 余分なプロセス無し |
+| 費用 | X-Ray 通常料金（月 10 万トレース無料） | Transaction Search の料金（取り込み量と索引の割合）。新規は 3 か月の無料枠 |
+| 将来性 | AWS は Collector 無しで送る方向を推しており、旧来の方式になりつつある | AWS が今推している方式 |
+
+- **RAIDYNC での論点**: A は 6-6 で測るレイテンシー（p95）に Collector のコールドスタートが混ざる（計測の仕組みが測りたい数字を悪化させる）。一方 A はローカルと AWS で送り方が揃い、B は Exporter をローカルと AWS で切り替える必要がある
+
+### Q. OTLP の Span とは何か
+
+**Span と OTLP は別の層の言葉。** Span は「1 つの処理の記録」というデータで、OTLP（OpenTelemetry Protocol）はその Span を送り先へ運ぶ通信の約束事。「OTLP の Span」は「OTLP で運ばれる Span」という意味になる。
+
+**Span = 1 つの処理の「名前・開始時刻・終了時刻・結果」の記録。** 主な中身:
+
+| 項目 | 例（RAIDYNC） |
+|---|---|
+| 名前 | `GET /match/status/{ticketId}`、`DynamoDB.Query` |
+| Trace ID | 1 リクエスト全体で共通の ID。同じ ID の Span を集めると 1 本のトレースになる |
+| Span ID / 親 Span ID | 親子関係。DynamoDB の Span は HTTP の Span を親に持つ |
+| 開始・終了時刻 | ここから所要時間が出る（Jaeger の横棒の長さ） |
+| 属性 | テーブル名、HTTP ステータスなどの key-value |
+| ステータス | 成功 / エラー |
+
+- **RAIDYNC での作られ方**: `otelhttp.NewHandler`（`localapi/main.go`）が HTTP 1 回ごとに親 Span を作り、`ctx` 経由で親を受け取った `otelaws`（`db/client.go`）が DynamoDB 呼び出しごとに子 Span を作る。ハンドラーのコードで Span を自分で作っている箇所は無い
+- **OTLP の役割**: できた Span を `otlptracegrpc` の Exporter がまとめて送る。送り先がローカルの Jaeger でも AWS の X-Ray（Collector 経由）でも同じ形式なので、**コードを変えずに送り先だけ環境変数で切り替えられる**。OTLP には gRPC（`:4317`）と HTTP（`:4318`）の 2 種類の運び方がある
+- **C# との対応**: .NET の `System.Diagnostics.Activity` が Span にあたる（`ActivitySource.StartActivity` ≒ `tracer.Start`）。.NET の OpenTelemetry は Activity を Span として OTLP で送る
+
+### Q. Collector とは何か
+
+**Collector（OpenTelemetry Collector）は、アプリと送り先の間に置く「Span の中継所」となる別プログラム。** アプリは Collector に OTLP で投げるだけで、受け取った Collector が加工して、最終的な送り先（X-Ray、Jaeger、Datadog など）の形式に変えて送る。
+
+```
+Collector 無し: アプリ ──OTLP──→ 送り先
+Collector 有り: アプリ ──OTLP──→ Collector ──(送り先の形式)──→ 送り先
+```
+
+中は 3 段の組み合わせで、設定ファイル（YAML）で組む:
+
+| 段 | 役割 | 例 |
+|---|---|---|
+| Receiver | 受け取る | OTLP の gRPC `:4317` / HTTP `:4318` |
+| Processor | 加工する | まとめて送る（batch）、間引く（sampling）、属性の追加・削除 |
+| Exporter | 送り出す | AWS X-Ray（SigV4 署名つき）、Jaeger、ファイル |
+
+- **置く理由**: 送り先ごとの事情（署名・形式・リトライ・間引き）を**アプリから追い出せる**。アプリは常に「`localhost:4317` に OTLP で送る」だけで済み、送り先の変更は Collector の設定で済む
+- **RAIDYNC のローカル**: Jaeger は自分で OTLP を受け取れるので Collector は挟んでいない（`localapi` → Jaeger に直送）
+- **RAIDYNC の AWS（6-3 の論点）**: X-Ray へは SigV4 署名が要る。Lambda レイヤーの Collector（ADOT）を同居させると署名は Collector がやってくれるが、別プロセスなのでコールドスタートとメモリが増える。Collector を使わずにアプリから直接送る案との比較は上の Q を参照
+- **似た構成**: ログでいえば、アプリはローカルのエージェント（Fluentd など）に書くだけで、転送先の切り替えはエージェント側の設定で済ませる構成と同じ考え方
+
+### Q. Collector のレイヤー（A）だと Lambda は `localhost:4317` に送る。AWS を動かすときに自分の PC で何か起動しておく必要があるのか
+
+**無い。** `localhost` は「そのプログラムが動いているマシン自身」を指す名前で、指す先は動いている場所で変わる。
+
+| 動いている場所 | `localhost:4317` の先 |
+|---|---|
+| 自分の PC（localapi） | PC 上の Jaeger（Docker） |
+| AWS の Lambda | 同じ Lambda 実行環境の中の Collector（レイヤーとして Lambda と一緒に AWS が起動する） |
+
+AWS の Lambda から開発者の PC の `localhost` には届きようがない。「A ならローカルと揃う」は、**コードが同じ**（どちらも `localhost:4317` に gRPC）で、受け取る相手が場所によって自然に入れ替わる、という意味。
+
+### Q. 現状、X-Ray は何に使っているか
+
+**まだ何にも使っていない（2026-10-27 時点）。** `terraform/` にも `server/` にも X-Ray の設定は無い（API Gateway のトレース有効化、Lambda の `tracing_config`、IAM 権限のどれも無し）。「CloudWatch + X-Ray」は計画で、6-3 がその実装。
+
+| 動かす場所 | トレースの行き先 |
+|---|---|
+| ローカル（localapi） | Jaeger。今トレースを見られるのはここだけ |
+| AWS（Lambda） | どこにも行かない。`localhost:4317` の受け手（Collector）がまだ無く、送信失敗で捨てられる（Lambda 本体は動く） |
+
+X-Ray は「Jaeger の AWS 版」の位置付け。AWS で見たいのは、6-6 の p95 悪化の切り分けと、ローカルでは見えない部分（API Gateway → authorizer → 本体 Lambda のつながり、GameLift `CreateGameSession` の時間。ローカルは Stub なので Jaeger に出ない）。
+
+**判断（2026-10-27）: B（X-Ray の OTLP エンドポイントへ直接送る）を採る。** 6-6 で測る p95 に Collector のコールドスタートを混ぜないためと、AWS が今推している方式で組むため。代わりに、Exporter をローカル（Jaeger・平文 gRPC）と AWS（X-Ray・SigV4 署名付き HTTP）で切り替える実装と、Transaction Search の有効化が必要になる。
+
+### Q. Exporter を呼び出し口で決め打ちする（3 案）と、`telemetry.go` にローカル用と AWS 用の処理が同居する。それでよいのか。環境変数で切り替える（1 案）でも同居するのでは
+
+**同居してよい。むしろ同居させるのが `telemetry` パッケージの役目。** 1 案でも 3 案でも同居は避けられず、違うのは「どちらを使うかを**誰が決めるか**」だけ。
+
+| | 同居 | どちらを使うかを決めるもの |
+|---|---|---|
+| 1. 環境変数 | する | 実行時の設定（`TRACE_EXPORTER`） |
+| 3. 決め打ち | する | 呼び出し口（`Init` か `StartLambda` か） |
+
+- 呼び出し側（`main.go`）が「どこへどう送るか」を知らずに済むよう、違いをこのパッケージに閉じ込めている。同居させず `main.go` 側に書くと、Lambda 6 関数に同じ Exporter 作成のコードが散らばる
+- このプロジェクトには前例がある。Lambda の `main.go` の `selectSessionProvider` は、本物の GameLift と `GameLiftStub` を同居させ、環境変数で選んでいる（1 案と同じ形）
+- C# でいえば、`Program.cs` で `if (env.IsDevelopment())` によって登録するサービスを変えるのと同じ。開発用と本番用のコードが 1 つのアセンブリに入っているのは普通のこと
+- 気になるのは同居そのものより**見通し**。肥大化したら同じパッケージのままファイルを分ける（例: `exporter_local.go` / `exporter_xray.go`）。Go では同じパッケージなら別ファイルでも分け方の制約は無い
+- 副作用は、Lambda のバイナリに使わない gRPC Exporter も入ること。サイズの差は小さく、気にする段階ではない
+
+### Q. 環境変数で選ぶ前例（`selectSessionProvider`）があるなら、Exporter も 1 案（環境変数）のほうがきれいではないか
+
+**どちらでも成り立つ。揃えるなら 1 案でよい。** 「同じ問題は同じ形で解く」は読み手にとって大きな利点。
+
+ただし、前例と完全に同じ形ではない点に注意する。
+
+| | `selectSessionProvider` | `TRACE_EXPORTER`（1 案） |
+|---|---|---|
+| 環境変数の中身 | フリート ID（どのみち必要な値） | 切り替えだけのためのスイッチ |
+| 未設定のとき | Stub になり、ログに出る | ローカル用 gRPC になり、AWS では Span が静かに消える |
+
+1 案で進める場合、前例から次の 2 点を受け継ぐ。
+
+- **どちらを選んだかを起動時にログへ出す**（前例の `log.Printf("GameLiftStub を使用…")` と同じ）。渡し忘れても CloudWatch Logs を見れば気づける
+- **Terraform の Lambda の環境変数に必ず入れる**（6-d で `GAMELIFT_FLEET_ID` と並べて書く）
+
+**判断（2026-10-27）: 1 案（環境変数）で進める。** 前例との一貫性を優先した。
