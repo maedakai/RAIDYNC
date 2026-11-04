@@ -2565,3 +2565,32 @@ X-Ray は「Jaeger の AWS 版」の位置付け。AWS で見たいのは、6-6 
 - **Terraform の Lambda の環境変数に必ず入れる**（6-d で `GAMELIFT_FLEET_ID` と並べて書く）
 
 **判断（2026-10-27）: 1 案（環境変数）で進める。** 前例との一貫性を優先した。
+
+### Q. X-Ray の OTLP エンドポイントへ送るのに何が要るか（Transaction Search と IAM の調査、2026-10-30）
+
+**前提: Transaction Search の有効化が必須。** 無効のまま送ると 400（`The OTLP API is supported with CloudWatch Logs as a Trace Segment Destination`）。有効化すると Span は CloudWatch Logs の `aws/spans` ロググループに構造化ログとして入り、既定で 1% が無料で索引付けされる。**設定はリージョン単位**なので、Lambda を置く 2 リージョン（ap-northeast-1 / us-east-1）の両方で要る。
+
+API での有効化は 3 段:
+
+1. CloudWatch Logs のリソースポリシー: `xray.amazonaws.com` に `aws/spans` と `/aws/application-signals/data` への `logs:PutLogEvents` を許可（`aws:SourceArn` / `aws:SourceAccount` 条件付き）
+2. `UpdateTraceSegmentDestination`（送り先を CloudWatchLogs に）
+3. `UpdateIndexingRule`（索引付けの割合）
+
+**Terraform**: classic の `aws` provider には該当リソースが見当たらない。`awscc_xray_transaction_search_config`（CloudFormation `AWS::XRay::TransactionSearchConfig`）が 2 と 3 を担う（`indexing_percentage`）。1 は `aws_cloudwatch_log_resource_policy` で書ける。dev には awscc provider（primary / secondary）が既にある。
+
+**Lambda に要る IAM アクション**: `xray:PutSpans`（「OpenTelemetry の Span を X-Ray にアップロードする」権限、Resource は `*`）。既存の managed policy（`AWSXRayDaemonWriteAccess` など）は旧来の `PutTraceSegments` のみで `PutSpans` を含まないため、インラインで付ける。permission-only の `xray:PutSpansForIndexing` も存在するが要否は資料で確定できず、ステップ 7 の挙動で判断する。
+
+### Q. X-Ray を使うには CloudWatch の Transaction Search を有効にする必要があり、それを Terraform で構築しようとしている、という認識でよいか
+
+**よい。ただし 2 点補足。**
+
+- 必須なのは「**OTLP エンドポイントで送る場合**」。X-Ray そのものは Transaction Search なしでも使える（旧来の X-Ray SDK / デーモンが使う `PutTraceSegments` 経路）。6-3 は B 案（OTLP 直送）を選んだので、その帰結として必須になった
+- Transaction Search は CloudWatch の機能（コンソールでは Application Signals の配下）。CloudWatch Logs そのものの設定ではないが、有効にすると Span の保存先が CloudWatch Logs の `aws/spans` になる。そのため「X-Ray がそのロググループに書いてよい」というリソースポリシーも一緒に要る
+
+Terraform にするのは CLAUDE.md の「すべての AWS リソースは Terraform で定義、コンソールでの手動変更は禁止」に従うため。
+
+### Q. 6-c の plan で、触っていないアラーム 12 個に in-place の差分が出たのはなぜか
+
+**改行コードの違い。** monitoring の `alarm_description` はヒアドキュメント（`<<-EOT`）で、ファイルの改行がそのまま説明文に入る。このリポジトリは `core.autocrlf=true` で作業ツリーが CRLF のため、デプロイ済みの説明文は CRLF だった。編集時に `main.tf` を LF で保存したので、見た目は同じでも説明文が変わったと判定された。ファイルを CRLF に戻すと差分は消えた（7 to add, 0 to change）。
+
+あわせて出た「SNS の購読 2 個が destroy」は、plan を実行したシェルに `TF_VAR_notification_email` が無かったため（通知先のメールは tfvars に書かず環境変数で渡す設計）。apply するときは、環境変数を設定したターミナルで plan し直して、destroy が出ないことを確認する。

@@ -1,6 +1,6 @@
 # Lambda 実行ロールを用途別に 2 つ定義する。
-#   - authorizer_role : JWT 検証のみ（DynamoDB/GameLift に触れない）→ Logs 権限だけ
-#   - matchmaking_role: match_* / session_end 用。DynamoDB CRUD + GameLift セッション作成 + Logs
+#   - authorizer_role : JWT 検証のみ（DynamoDB/GameLift に触れない）→ Logs + X-Ray
+#   - matchmaking_role: match_* / session_end 用。DynamoDB CRUD + GameLift セッション作成 + Logs + X-Ray
 # dev E2E の狙いのひとつが「最小権限で本当に動くか」の実効性検証なので、role を分ける。
 
 # Lambda サービスが assume できることを示す信頼ポリシー（両ロール共通）。
@@ -77,4 +77,32 @@ resource "aws_iam_role_policy" "matchmaking" {
   name   = "raidync-dev-matchmaking-inline"
   role   = aws_iam_role.matchmaking.id
   policy = data.aws_iam_policy_document.matchmaking.json
+}
+
+# ---- X-Ray への Span 送信（両ロール共通） ----
+# Lambda は OTel の Span を X-Ray の OTLP エンドポイントへ送る（internal/telemetry）。その権限が xray:PutSpans。
+# AWS の managed policy（AWSXRayDaemonWriteAccess 等）は旧来の PutTraceSegments しか含まないため自前で定義する。
+# Logs と同じく業務に依らない横断的な権限なので、1 つのポリシーを両ロールに attachment で付ける（定義を 1 か所に保つ）。
+data "aws_iam_policy_document" "xray" {
+  statement {
+    sid       = "XRayPutSpans"
+    actions   = ["xray:PutSpans"]
+    resources = ["*"]
+  }
+}
+
+resource "aws_iam_policy" "xray" {
+  name   = "raidync-dev-xray-put-spans"
+  policy = data.aws_iam_policy_document.xray.json
+  tags   = var.tags
+}
+
+resource "aws_iam_role_policy_attachment" "authorizer_xray" {
+  role       = aws_iam_role.authorizer.name
+  policy_arn = aws_iam_policy.xray.arn
+}
+
+resource "aws_iam_role_policy_attachment" "matchmaking_xray" {
+  role       = aws_iam_role.matchmaking.name
+  policy_arn = aws_iam_policy.xray.arn
 }

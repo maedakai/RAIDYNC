@@ -219,7 +219,8 @@ module "monitoring" {
 module "monitoring_secondary" {
   source = "../../modules/monitoring"
   providers = {
-    aws = aws.secondary
+    aws   = aws.secondary
+    awscc = awscc.secondary
   }
   alarm_function_names = module.lambda_secondary.function_names
   notification_email   = var.notification_email

@@ -43,3 +43,59 @@ resource "aws_sns_topic_subscription" "this" {
   protocol  = "email"
   endpoint  = var.notification_email
 }
+
+# ---- Transaction Search（X-Ray の OTLP エンドポイントの前提） ----
+# Lambda は Span を X-Ray の OTLP エンドポイントへ直接送る（internal/telemetry）。この経路は
+# Transaction Search が無効だと 400 で拒否される。有効にすると Span は CloudWatch Logs の
+# aws/spans に保存される。設定はリージョン単位なので、このモジュール（リージョンごとに呼ばれる）に置く。
+# region / account は呼び出し側の provider から読む（secondary なら us-east-1 が返る）。
+data "aws_caller_identity" "current" {}
+data "aws_region" "current" {}
+
+locals {
+  region  = data.aws_region.current.name
+  account = data.aws_caller_identity.current.account_id
+}
+
+# X-Ray が aws/spans（と Application Signals 用のロググループ）へ書き込むことを許すリソースポリシー。
+# 条件で「このアカウント・このリージョンの X-Ray から」に絞る（confused deputy 対策）。
+data "aws_iam_policy_document" "xray" {
+  statement {
+    sid     = "XRayWrite"
+    actions = ["logs:PutLogEvents"]
+    resources = [
+      "arn:aws:logs:${local.region}:${local.account}:log-group:aws/spans:*",
+      "arn:aws:logs:${local.region}:${local.account}:log-group:/aws/application-signals/data:*",
+    ]
+    principals {
+      type        = "Service"
+      identifiers = ["xray.amazonaws.com"]
+    }
+    condition {
+      test     = "ArnLike"
+      variable = "aws:SourceArn"
+      values = [
+        "arn:aws:xray:${local.region}:${local.account}:*",
+      ]
+    }
+    condition {
+      test     = "StringEquals"
+      variable = "aws:SourceAccount"
+      values   = [local.account]
+    }
+  }
+}
+
+resource "aws_cloudwatch_log_resource_policy" "xray" {
+  policy_name     = "raidync-dev-xray-transaction-search"
+  policy_document = data.aws_iam_policy_document.xray.json
+}
+
+# 送り先を CloudWatch Logs に切り替え、Span の 1% を索引付けする（1% までは無料）。
+# Span 自体は 100% aws/spans に入り検索できる。索引はトレース一覧・分析用の要約だけに効く。
+# 参照関係が無いため depends_on で順序を明示する（リソースポリシーが先に無いと X-Ray が書き込めない）。
+# classic の aws provider には該当リソースが無く、awscc（AWS::XRay::TransactionSearchConfig）を使う。
+resource "awscc_xray_transaction_search_config" "this" {
+  depends_on          = [aws_cloudwatch_log_resource_policy.xray]
+  indexing_percentage = 1
+}
