@@ -277,5 +277,10 @@ resource "aws_api_gateway_stage" "this" {
   deployment_id = aws_api_gateway_deployment.this.id
   stage_name    = var.stage_name
 
+  # X-Ray のトレースを有効にする。API Gateway が自分の区間（滞在時間・authorizer の呼び出し）を記録し、
+  # 呼び出す Lambda に親の ID を渡す。Lambda の OTel（xrayconfig）がそれを親として読むので 1 本につながる。
+  # 記録する割合はここではなく X-Ray のサンプリングルールで決まる（既定は毎秒 1 件 + 5%）。
+  xray_tracing_enabled = true
+
   tags = var.tags
 }

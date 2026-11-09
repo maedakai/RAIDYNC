@@ -2779,3 +2779,9 @@ Tracer.Start → Span → SpanProcessor（WithBatcher：まとめて非同期に
 | localapi | 毎回ルートだが送り先は Jaeger なので無関係 |
 
 ID 生成器が効くのは 6-d 適用前と手作業の呼び出しくらいで、本番の経路には無い。「入れない」判断は変わらない。
+
+### Q. 6-d で API Gateway と Lambda のトレースをどう有効にするか
+
+- **API Gateway**: `aws_api_gateway_stage` に `xray_tracing_enabled = true` を足すだけ。ステージの設定なので再デプロイは要らず、IAM も要らない。`aws_lambda_permission`（`execution_arn`）は「API Gateway が Lambda を呼んでよいか」という呼び出しの許可で、トレースとは別物（既に設定済み）。**判断（2026-11-09）: 変数にせず常に `true`。** 普段は既定のサンプリングで量が少なく、切り替える理由が今は無い（Transaction Search と同じ扱い）
+- **Lambda の `tracing_config.mode`**: `PassThrough` は上流の ID を中継するだけ、`Active` は Lambda 基盤が自分の区間（コールドスタートの Init、呼び出しのオーバーヘッド）も記録する。**判断（2026-11-09）: `Active`。** 6-3 の目的にコールドスタートなどハンドラー外の時間の確認が入っているため。代わりに Lambda の実行ロールに旧来の `xray:PutTraceSegments` 等の権限が要る（6-d の 4）
+- **`TRACE_EXPORTER`**: 6 関数すべてに同じ値が要るので、`locals` の `common_env` に置き、`functions_resolved` で `merge(local.common_env, cfg.env)` する（後ろの関数ごとの値が勝つ）。**判断（2026-11-09）: 変数にせず `"xray"` を直接書く。** Lambda は AWS でしか動かないので値が変わらない。変数にして既定値を空にすると、空文字を落とす `functions_resolved` によって環境変数ごと消え、`validate` は通るのに Span が届かない状態になる（実際に一度そうなりかけ、`plan` で確認して気づける類の誤り）

@@ -49,11 +49,18 @@ locals {
     }
   }
 
+  # 全関数に共通の環境変数。関数ごとの env と merge し、同じキーなら関数ごとの値が勝つ。
+  # TRACE_EXPORTER は Span の送り先（internal/telemetry の newExporter）。Lambda は AWS でしか動かないため
+  # 常に xray で、変数にしない（未設定だと gRPC で localhost に送ろうとして Span が捨てられる）。
+  common_env = {
+    TRACE_EXPORTER = "xray"
+  }
+
   # 空文字の環境変数は「未設定」と同義なので落とす。
   # （コード側は Getenv の空文字で分岐するため、空を渡しても害はないがノイズになる）
   functions_resolved = {
     for name, cfg in local.functions : name => merge(cfg, {
-      env = { for k, v in cfg.env : k => v if v != "" }
+      env = { for k, v in merge(local.common_env, cfg.env) : k => v if v != "" }
     })
   }
 }
@@ -106,6 +113,10 @@ resource "aws_lambda_function" "this" {
     content {
       variables = environment.value
     }
+  }
+
+  tracing_config {
+    mode = "Active"
   }
 
   # ロググループを Lambda より先に作らせる（Lambda 側の自動作成と競合させない）。

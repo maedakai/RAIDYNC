@@ -79,20 +79,27 @@ resource "aws_iam_role_policy" "matchmaking" {
   policy = data.aws_iam_policy_document.matchmaking.json
 }
 
-# ---- X-Ray への Span 送信（両ロール共通） ----
-# Lambda は OTel の Span を X-Ray の OTLP エンドポイントへ送る（internal/telemetry）。その権限が xray:PutSpans。
-# AWS の managed policy（AWSXRayDaemonWriteAccess 等）は旧来の PutTraceSegments しか含まないため自前で定義する。
+# ---- X-Ray への送信（両ロール共通） ----
+# 送り手は 2 つある。OTel の Span（internal/telemetry が OTLP エンドポイントへ送る）は xray:PutSpans、
+# tracing_config = Active の Lambda 基盤が送る自分の区間（コールドスタートの Init など）は
+# 旧来の xray:PutTraceSegments / xray:PutTelemetryRecords。
+# AWS の managed policy（AWSXRayDaemonWriteAccess）は PutSpans を含まず、サンプリングルールの読み取りなど
+# 使わない権限も含むため、必要な 3 つだけを自前で定義する。
 # Logs と同じく業務に依らない横断的な権限なので、1 つのポリシーを両ロールに attachment で付ける（定義を 1 か所に保つ）。
 data "aws_iam_policy_document" "xray" {
   statement {
-    sid       = "XRayPutSpans"
-    actions   = ["xray:PutSpans"]
+    sid = "XRayWrite"
+    actions = [
+      "xray:PutSpans",
+      "xray:PutTelemetryRecords",
+      "xray:PutTraceSegments",
+    ]
     resources = ["*"]
   }
 }
 
 resource "aws_iam_policy" "xray" {
-  name   = "raidync-dev-xray-put-spans"
+  name   = "raidync-dev-xray-write"
   policy = data.aws_iam_policy_document.xray.json
   tags   = var.tags
 }
