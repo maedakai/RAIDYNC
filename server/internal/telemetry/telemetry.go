@@ -15,6 +15,7 @@ import (
 	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"go.opentelemetry.io/contrib/instrumentation/github.com/aws/aws-lambda-go/otellambda"
+	"go.opentelemetry.io/contrib/instrumentation/github.com/aws/aws-lambda-go/otellambda/xrayconfig"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
@@ -39,6 +40,8 @@ func newProvider(ctx context.Context, serviceName string) (*sdktrace.TracerProvi
 
 	tp := sdktrace.NewTracerProvider(sdktrace.WithResource(res), sdktrace.WithBatcher(exporter))
 	otel.SetTracerProvider(tp)
+	// グローバルは W3C（traceparent）。Lambda が親を読むときの X-Ray 形式は StartLambda で
+	// otellambda に個別に渡す（xrayconfig）ため、ここには入れない。
 	otel.SetTextMapPropagator(propagation.TraceContext{})
 	return tp, nil
 }
@@ -57,13 +60,16 @@ func Init(ctx context.Context, serviceName string) (func(context.Context) error,
 // StartLambda は OTel を初期化し、ハンドラーを計測で包んで lambda.Start する（戻らない）。
 // Lambda はレスポンスを返すと凍結され、終了時の後片付けが来ないため、Init のように Shutdown を
 // 使えない。代わりに WithFlusher で呼び出しのたびに ForceFlush し、凍結前に Span を送り切る。
+// xrayconfig.WithRecommendedOptions は WithFlusher に加え、Lambda 基盤が渡す _X_AMZN_TRACE_ID を
+// 親として読む設定（EventToCarrier と X-Ray 形式の propagator）を含む。これで OTel の Span が
+// API Gateway・Lambda 基盤のトレースの子になる（otellambda は既定では親を読まず、毎回新しいトレースになる）。
 // handler は lambda.Start と同じく任意の形を受け取る（authorizer も他の関数も渡せる）。
 func StartLambda(serviceName string, handler any) {
 	tp, err := newProvider(context.Background(), serviceName)
 	if err != nil {
 		log.Fatalf("init telemetry: %v", err)
 	}
-	lambda.Start(otellambda.InstrumentHandler(handler, otellambda.WithFlusher(tp)))
+	lambda.Start(otellambda.InstrumentHandler(handler, xrayconfig.WithRecommendedOptions(tp)...))
 }
 
 // newExporter は TRACE_EXPORTER に応じて Span の送り先を選ぶ。どちらを選んだかは起動時にログへ出す。

@@ -2594,3 +2594,188 @@ Terraform にするのは CLAUDE.md の「すべての AWS リソースは Terra
 **改行コードの違い。** monitoring の `alarm_description` はヒアドキュメント（`<<-EOT`）で、ファイルの改行がそのまま説明文に入る。このリポジトリは `core.autocrlf=true` で作業ツリーが CRLF のため、デプロイ済みの説明文は CRLF だった。編集時に `main.tf` を LF で保存したので、見た目は同じでも説明文が変わったと判定された。ファイルを CRLF に戻すと差分は消えた（7 to add, 0 to change）。
 
 あわせて出た「SNS の購読 2 個が destroy」は、plan を実行したシェルに `TF_VAR_notification_email` が無かったため（通知先のメールは tfvars に書かず環境変数で渡す設計）。apply するときは、環境変数を設定したターミナルで plan し直して、destroy が出ないことを確認する。
+
+### Q. 「トレースが 2 本に分かれる」とは、どう分かれるのか
+
+**ID の付け方が 2 系統あり、互いを知らないため。**
+
+| 系統 | 誰が作るか | ID の渡し方 | 見えるもの |
+|---|---|---|---|
+| X-Ray ネイティブ | API Gateway（トレース有効時）、Lambda 基盤（`tracing_config = Active` 時） | `X-Amzn-Trace-Id` ヘッダー / 環境変数 `_X_AMZN_TRACE_ID` | API Gateway の滞在時間、authorizer の呼び出し、コールドスタート（Init）、Lambda 基盤のオーバーヘッド |
+| OTel（自前） | `otellambda` とその下の `otelaws` | W3C `traceparent`（`propagation.TraceContext`） | ハンドラー本体、DynamoDB / GameLift 呼び出し |
+
+`otellambda` は既定で親を探さない（`EventToCarrier` の既定値は空のキャリアを返し、「呼び出しごとに新しいトレースになる」と contrib のコメントに明記）。Lambda 基盤が渡す `_X_AMZN_TRACE_ID` も読まない。そのため、1 回のリクエストが次のように別々のトレースになる。
+
+- X-Ray ネイティブの 1 本: API Gateway → authorizer Lambda / 本体 Lambda（中身は空）
+- OTel の 1 本: authorizer のハンドラー
+- OTel のもう 1 本: 本体のハンドラー → DynamoDB …
+
+（API Gateway と Lambda のトレースを有効にしない今の状態でも、OTel 側は authorizer と本体で別トレースに分かれる。）
+
+**つなぐ方法の候補**: OTel に X-Ray 形式の propagator と ID 生成器を入れ、`_X_AMZN_TRACE_ID` から親を読むよう `otellambda` を設定する（contrib に Lambda 向けの X-Ray 設定一式がある）。そうすると OTel の Span が Lambda 基盤の Span の子になり、API Gateway からの 1 本にまとまる。
+
+### Q. match_request の API で使っているトレースとは何か
+
+**OpenTelemetry（OTel）の分散トレース。** 1 回のリクエストの処理を Span（開始・終了時刻を持つ区間）の木として記録する。X-Ray SDK は使っていない。
+
+| 層 | どこで | 何の Span |
+|---|---|---|
+| ルート | `cmd/lambda/match_request/main.go` の `telemetry.StartLambda` → `otellambda.InstrumentHandler` | Lambda 呼び出し 1 回分（`service.name=match_request`） |
+| 子 | `db.NewClient` の `otelaws.AppendMiddlewares` | DynamoDB 呼び出し（`FindWaitingByPlayer` の Query、`PutTicket` の PutItem） |
+
+- 親子がつながるのは、ハンドラーが受け取った `ctx` をそのまま `db` に渡しているから（Span は Context に乗って運ばれる）
+- Lambda は応答後に凍結されるため、`WithFlusher` で呼び出しのたびに `ForceFlush` して送り切る
+- 送り先は `TRACE_EXPORTER` で切り替え: `xray` なら X-Ray の OTLP エンドポイント（HTTP + SigV4 署名）、それ以外は OTLP gRPC（ローカルの Jaeger）
+- 伝播形式は W3C `traceparent`。X-Ray ネイティブ（`X-Amzn-Trace-Id`）とは別系統なので、API Gateway や authorizer のトレースとはつながらない（前の Q「トレースが 2 本に分かれる」）
+
+**注意（2026-11-05 時点）**: Terraform の Lambda モジュールにはまだ `TRACE_EXPORTER=xray` が無い。受け側（Transaction Search・`xray:PutSpans`）は 6-c で整ったが、このまま AWS で動かすと gRPC の localhost へ送ろうとして Span は捨てられる。
+
+### Q. API Gateway と authorizer のトレースが、match_request のトレースと別になるのはなぜか
+
+**親になれるのが API Gateway だけなのに、その API Gateway が OTel の ID を渡していないため。**
+
+- **authorizer と match_request は親子ではなく兄弟。** API Gateway がまず authorizer を呼び、許可が出たら別に match_request を呼ぶ。authorizer が match_request を呼ぶわけではないので、authorizer から match_request へ `traceparent` が渡る経路がそもそも無い
+- **共通の親の API Gateway は ID を渡せる立場だが、形式が違う。** トレースを有効にした API Gateway は X-Ray 形式の `X-Amzn-Trace-Id` を付け、Lambda 基盤はそれを `_X_AMZN_TRACE_ID` で渡す。こちらの OTel は W3C `traceparent` を前提にしており、`otellambda` も既定では親を探さない（`EventToCarrier` は空を返す）。そのため、どちらの Lambda も呼ばれるたびに新しいトレースのルートになる
+- **今の dev では API Gateway のトレース自体が無い。** `api_gateway` モジュールで `xray_tracing_enabled` を設定しておらず、Lambda の `tracing_config` も無い。API Gateway の滞在時間はどのトレースにも出ない
+
+つなぐには、両方の Lambda の OTel が `_X_AMZN_TRACE_ID` を親として読むようにし（X-Ray 形式の propagator と ID 生成器）、API Gateway のトレースを有効にして共通の親を作る必要がある。
+
+### Q. OpenTelemetry（OTel）の基礎
+
+**OTel は「計測データの取り方と運び方」の業界標準。** 仕様・API・SDK・送信プロトコル（OTLP）をまとめて定めており、送り先（Jaeger、X-Ray、Datadog など）を選ばない。扱う信号はトレース・メトリクス・ログの 3 つで、RAIDYNC はトレースだけを使う（メトリクスとログは CloudWatch）。
+
+**用語**
+
+| 用語 | 意味 | RAIDYNC では |
+|---|---|---|
+| Trace | 1 リクエストの処理全体。TraceID（16 バイト）で識別 | match_request の 1 回の呼び出し |
+| Span | 処理の 1 区間。名前・開始/終了時刻・SpanID・親の SpanID・属性・状態を持つ。親子をたどると木になる | Lambda 呼び出し（ルート）、DynamoDB の Query / PutItem（子） |
+| Context | 「今どの Span の中にいるか」を運ぶ入れ物 | Go の `context.Context`（`ctx` の引き回し） |
+| Propagator | Context をプロセスの外へ運ぶための、ヘッダーへの書き出しと読み取り | `propagation.TraceContext{}`（W3C `traceparent`） |
+| Resource | どのサービスが出したかを示す属性 | `service.name=match_request` |
+| Exporter | Span を送り先へ送る部品。プロトコルは OTLP（gRPC / HTTP） | gRPC → Jaeger、HTTP + SigV4 → X-Ray |
+
+**API と SDK を分けている理由**: ライブラリは API（`otel.Tracer(...).Start(...)` などのインターフェース）だけに依存し、実体（SDK）はアプリの `main` が 1 回だけ設定する。SDK を設定しなければ API は何もしない実装になるので、ライブラリは計測コードを常に埋めておける。C# の `ILogger` と logging provider の関係に近い。.NET では `ActivitySource` / `Activity` が OTel の API に相当し、`Activity` が Span にあたる。
+
+**データの流れ（`telemetry.newProvider`）**
+
+```
+Tracer.Start → Span → SpanProcessor（WithBatcher：まとめて非同期に送る）→ Exporter → Jaeger / X-Ray
+                           ↑ TracerProvider が束ねる（otel.SetTracerProvider でグローバル登録）
+```
+
+**計測の付け方は 2 通り**: (1) 計測ライブラリを使う（`otellambda` が Lambda 呼び出し、`otelaws` が AWS SDK 呼び出しの Span を自動で作る）。(2) 自分で `tracer.Start(ctx, "name")` と `span.End()` を書く。RAIDYNC は今のところ (1) だけ。
+
+**`traceparent` の中身**: `00-<TraceID 32 桁>-<親 SpanID 16 桁>-<flags>`。受け取った側は同じ TraceID を使い、親 SpanID の下に子 Span をつなげる。X-Ray の `X-Amzn-Trace-Id` は同じ役割を持つ別の形式。
+
+### Q. 現状は、API Gateway と Lambda のトレースをつなぐ ID の形式が互いに対応していない、ということか
+
+**おおむねそう。ただし、つながらない理由は形式の違いだけではなく 3 つ重なっている。**
+
+| # | 理由 | どこを直すか |
+|---|---|---|
+| 1 | 形式が違う。API Gateway / Lambda 基盤は X-Ray 形式（`X-Amzn-Trace-Id` / `_X_AMZN_TRACE_ID`）、こちらの OTel は W3C `traceparent` しか読み書きしない | OTel に X-Ray 形式の propagator を入れる |
+| 2 | 形式が合っていても読みに行かない。`otellambda` は既定で親を探さず、呼び出しごとに新しいトレースを始める | `otellambda` に「`_X_AMZN_TRACE_ID` から親を読む」設定を渡す |
+| 3 | 親になる Span がそもそも記録されていない。dev は API Gateway の `xray_tracing_enabled` も Lambda の `tracing_config` も未設定 | Terraform でトレースを有効にする |
+
+1 だけ直しても 2 が残るとつながらない。1 と 2 を直せば OTel の Span は Lambda 基盤のトレースにぶら下がるが、3 が無いと API Gateway の区間は見えない。contrib には 1 と 2 をまとめた Lambda 向けの X-Ray 設定一式がある（どこまで要るかは実装時に確認する）。
+
+### Q. W3C 形式（`traceparent`）は、コードの具体的にどこで決まっているのか
+
+**`server/internal/telemetry/telemetry.go:42` の 1 行だけ。** `otel.SetTextMapPropagator(propagation.TraceContext{})` でグローバルの propagator を W3C Trace Context にしている。計測ライブラリは propagator を自分で持たず、既定でこのグローバルを `otel.GetTextMapPropagator()` で取りに来るため、この 1 行で全体の形式が決まる。
+
+| 使う側 | 向き | 何をするか | 実際の効果 |
+|---|---|---|---|
+| `otellambda`（Lambda 本体） | 読む（Extract） | イベントから作った carrier を読む | 既定の `EventToCarrier` は空の carrier を返すので、読んでも何も無い → 毎回新しいトレース |
+| `otelaws`（DynamoDB / GameLift） | 書く（Inject） | AWS SDK の HTTP リクエストのヘッダーに `traceparent` を付ける（otelaws `aws.go:94`） | AWS 側はこのヘッダーを使わないので、何も起きない |
+| `otelhttp`（localapi の各ハンドラー） | 読む（Extract） | 受け取った HTTP リクエストの `traceparent` を読む | k6 は `traceparent` を送らないので、毎回新しいトレース |
+
+**現状、W3C 形式でプロセスをまたいでつながっている箇所は無い。** 親子がつながっているのはプロセス内の `ctx` の引き回し（Lambda → DynamoDB）だけで、こちらは propagator を使わない。X-Ray とつなぐなら、この 1 行に X-Ray 形式の propagator を加える（または置き換える）ことになる。
+
+### Q. トレースをつなぐ理由は何か
+
+**まだ「つなぐ」と決めたわけではない（候補として挙げた段階）。つなぐ場合の理由は次の 3 つ。**
+
+1. **ロードマップの完了基準。** 6-3 の完了基準は「API→Lambda→DynamoDB のトレース確認」（docs/roadmap.md）。今の OTel だけでは Lambda→DynamoDB までしか見えず、API の区間が抜ける
+2. **クライアントが待つ時間の内訳が分かる。** クライアントの待ち時間は「API Gateway の滞在 + authorizer + Lambda のコールドスタート + ハンドラー」。OTel が見ているのはハンドラーだけ。6-5 で 8 人→40 人のとき `iteration_duration` の最大が 6.6s→11s に伸びたが、それがハンドラーの中（DynamoDB の競合など）なのか外なのかは、つながったトレースでないと切り分けられない。6-6 の 1,000 接続でも同じ問いが出る
+3. **1 リクエストを最後まで追える。** 401 や 5xx が出たとき、authorizer で落ちたのか本体で落ちたのかを同じ TraceID でたどれる。別々だと時刻やリクエスト ID で突き合わせることになる
+
+**つながない選択肢**: API Gateway の区間は CloudWatch のメトリクス（`Latency` − `IntegrationLatency`）でも大まかに分かる。つなぐ手間（propagator・`EventToCarrier` の設定・Terraform のトレース有効化）と、得られる情報を比べて決める。
+
+**判断（2026-11-05）: つなぐ。** 6-3 の完了基準を満たすことと、6-6 で遅延の内訳（ハンドラーの中か外か）を切り分けたいことが決め手。
+
+### Q. propagator を X-Ray 形式に置き換えるのと、W3C と併用するのとで、メリット・デメリットは何か
+
+前提: グローバルの propagator（`telemetry.go:42`）は Lambda と localapi で共通。使う側は `otellambda`（読む）、`otelaws`（AWS SDK のリクエストに書く。AWS 側は使わない）、`otelhttp`（localapi で読む）。Lambda が親を受け取るのは HTTP ヘッダーではなく環境変数 `_X_AMZN_TRACE_ID` なので、`EventToCarrier` でそれを carrier に詰め、propagator がその文字列を解釈する。
+
+| 案 | 書き方 | メリット | デメリット |
+|---|---|---|---|
+| 置き換え | `xray.Propagator{}` だけ | 1 形式で単純。AWS 側の形式と揃う | localapi も X-Ray 形式になる。今は k6 がどちらも送らないので実害は無いが、将来 Unity クライアントや別サービスが `traceparent` を送ってきても読めない。「ローカルは業界標準、AWS は X-Ray」という OTel を選んだ理由（送り先を選ばない）が薄れる |
+| 併用 | `propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, xray.Propagator{})` | どちらの形式でも読める。環境で分岐しない。将来 W3C の呼び出し元が来ても対応できる | 書くときは両方のヘッダーを付ける（無駄だが軽い）。読むときに両方あると後ろの propagator が勝つ、という順序の決まりを知っておく必要がある。なぜ 2 つあるのかをコメントで残す必要がある |
+| （第 3 案）Lambda だけ X-Ray | グローバルは W3C のまま、`StartLambda` で `otellambda.WithPropagator(xray.Propagator{})` を渡す | localapi は一切変わらない。Lambda 固有の事情が `StartLambda` に閉じる | propagator の指定が 2 か所に分かれる。Lambda 内の `otelaws` はグローバル（W3C）を使うので、同じプロセスで形式が混在する（今は実害なし） |
+
+**判断（2026-11-06）: 併用（Composite）。** 並べる順序は今のところ結果に影響しない（Lambda の carrier に入るのは `X-Amzn-Trace-Id` だけ、localapi に届くのは `traceparent` だけで、両方そろう場面が無い）。
+
+### Q. Lambda で親のトレース ID を読む設定（EventToCarrier）はどこに置き、どの部品を使うか
+
+**置き場所は `StartLambda` しかない。** `EventToCarrier` は `otellambda.Option` で、渡し先の `otellambda.InstrumentHandler` を呼ぶのが `StartLambda` だけだから。論点は「どの部品を使うか」になる。
+
+`otellambda/xrayconfig`（v0.72.0）の中身は小さい: `_X_AMZN_TRACE_ID` を `X-Amzn-Trace-Id` として carrier に詰める 3 行の関数、それと propagator（X-Ray のみ）を otellambda に渡す Option、それらに `WithTracerProvider`・`WithFlusher` を足した `WithRecommendedOptions(tp)`。`NewTracerProvider` は Exporter が gRPC・平文固定なので、X-Ray の OTLP エンドポイント（HTTP + SigV4）には使えない。
+
+| 案 | 内容 |
+|---|---|
+| ① 一式 | `xrayconfig.WithRecommendedOptions(tp)` |
+| ② 一部 | `xrayconfig.WithEventToCarrier()` ＋ 既存の `WithFlusher(tp)` |
+| ③ 自作 | 3 行の関数を自分で書いて `otellambda.WithEventToCarrier` に渡す |
+
+**判断（2026-11-06）: ①。** 帰結として、otellambda はグローバルの Composite ではなく `xrayconfig` の X-Ray 専用 propagator を使う。グローバルの X-Ray 部分が Lambda で効くのは `otelaws` の書き出し（AWS 側は使わない）だけになる。
+
+**判断（2026-11-07）: グローバルの Composite は W3C（`TraceContext{}`）だけに戻す。** ①を採ると otellambda は `xrayconfig` の X-Ray 専用 propagator を使うため、グローバルに入れた X-Ray 部分は Lambda でも localapi でも何にも効かない（`otelaws` が AWS SDK のヘッダーに書くだけで、AWS 側は使わない）。使われない部品を説明付きで残す理由が弱く、X-Ray 形式の扱いは `StartLambda` に閉じる方が読みやすい。論点 1 の「併用」は、論点 2 の選択によって不要になった。
+
+### Q. API Gateway が `Sampled=0`（記録しない）を付けたリクエストで、OTel の Span はどうなるか
+
+**記録されない（Span は作られるが、記録も送信もされない）。ハンドラー配下の DynamoDB の Span も同じく消える。**
+
+1. Lambda 基盤が `_X_AMZN_TRACE_ID`（例: `Root=1-…;Parent=…;Sampled=0`）を渡す
+2. `xrayconfig` の `EventToCarrier` と X-Ray propagator がそれを読み、親の SpanContext にする。`Sampled=1` 以外（`0` や項目なし）は「記録しない」フラグになる（`xray/propagator.go` の `parseTraceFlag`）
+3. 既定のサンプラーは `ParentBased(AlwaysSample())`（SDK `provider.go`）。親がプロセスの外から来て記録しない場合は `remoteParentNotSampled: NeverSample()` に当たり、otellambda のルート Span は記録されない
+4. 子の Span（`otelaws` の DynamoDB 呼び出し）は「ローカルの親が記録しない」なので、これも記録されない
+
+**変化**: 今まで（親を読まない）は全呼び出しが新しいルートとして `AlwaysSample` で 100% 記録されていた。つないだ後は、記録する割合を **API Gateway の X-Ray サンプリングルール**が決める。既定ルールは「毎秒最初の 1 件 + それ以降の 5%」なので、負荷テスト中はほとんどのトレースが残らない。
+
+**選択肢**
+
+| 案 | 内容 | メリット | デメリット |
+|---|---|---|---|
+| A. 従う | 既定ルールのまま | 一般的な本番の形。Span の量（= 費用）が抑えられる | 6-6 で遅いリクエストを探しても、そのトレースが残っていないことが多い |
+| B. ルールを変える | Terraform（`aws_xray_sampling_rule`）で API Gateway の割合を上げる（例: 負荷テスト中だけ 100%） | つながった 1 本のトレースのまま、全件を見られる。割合を IaC で切り替えられる | Span の量に比例して費用が増える。テスト後に戻すのを忘れない運用が要る |
+| C. 親の判断を無視 | OTel のサンプラーを `ParentBased(..., WithRemoteParentNotSampled(AlwaysSample()))` などにする | API Gateway の判断に関係なく Lambda 以降は全件残る | `Sampled=0` のときは API Gateway・Lambda 基盤側の Span が無いので、親が欠けた（つながらない）トレースになる。つなぐ目的と矛盾する |
+
+**未確認（ステップ 7 で見る）**: API Gateway のトレースを有効にする前（Lambda が `PassThrough`）に `_X_AMZN_TRACE_ID` に何が入るか。`Sampled=0` 付きの ID が入るなら、Terraform を当てる前の今の状態でも Span が記録されなくなる。
+
+**判断（2026-11-07）: 普段は A（既定ルールに従う）、負荷テストのときだけ B（サンプリングルールで割合を上げる）。** C は親が欠けたトレースになり、つなぐ目的と矛盾するため採らない。B の切り替え方（Terraform の変数で割合を変えるか、ルールを足し引きするか）は 6-d で決める。サンプリングルールはリージョンごとの設定なので、primary / secondary の両方に要る。
+
+### Q. X-Ray 形式の ID 生成器（`xray.NewIDGenerator()`）は何のために使うつもりだったのか
+
+**自分がルートになるトレースの TraceID を、X-Ray が受け付ける形式にするため。ただし、今回の構成では要らない可能性が高い。**
+
+- X-Ray の旧来の TraceID は「先頭 8 桁（16 進）= 生成時刻の UNIX 秒、残り 24 桁 = 乱数」。OTel の既定は 32 桁すべて乱数（W3C 形式）で、昔の X-Ray は先頭が時刻として不自然な ID を受け付けなかった。生成器はこの差を埋める部品
+- 効くのはルートになるときだけ。API Gateway から親を受け取れば TraceID は親のものを引き継ぐ。Lambda でルートになるのは親が無い・読めないときくらい
+- 論点として挙げたきっかけは、`xrayconfig.NewTracerProvider` の中で使われていたこと。RAIDYNC の設計上、具体的に困る場面があったわけではない
+- AWS は 2023-10 に「X-Ray が W3C 形式の TraceID を受け付けるようになった」と発表している（条件として CloudWatch エージェント / ADOT Collector のバージョンが挙がっている）。RAIDYNC は OTLP エンドポイントへ直送するので、その経路でも受け付けると考えられるが、資料での確認はできていない
+
+**判断（2026-11-09）: 今は入れない。** ステップ 7 で、6-d 適用前（Lambda が PassThrough）に親の無い Span が X-Ray に届くかを確認し、拒否されていたら入れる（次の Q のとおり、6-d 適用後の通常経路ではルートにならない）。
+
+### Q. Lambda で「親が無い・読めない」ためルートになる場面は、実際にあるのか
+
+**6-d（API Gateway のトレース有効化・Lambda の `Active`）を当てた後の通常経路では無い。** `aws-lambda-go` v1.55.1 の `lambda/invoke_loop.go:66-70` は、呼び出しごとに Lambda 基盤の `Lambda-Runtime-Trace-Id` ヘッダーを `_X_AMZN_TRACE_ID` に入れ、`xrayconfig` はそれを読む。
+
+| ケース | ルートになるか |
+|---|---|
+| API Gateway 経由・6-d 適用後 | ならない（`Sampled=0` でも親の ID は届く） |
+| API Gateway 経由・6-d 適用前（PassThrough） | 未確認。`Parent=` が無ければ親として無効になりルートになる（ステップ 7 で確認） |
+| API Gateway 以外（`aws lambda invoke`・コンソールのテスト実行） | Terraform が許可している呼び出し元は `apigateway.amazonaws.com` だけなので手作業のときのみ。`Active` なら基盤が親を作るのでならない |
+| 1 つの実行環境で同時に複数呼び出しを処理する構成（`AWS_LAMBDA_MAX_CONCURRENCY` > 1） | なる。上のコードは `MaxConcurrency() == 1` のときだけ環境変数をセットする。RAIDYNC は通常の Lambda なので該当しない |
+| localapi | 毎回ルートだが送り先は Jaeger なので無関係 |
+
+ID 生成器が効くのは 6-d 適用前と手作業の呼び出しくらいで、本番の経路には無い。「入れない」判断は変わらない。
