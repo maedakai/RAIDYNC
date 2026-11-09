@@ -2785,3 +2785,58 @@ ID 生成器が効くのは 6-d 適用前と手作業の呼び出しくらいで
 - **API Gateway**: `aws_api_gateway_stage` に `xray_tracing_enabled = true` を足すだけ。ステージの設定なので再デプロイは要らず、IAM も要らない。`aws_lambda_permission`（`execution_arn`）は「API Gateway が Lambda を呼んでよいか」という呼び出しの許可で、トレースとは別物（既に設定済み）。**判断（2026-11-09）: 変数にせず常に `true`。** 普段は既定のサンプリングで量が少なく、切り替える理由が今は無い（Transaction Search と同じ扱い）
 - **Lambda の `tracing_config.mode`**: `PassThrough` は上流の ID を中継するだけ、`Active` は Lambda 基盤が自分の区間（コールドスタートの Init、呼び出しのオーバーヘッド）も記録する。**判断（2026-11-09）: `Active`。** 6-3 の目的にコールドスタートなどハンドラー外の時間の確認が入っているため。代わりに Lambda の実行ロールに旧来の `xray:PutTraceSegments` 等の権限が要る（6-d の 4）
 - **`TRACE_EXPORTER`**: 6 関数すべてに同じ値が要るので、`locals` の `common_env` に置き、`functions_resolved` で `merge(local.common_env, cfg.env)` する（後ろの関数ごとの値が勝つ）。**判断（2026-11-09）: 変数にせず `"xray"` を直接書く。** Lambda は AWS でしか動かないので値が変わらない。変数にして既定値を空にすると、空文字を落とす `functions_resolved` によって環境変数ごと消え、`validate` は通るのに Span が届かない状態になる（実際に一度そうなりかけ、`plan` で確認して気づける類の誤り）
+
+### Q. 6-c / 6-d の apply が `AccessDenied` で途中まで失敗したのはなぜか
+
+**apply する側（`raidync-cli`）の権限不足。Lambda の実行ロールの権限とは別の話。** `raidync-cli` の権限は `terraform/bootstrap/raidync-cli-deploy-policy.json`（管理ポリシー `raidync-cli-deploy`）で、使うサービスだけに絞っている。
+
+| 失敗したリソース | 足りなかった権限 | 理由 |
+|---|---|---|
+| `aws_iam_policy.xray` と attachment 2 つ | `iam:CreatePolicy` など | これまで IAM で許可していたのはロール（`role/raidync-dev-*`）だけ。自前の管理ポリシーを作るのは 6-c が初めて |
+| `awscc_xray_transaction_search_config` ×2 | `xray:GetTraceSegmentDestination` など | デプロイポリシーに `xray` が無かった |
+
+ステージ・Lambda・ロググループのリソースポリシーは適用済みになり、残りは `Plan: 5 to add`。この間も API は動くが、Lambda の Span 送信は 403 で捨てられる。
+
+**追加した権限（2026-11-09）**: `xray:*`（使うサービスは丸ごと許可する既存の方針に合わせた。6-d の 5 のサンプリングルールもこれで作れる）、`policy/raidync-dev-*` に限定した管理ポリシーの操作、Transaction Search の有効化に要る `application-signals:StartDiscovery`・Application Signals のサービスリンクロール（作成と `GetRole`）・`cloudtrail:CreateServiceLinkedChannel`。根拠は AWS ドキュメント「Enable transaction search」の Prerequisites と、CloudFormation `AWS::XRay::TransactionSearchConfig` の create ハンドラーの必要権限。
+
+**気づけなかった理由**: `plan` は読み取りしかしないので、作成の権限が足りなくても通る。`validate` も同じ。作成系の権限は apply するまで（または IAM Policy Simulator で試すまで）分からない。
+
+### Q. つないだ結果、AWS dev で 1 本のトレースになったか（6-3 ステップ 7）
+
+**なった。** `POST /match/request` を 1 回送り、Logs Insights で `aws/spans` を引いた（2026-11-09）。18 行すべてが同じ TraceID（`6af1dbeb…`）で、親子は次のとおり（ms は所要時間。`LambdaService` などが 2 行ずつ出るのは、処理中の途中経過と完了後の 2 回記録されるため）。
+
+```
+raidync-dev-api  POST /match                              1621 ms  ← API Gateway（ルート）
+├ raidync-dev-authorizer/LambdaService                     509 ms  ← Lambda 基盤（Active）
+│  └ LambdaExecutionEnvironment                             77 ms
+│     ├ Init                                               212 ms  ← コールドスタート
+│     ├ authorizer（OTel / otellambda）                     2.4 ms
+│     └ Overhead                                           0.2 ms
+└ awslambda.Invoke                                        1000 ms  ← API Gateway → 本体
+   └ raidync-dev-match_request/LambdaService              1062 ms
+      └ LambdaExecutionEnvironment                         715 ms
+         ├ Init                                            139 ms  ← コールドスタート
+         ├ match_request（OTel / otellambda）               634 ms
+         │  ├ DynamoDB.Query（otelaws）                     626 ms
+         │  └ DynamoDB.PutItem（otelaws）                     7 ms
+         └ Overhead                                        0.3 ms
+```
+
+- **つながったことの確認**: OTel の Span（`authorizer`・`match_request`）の親が、Lambda 基盤の `LambdaExecutionEnvironment` になっている。`xrayconfig` が `_X_AMZN_TRACE_ID` から親を読めている
+- **見えるようになったもの**: API Gateway の全体 1.6 秒のうち、コールドスタート（Init）が authorizer 212 ms・本体 139 ms。ハンドラー内では最初の DynamoDB Query が 626 ms と突出し、次の PutItem は 7 ms。初回の接続確立（TLS など）がハンドラーの中に乗っていると読める（要検証）。OTel だけでは Init と API Gateway の区間は見えなかった
+- **`get-trace-summaries` は空だった**: Transaction Search の索引付け（indexing）を 1% にしているため、トレースの一覧（X-Ray のトレース画面）に載るのは一部だけ。Span そのものは `aws/spans` に全部入るので、確認は Logs Insights（Transaction Search の画面）で行う
+- **ID 生成器**: 親の無い Span は API Gateway のルートだけで、Lambda の Span はすべて親を持っていた。入れなかった判断で問題なかった
+
+### Q. AWS コンソールでトレースを確認できるか
+
+**できる。`raidync-admin` でログインし、CloudWatch の画面から見る**（`raidync-cli` はコンソールにログインできない）。リージョンは東京（ap-northeast-1）。
+
+| 見たいもの | 場所 |
+|---|---|
+| 1 本のトレースのウォーターフォール | CloudWatch → 「X-Ray traces」→「Traces」で TraceID を検索。X-Ray 形式の ID は `1-<先頭 8 桁>-<残り 24 桁>`（例: `1-6af1dbeb-0a595cde1e00781b3f48e0b5`） |
+| Span を条件で探す | CloudWatch → 「Application Signals」→「Transaction search」。`aws/spans` を画面上で検索する機能 |
+| Span の生データ | CloudWatch → 「Logs Insights」でロググループ `aws/spans` を選んで問い合わせる |
+| サービス間のつながりの図 | CloudWatch → 「X-Ray traces」→「Trace map」 |
+
+- 索引付けを 1% にしているので、「Traces」の一覧に出てくるのは一部だけ。一覧に無いトレースは、TraceID を直接指定するか Transaction search で探す（**確認結果**: 索引の無いトレースは「Traces」の詳細画面でも開けない。`aws xray batch-get-traces` で `6af1dbeb…` を指定すると、`Traces` も `UnprocessedTraceIds` も空で返った。コンソールの詳細画面は同じ API を使うので、表示されない。Span は `aws/spans` に入っているので、Transaction search と Logs Insights では見られる）
+- TraceID の先頭 8 桁は生成時刻の UNIX 秒（`6af1dbeb` = 1794235371 = 2026-11-09 14:42:51 UTC）。API Gateway が X-Ray 形式で作り、Lambda の OTel がそれを引き継いでいる
