@@ -213,6 +213,7 @@ module "monitoring" {
   source               = "../../modules/monitoring"
   alarm_function_names = module.lambda.function_names
   notification_email   = var.notification_email
+  sampling_fixed_rate  = var.sampling_fixed_rate
   tags                 = var.tags
 }
 
@@ -224,6 +225,7 @@ module "monitoring_secondary" {
   }
   alarm_function_names = module.lambda_secondary.function_names
   notification_email   = var.notification_email
+  sampling_fixed_rate  = var.sampling_fixed_rate
   tags                 = var.tags
 }
 

@@ -99,3 +99,22 @@ resource "awscc_xray_transaction_search_config" "this" {
   depends_on          = [aws_cloudwatch_log_resource_policy.xray]
   indexing_percentage = 1
 }
+
+# どのリクエストを記録するか（サンプリング）を決めるルール。API Gateway が入口で判定し、結果は
+# 下流の Lambda にも引き継がれる（記録しないと決まったリクエストは Lambda の Span も送られない）。
+# 条件はすべて "*" で全リクエストに当てる。priority 9999 は既定ルール（10000）より優先されるため、
+# 割合は常にこのルールの fixed_rate で決まる。普段は既定ルールと同じ値（毎秒 1 件 + 5%）にしておき、
+# 遅いリクエストを全件追いたいときだけ変数で 1.0 に上げる（取り込み課金が増えるため検証後は戻す）。
+resource "aws_xray_sampling_rule" "this" {
+  rule_name      = "raidync-dev-sampling-rule"
+  priority       = 9999
+  fixed_rate     = var.sampling_fixed_rate
+  reservoir_size = 1
+  service_name   = "*"
+  service_type   = "*"
+  resource_arn   = "*"
+  host           = "*"
+  http_method    = "*"
+  url_path       = "*"
+  version        = 1
+}
