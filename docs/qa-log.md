@@ -2955,3 +2955,94 @@ CLI なら `aws service-quotas request-service-quota-increase --service-code lam
 **どの値を申請するか**: AWS の通常の既定値 1,000 が目安。6-6 の最大は約 2,000 リクエスト/秒で、1 回の呼び出しで 2 関数が動き、それぞれ数十 ms かかる。同時実行は「1 秒あたりのリクエスト数 × 実行時間」なので、2,000 × (0.05 + 0.05) 秒 ≒ 200 になる。これにコールドスタートで長引く分を見込んでも、1,000 で足りる。
 
 **IaC との関係**: クォータはリソースではなく「アカウントの上限」なので、コンソールでの申請は IaC 違反にはあたらない（Terraform の `aws_servicequotas_service_quota` でも申請はできるが、申請は一度きりで state に持つ意味が薄い）。
+
+
+### Q. 6-6（AWS での負荷テスト）の規模と範囲をどう決めたか
+
+**判断（2026-11-11）: 人数は段階的に増やし、範囲はマッチ成立までにする。**
+
+- **人数を段階的に増やす**: 目標は文書によって「1,000 接続」（roadmap）と「同時セッション 1,000＝接続 4,000」（CLAUDE.md）に分かれている。いきなり最大の規模で失敗すると、どこが詰まったか切り分けにくい。小さい規模から増やし（例: 100 → 1,000 → 4,000）、段ごとに結果を見てから次に進む
+- **範囲はマッチ成立まで**: GameLift のフリートは起動しない（`enable_gamelift = false`）。`match_status` は `GAMELIFT_FLEET_ID` が空なら `GameLiftStub` を使うので、コードを変えずにマッチ成立と Sessions への書き込みまでが動く。測るのは API Gateway・Lambda・DynamoDB の負荷だけで、GameLift の時間課金と容量計算が要らない
+- 先送りしていたセカンダリの GameLift の実機確認と 6-7（オートスケーリング）は、6-6 とは別の機会に行う
+
+### Q. Terraform の `test_user_count` でユーザーを作り、`call-api.sh` で回せば、実際に API を叩くことになるか
+
+**なる。ただし `call-api.sh` は負荷テストには使えない。**
+
+- `test_user_count` は Cognito にユーザー（`player1@…` からの連番、共通パスワード）を作るだけで、API は叩かない
+- `call-api.sh` は、指定したユーザー（`USER_EMAIL`）でログインし、本物の API Gateway → authorizer → Lambda → DynamoDB に 1 本送る
+- `call-api.sh` は 1 回の呼び出しで `terraform output` を 3 回実行し、Cognito にログインしてから 1 本だけ送る。1 本に数秒かかるので、数百〜数千人が 2 秒ごとにポーリングする負荷は作れない
+
+6-6 での役割分担: ユーザーの用意は Terraform（または別の方法）、ログインと並列のポーリングは k6（6-5 の `load-test-small.js` の宛先を AWS にした形）、`call-api.sh` は動作確認で 1 本叩く道具のまま。
+
+### Q. Cognito のテストユーザーは、メールの確認をしないと使えないのではないか
+
+**管理者用の API で作れば、メールを確認しなくてもログインできる。** Cognito はユーザーごとに 2 つの状態を別々に持つ。
+
+| 状態 | 意味 | ログインに必要か |
+|---|---|---|
+| ユーザーの状態（`UserStatus`: UNCONFIRMED / CONFIRMED など） | アカウントが有効か | 必要（CONFIRMED でないと `InitiateAuth` が失敗する） |
+| メールの確認済みフラグ（属性 `email_verified`） | メールアドレスの持ち主だと確かめたか | 不要（パスワードリセットのメール送信などで使われる） |
+
+メールのコードの入力は、UNCONFIRMED を CONFIRMED にする手段の 1 つにすぎない。
+
+- **`SignUp` → `AdminConfirmSignUp`**: コードなしで CONFIRMED にできる。ただし `SignUp` の時点で確認メールが送られる（`auto_verified_attributes = ["email"]` のため）。宛先が存在しない `example.com` でも送信は行われ、1 日の送信上限にも数えられる
+- **`AdminCreateUser`（`MessageAction = SUPPRESS`、`email_verified = true`）→ `AdminSetUserPassword`（`Permanent = true`）**: メールを一度も送らずに CONFIRMED のユーザーができる
+
+後者は Terraform の `aws_cognito_user.test` と同じ作り方（`message_action = "SUPPRESS"`、`email_verified = true`、`password` の指定）。`player1@example.com` はメールを受け取っていないのにログインでき、API も叩けている。
+
+### Q. 6-6 の k6（`load-test-large.js`）は `k6 run tests/load/load-test-large.js` だけで実行できるか
+
+**できない。先に AWS の認証情報を環境変数に入れる必要がある。** k6 は `~/.aws/credentials` のプロファイルを読まないため、`setup()` で Cognito の管理者用 API（`AdminCreateUser` など）に SigV4 署名するための `__ENV.AWS_ACCESS_KEY_ID` などが空になり、`sign()` が失敗する。
+
+```bash
+# Git Bash
+eval "$(aws configure export-credentials --format env)" && k6 run -q --vus 1 --iterations 1 --no-thresholds tests/load/load-test-large.js
+```
+
+```powershell
+# PowerShell
+aws configure export-credentials --format powershell | Invoke-Expression
+k6 run -q --vus 1 --iterations 1 --no-thresholds tests/load/load-test-large.js
+```
+
+- `aws configure export-credentials` は、AWS CLI が使っている認証情報（raidync-cli）を環境変数を設定する文の形で出す。`eval` / `Invoke-Expression` で実行するので、画面には出ない
+- `--vus 1 --iterations 1` はスクリプトの `scenarios` より優先される。付けないと `options` のとおり 1,000 VU で 3 分回る。`setup()` は回数の指定に関係なく最初に 1 回だけ実行される
+- `--no-thresholds` は、しきい値の判定を行わない（`setup()` だけを試している段階で `matched` の指標がまだ無いため）
+
+### Q. k6 の `setup()` で作ったテストユーザーは、どう後片付けするか
+
+**`teardown()` で消すことを基本にし、`setup()` の途中で失敗した場合はその場で消す。それでも残ったものは別の掃除スクリプトで一掃する（2026-11-15 決定）。**
+
+- `teardown(data)` は負荷の後に 1 回だけ動き、`setup()` の戻り値を受け取る。`setup()` が `runId` と `tokens` を返し、`teardown()` は `tokens.length` 人分の `${runId}+${i}@example.com` を `AdminDeleteUser` で消す
+- 削除の失敗は `throw` せず、ユーザー名をログに出して最後まで続ける（1 人の失敗で残り全員が残るのを防ぐ）。作成側（`setup()`）は失敗したら止める。失敗をどう扱うかは呼び出し側が決め、`callCognito` は署名して送るだけにする
+- k6 は **`setup()` が `throw` で終わると `teardown()` を呼ばない**。そのため、途中で失敗したときは `setup()` の中で、それまでに作ったユーザー（作成済みでログインに失敗した人も含む）を消してから改めて `throw` する（案 A）
+- ネットワーク断や k6 の強制終了など、それでも残るケースのために、`@example.com` のテストユーザーをまとめて消す掃除スクリプトを用意する（案 C）。Terraform 管理の `player1〜4` は対象から外す
+- 退けた案: 失敗時のログに `runId` を出して手で消すだけ（案 B）。数百人規模で途中失敗すると手作業が重い
+- 掃除スクリプトの対象の絞り方: メールアドレスの先頭に**負荷テスト用の固定の文字列**を付け、`list-users --filter 'email ^= "<固定の文字列>"'` で選ぶ。`runId`（作成時刻のミリ秒）の前方一致だけだと、「何回目の実行か」を知る必要があるうえ、短い前方一致（`1794` など）は「その時期に作った」という偶然の一致でしか当たらない。固定の文字列なら、テストユーザーであること自体で選べ、Terraform 管理の `player1〜4@example.com` に当たることもない
+- Cognito の `--filter` は完全一致（`=`）と前方一致（`^=`）だけで、部分一致はできない。そのため固定の文字列は先頭に置く
+- 名前の付け方を変える前に作った 9 人（`1794…@example.com`）は新しい付け方に当てはまらないので、一度だけ別に消す
+
+### Q. Git Bash で AWS CLI の出力をループに渡すと、値がおかしくなるのはなぜか
+
+**Windows の AWS CLI は `--output text` の行末を CRLF（`\r\n`）で出すため。** Bash の `for X in $LIST` は空白・タブ・`\n` で区切るので、`\r` が値の末尾に残る。`--username "xxx@example.com\r"` は Cognito のユーザー名の形式に合わず `InvalidParameterException` になる（`\r` なしなら見つかる。2026-11-15 に確認）。
+
+- 対処: `LIST=$(aws ... --output text | tr -d '\r')` のように、受け取る側で `\r` を消す。パイプ `|` は左の出力を右の入力に渡すので、`aws` の後に `tr` を置く
+- 引用符の違い: `'…'` はそのまま、`"…"` は中の `$変数` を展開、`` `…` `` は中身をコマンドとして実行する（`$( )` の古い形）。`` tr -d `\r` `` と書くと `r` というコマンドを実行しようとする
+- `--filter` に変数を入れるときは外側を `"`、内側を `\"` にする（`"email ^= \"$PREFIX\""`）
+- `.tf` の CRLF（ヒアドキュメントの値が変わり plan に偽の差分）と同じく、Windows 特有の改行の問題
+
+### Q. 6-6 の k6 で、4 人そろっているのにマッチが成立しないことがあるのはなぜか
+
+**`match_status` の競合のバグ。確保（`ClaimTickets`）の後の `MarkMatched` が、負けた側のトランザクションとぶつかって 500 になり、チケットが `MATCHING` のまま止まる（2026-11-15 に AWS dev で発見）。**
+
+- 4 VU がほぼ同時に `match/status` を送ると、複数の Lambda が同時に `TryMatch` を実行する
+- Lambda A が `ClaimTickets`（`TransactWriteItems`）で 4 枚を `WAITING → MATCHING` にした直後、Lambda B も同じ 4 枚に `ClaimTickets` を送る。B は条件不一致で最終的に失敗するが、判定中は「トランザクション進行中」になる
+- その間に A の `MarkMatched`（普通の `UpdateItem`）が届くと `TransactionConflictException: Transaction is ongoing for the item` で失敗し、A は 500 を返す
+- `MarkMatched` は 1 枚ずつ順に処理するので、ぶつかる前の分だけ MATCHED になる（4 人中 1 人だけ成立した回があった）
+- 残りは `MATCHING` のまま誰も進めない。`TryMatch` は `WAITING` 以外をそのまま返すだけで、`TIMEOUT` にもしない。クライアントは 70 秒待って諦め、`PutSession` 済みのセッションも宙に浮く
+- 楽観ロックは「2 人が同じチケットを確保する」ことは防げている。抜けていたのは「確保した後の書き込み」と「失敗したときに止まった状態を戻す・救う手段」
+- ローカル（LocalStack で 1 プロセス）では、ここまで同時に重ならないので出なかった
+- 4 VU で 3 回中 2 回発生。エラーログは `"msg":"match processing failed","status":500`、`ErrorKind=match_processing_failed`
+
+対応は後回しにし、k6 のスクリプトを先に仕上げる。人数を段階的に増やす前には直す（このままでは `matched: rate==1` が毎回失敗する）。
