@@ -27,7 +27,8 @@ type Store interface {
 	GetTicket(ctx context.Context, ticketID string) (*protocol.Ticket, error)
 	QueryWaitingByQuest(ctx context.Context, questID string, limit int32) ([]protocol.Ticket, error)
 	ClaimTickets(ctx context.Context, tickets []protocol.Ticket) error
-	MarkMatched(ctx context.Context, ticketID, sessionID string, conn protocol.ConnectionInfo) error
+	MarkMatched(ctx context.Context, tickets []protocol.Ticket, sessionID string, conn protocol.ConnectionInfo, playerSessions map[string]string) error
+	MarkFailed(ctx context.Context, tickets []protocol.Ticket) error
 	PutSession(ctx context.Context, s protocol.Session) error
 	TimeoutTicket(ctx context.Context, ticketID string) error
 }
@@ -160,13 +161,18 @@ func (m *Matcher) finalize(ctx context.Context, self *protocol.Ticket, group []p
 		return nil, err
 	}
 
-	// 各チケットには「共通 conn ＋ 本人の playerSessionId」を配る（1 プレイヤー 1 枠）。
-	for _, g := range group {
-		pc := conn
-		pc.PlayerSessionID = playerSessions[g.PlayerID]
-		if err := m.store.MarkMatched(ctx, g.TicketID, sessionID, pc); err != nil {
-			return nil, err
+	// グループ全員を 1 つのトランザクションで MATCHED にする（全員なるか、誰もならないか）。
+	// 1 枚ずつ書くと途中で失敗したときに「一部だけ MATCHED」が残り、MATCHED を見た
+	// クライアントはポーリングをやめるので取り消せない。本人の playerSessionId は MarkMatched が配る。
+	if err := m.store.MarkMatched(ctx, group, sessionID, conn, playerSessions); err != nil {
+		if errors.Is(err, db.ErrTransactionConflict) {
+			if err := m.store.MarkFailed(ctx, group); err != nil {
+				return nil, err
+			}
+			self.Status = protocol.StatusFailed
+			return self, nil
 		}
+		return nil, err
 	}
 
 	selfConn := conn

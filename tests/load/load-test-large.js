@@ -160,7 +160,7 @@ export default function(data) {
         const ticketId = response.json().ticketId;
     check(response, { 'request is 200': (r) => r.status === 200 })
     let state = '';
-    while (state !== 'MATCHED' && state !== 'TIMEOUT'&& Date.now() < deadline) {
+    while (state !== 'MATCHED' && state !== 'TIMEOUT'&&state!== 'FAILED'&& Date.now() < deadline) {
         sleep(2);
         response = http.get(`${API_URL}/match/status/${ticketId}`,
         {headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${data.tokens[exec.vu.idInTest - 1]}` } });

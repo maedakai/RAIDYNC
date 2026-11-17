@@ -10,10 +10,11 @@ import (
 // fakeStore はテスト用のインメモリ Store 実装。
 // DynamoDB の楽観ロック挙動（version + status 条件）を再現し、Lock の競合や TIMEOUT 競合を検証可能にする。
 type fakeStore struct {
-	tickets    map[string]*protocol.Ticket
-	sessions   map[string]*protocol.Session
-	claimErr   error // 設定時は ClaimTickets が常にこのエラーを返す（競合シミュレーション）
-	timeoutErr error
+	tickets        map[string]*protocol.Ticket
+	sessions       map[string]*protocol.Session
+	claimErr       error // 設定時は ClaimTickets が常にこのエラーを返す（競合シミュレーション）
+	timeoutErr     error
+	markMatchedErr error // 設定時は MarkMatched が常にこのエラーを返す（送り直しても衝突した場合のシミュレーション）
 }
 
 func newFakeStore() *fakeStore {
@@ -67,15 +68,32 @@ func (f *fakeStore) ClaimTickets(_ context.Context, tickets []protocol.Ticket) e
 	return nil
 }
 
-func (f *fakeStore) MarkMatched(_ context.Context, ticketID, sessionID string, conn protocol.ConnectionInfo) error {
-	cur, ok := f.tickets[ticketID]
-	if !ok {
-		return db.ErrConflict
+func (f *fakeStore) MarkMatched(_ context.Context, tickets []protocol.Ticket, sessionID string, conn protocol.ConnectionInfo, playerSessions map[string]string) error {
+	if f.markMatchedErr != nil {
+		return f.markMatchedErr
 	}
-	cur.Status = protocol.StatusMatched
-	cur.SessionID = sessionID
-	connCopy := conn
-	cur.ConnectionInfo = &connCopy
+	for _, t := range tickets {
+		cur, ok := f.tickets[t.TicketID]
+		if !ok {
+			return db.ErrConflict
+		}
+		cur.Status = protocol.StatusMatched
+		cur.SessionID = sessionID
+		connCopy := conn
+		connCopy.PlayerSessionID = playerSessions[t.PlayerID]
+		cur.ConnectionInfo = &connCopy
+	}
+	return nil
+}
+
+func (f *fakeStore) MarkFailed(_ context.Context, tickets []protocol.Ticket) error {
+	for _, t := range tickets {
+		cur, ok := f.tickets[t.TicketID]
+		if !ok {
+			return db.ErrConflict
+		}
+		cur.Status = protocol.StatusFailed
+	}
 	return nil
 }
 

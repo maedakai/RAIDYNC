@@ -19,7 +19,9 @@ const (
 // ---------------------------------------------------------------------------
 
 // TicketStatus はマッチメイキングチケットのライフサイクル状態。
-// 遷移: WAITING → MATCHING → MATCHED / TIMEOUT / CANCELLED
+// 遷移: WAITING → MATCHING → MATCHED / FAILED、WAITING → TIMEOUT / CANCELLED。
+// FAILED は、揃って確保したが MATCHED を書き込めなかった（トランザクションの衝突が解けなかった）状態。
+// TIMEOUT（60 秒待っても揃わなかった）とは原因が違うが、クライアントはどちらも match/request を出し直す。
 type TicketStatus string
 
 const (
@@ -28,6 +30,7 @@ const (
 	StatusMatched   TicketStatus = "MATCHED"   // セッション確定、接続情報あり
 	StatusTimeout   TicketStatus = "TIMEOUT"   // 60 秒経過で不成立
 	StatusCancelled TicketStatus = "CANCELLED" // クライアントがキャンセル
+	StatusFailed    TicketStatus = "FAILED"    // 確定の書き込みが衝突で失敗。出し直す
 )
 
 // ---------------------------------------------------------------------------

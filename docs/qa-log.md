@@ -3043,6 +3043,20 @@ k6 run -q --vus 1 --iterations 1 --no-thresholds tests/load/load-test-large.js
 - 残りは `MATCHING` のまま誰も進めない。`TryMatch` は `WAITING` 以外をそのまま返すだけで、`TIMEOUT` にもしない。クライアントは 70 秒待って諦め、`PutSession` 済みのセッションも宙に浮く
 - 楽観ロックは「2 人が同じチケットを確保する」ことは防げている。抜けていたのは「確保した後の書き込み」と「失敗したときに止まった状態を戻す・救う手段」
 - ローカル（LocalStack で 1 プロセス）では、ここまで同時に重ならないので出なかった
+- ぶつかるのは**書き込み同士**（A の `UpdateItem` と B の `TransactWriteItems`）。`GetItem` や `Query` の読み取りは、トランザクション中の項目でも `TransactionConflictException` にならない。失敗して止まるのは、先に確保して勝った A の方で、負けた B は `ErrConflict` として正常に WAITING を返す
+- B が確保済みのチケットを確保しに行くのは、読んだ時点で `WAITING` に見えたから。理由は、(1) A の確保より前に読み終えていた、(2) 読み取りが結果整合で古い値を返した、の 2 つ。`GetTicket` の `GetItem` は `ConsistentRead` を指定しておらず、`QueryWaitingByQuest` は GSI（`questId-status-index`）への Query で、**GSI は強い整合性の読み取りを選べない**
 - 4 VU で 3 回中 2 回発生。エラーログは `"msg":"match processing failed","status":500`、`ErrorKind=match_processing_failed`
 
 対応は後回しにし、k6 のスクリプトを先に仕上げる。人数を段階的に増やす前には直す（このままでは `matched: rate==1` が毎回失敗する）。
+
+対応の方針（2026-11-16 決定）:
+
+- **衝突したら自分で送り直す**（最初の 1 回＋送り直し 3 回）。AWS SDK for Go v2（v1.47.1）の自動リトライの対象に `TransactionConflictException` は入っていない（`aws/retry/standard.go` で確認。似た名前の `TransactionInProgressException` は対象だが、冪等性トークンの二重送信の例外で別物）。SDK の設定でリトライ対象に足すとクライアントのすべての操作に効くため、今回の箇所だけで送り直す
+- **MATCHED への書き込みを 1 つのトランザクションにまとめる**。今は 1 枚ずつ `UpdateItem` しているため「一部だけ MATCHED」の状態が生まれ、MATCHED を一度見たクライアントはポーリングをやめるので後から取り消せない。`ClaimTickets` と同じく `TransactWriteItems` にすれば、全員 MATCHED か誰もならないかのどちらかになる
+- **送り直しても失敗したら、グループ全員を `FAILED`（新しい状態）にする**。まとめて書くので、この時点で MATCHED の人はいない
+- 退けた案: 削除（クライアントには 404 にしか見えない）、`TIMEOUT`（「60 秒待っても揃わなかった」と意味が違う）、`WAITING` に戻す（作成済みのセッションと二重になる）
+- 実装の分担（2026-11-17）: `MarkMatched` は `db` 側で送り直す（`TransactionConflict` は DynamoDB の都合なので `db` が扱う）。衝突の見分けは `TransactionCanceledException` の `CancellationReasons` に `TransactionConflict` があるか。`ConditionalCheckFailed`（条件に合わない）は送り直しても通らないので、すぐ返す。4 回とも衝突したら新しい `db.ErrTransactionConflict` を返す（既存の `ErrConflict` は「条件に合わなかった」の意味で使われているので分ける）。待つ時間は 50 → 100 → 200ms の指数バックオフ
+- `FAILED` は `pkg/protocol` の `TicketStatus` に足す。`finalize` が `errors.Is(err, db.ErrTransactionConflict)` を見たら、グループ全員を `MATCHING → FAILED` にする（新しい `db` の関数）。`match/status` は 200 で `status: FAILED` を返し、クライアント（k6 も）は `FAILED` でポーリングをやめて出し直す
+- 宿題にしたもの（2026-11-17）: (1) `FAILED` にしたときの作成済みセッションの片付け（`PutSession` の `ACTIVE` レコードと GameLift のゲームセッション。GameLift の座席は誰も来なければ GameLift が解放する）、(2) `finalize` の途中で Lambda 自身がタイムアウト・クラッシュした場合に `MATCHING` で残るチケットの救済（例: `TryMatch` で `MATCHING` になってから一定時間たったものを `FAILED` にする。`MATCHING` になった時刻の属性が必要）。どちらも「失敗した後に残るものの掃除」なので、まとめて設計する。6-6 で人数を増やすのを止めているのは衝突の方で、こちらではない
+- 修正後の確認（2026-11-17、AWS dev、4 VU で 3 分）: `matched` 89.47%（76 回中 68 回）→ **100%（312 回中 312 回）**、`http_req_failed` 0.38%（2 本）→ **0%（658 本中 0 本）**、回せた回数は 76 → 312 回（成立しなかった回が 70 秒待たされなくなったため）。デプロイ後の `match_status` の呼び出し 330 回で ERROR は 0 件
+- ただし送り直しはログも指標も出していないため、「衝突して送り直しで解消した」のか「衝突が起きなかった」のかは区別できない（修正前の割合なら 78 ラウンドで 8 回前後は衝突したはず）。人数を増やす段階では、送り直しの回数を見える化する

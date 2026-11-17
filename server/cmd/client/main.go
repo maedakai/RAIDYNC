@@ -310,6 +310,8 @@ func (c *client) pollMatch(ctx context.Context) error {
 			log.Printf("client: status=%s waited=%ds…", out.Status, out.WaitedSec)
 		case protocol.StatusTimeout, protocol.StatusCancelled:
 			return fmt.Errorf("match not formed: status=%s", out.Status)
+		case protocol.StatusFailed:
+			return fmt.Errorf("match failed: status=%s", out.Status)
 		default:
 			return fmt.Errorf("unexpected status: %s", out.Status)
 		}

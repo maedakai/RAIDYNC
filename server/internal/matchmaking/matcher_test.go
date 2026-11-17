@@ -162,6 +162,27 @@ func TestTryMatch_ClaimConflictKeepsWaiting(t *testing.T) {
 	assert.Equal(t, protocol.StatusWaiting, got.Status)
 }
 
+// TestTryMatch_MarkMatchedConflictFails は、確定の書き込み（MarkMatched）が送り直しても衝突した場合に、
+// グループ 4 人全員が FAILED になり、ポーリングした本人にもその場で FAILED が返ることを確認する。
+func TestTryMatch_MarkMatchedConflictFails(t *testing.T) {
+	store := newFakeStore()
+	for i, id := range []string{"t1", "t2", "t3", "t4"} {
+		store.put(makeWaiting(id, "p"+id, "", int64(1000+i)))
+	}
+	store.markMatchedErr = db.ErrTransactionConflict // 確保は成功したが、MATCHED の書き込みが衝突し続けた想定
+
+	m := newMatcherFor(store, newFakeSessionProvider(), 1500)
+	got, err := m.TryMatch(context.Background(), "t1")
+	require.NoError(t, err)
+	assert.Equal(t, protocol.StatusFailed, got.Status)
+
+	// 本人だけでなく、グループ全員が FAILED（MATCHING のまま残らない）
+	for _, id := range []string{"t1", "t2", "t3", "t4"} {
+		stored, _ := store.GetTicket(context.Background(), id)
+		assert.Equal(t, protocol.StatusFailed, stored.Status, id)
+	}
+}
+
 func TestTryMatch_PartyPreserved(t *testing.T) {
 	store := newFakeStore()
 	// self はソロ。同じクエストにパーティ 3 + ソロが居る。

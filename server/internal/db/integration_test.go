@@ -2,7 +2,8 @@
 
 // integration タグ付き。LocalStack（DynamoDB）に実際に接続して CRUD と原子的 claim を検証する。
 // 実行: docker compose up -d localstack && ./docker/localstack/scripts/localstack-init.sh
-//      go test -tags=integration ./internal/db/...
+//
+//	go test -tags=integration ./internal/db/...
 package db_test
 
 import (
@@ -107,6 +108,95 @@ func TestClaimTickets_AtomicSuccess(t *testing.T) {
 		require.NotNil(t, got)
 		assert.Equal(t, protocol.StatusMatching, got.Status)
 		assert.Equal(t, tk.Version+1, got.Version)
+	}
+}
+
+// TestMarkMatched_AllMatched は MarkMatched で確保済みの 4 人全員が 1 つのトランザクションで MATCHED になり、
+// 同じ sessionId と、1 人ずつ違う座席番号（PlayerSessionID）が書かれることを確認する。
+func TestMarkMatched_AllMatched(t *testing.T) {
+	c, ctx := setup(t)
+	prefix := "matched-ok"
+
+	tickets := make([]protocol.Ticket, 0, 4)
+	for i := 0; i < 4; i++ {
+		tk := makeTicket(prefix, i)
+		require.NoError(t, c.PutTicket(ctx, tk))
+		tickets = append(tickets, tk)
+	}
+	require.NoError(t, c.ClaimTickets(ctx, tickets))
+
+	playerSessions := map[string]string{}
+	for i, tk := range tickets {
+		playerSessions[tk.PlayerID] = fmt.Sprintf("psess-%d", i)
+	}
+	conn := protocol.ConnectionInfo{IPAddress: "127.0.0.1", Port: 7777}
+	require.NoError(t, c.MarkMatched(ctx, tickets, "sess-test", conn, playerSessions))
+
+	for i, tk := range tickets {
+		got, err := c.GetTicket(ctx, tk.TicketID)
+		require.NoError(t, err)
+		assert.Equal(t, protocol.StatusMatched, got.Status)
+		assert.Equal(t, "sess-test", got.SessionID)
+		// 共通の conn に、本人の座席番号だけが差し込まれていること（全員同じ値になっていないこと）
+		assert.Equal(t, fmt.Sprintf("psess-%d", i), got.ConnectionInfo.PlayerSessionID)
+	}
+}
+
+// TestMarkFailed_AllFailed は MarkFailed で確保済みの 4 人全員が 1 つのトランザクションで FAILED になることを確認する。
+func TestMarkFailed_AllFailed(t *testing.T) {
+	c, ctx := setup(t)
+	prefix := "failed-ok"
+
+	tickets := make([]protocol.Ticket, 0, 4)
+	for i := 0; i < 4; i++ {
+		tk := makeTicket(prefix, i)
+		require.NoError(t, c.PutTicket(ctx, tk))
+		tickets = append(tickets, tk)
+	}
+	require.NoError(t, c.ClaimTickets(ctx, tickets))
+
+	require.NoError(t, c.MarkFailed(ctx, tickets))
+
+	for _, tk := range tickets {
+		got, err := c.GetTicket(ctx, tk.TicketID)
+		require.NoError(t, err)
+		assert.Equal(t, protocol.StatusFailed, got.Status)
+	}
+}
+
+// TestMarkMatched_NotAllMatching は 1 人でも MATCHING でなければ MarkMatched がエラーを返し、
+// 誰も MATCHED にならないことを確認する（一部だけ MATCHED を作らない）。
+// 条件に合わないだけなので、送り直しの対象（ErrTransactionConflict）にはならない。
+func TestMarkMatched_NotAllMatching(t *testing.T) {
+	c, ctx := setup(t)
+	prefix := "matched-partial"
+
+	tickets := make([]protocol.Ticket, 0, 4)
+	for i := 0; i < 4; i++ {
+		tk := makeTicket(prefix, i)
+		require.NoError(t, c.PutTicket(ctx, tk))
+		tickets = append(tickets, tk)
+	}
+	// 3 枚だけ確保し、4 枚目は WAITING のまま残す。
+	require.NoError(t, c.ClaimTickets(ctx, tickets[:3]))
+
+	playerSessions := map[string]string{}
+	for i, tk := range tickets {
+		playerSessions[tk.PlayerID] = fmt.Sprintf("psess-%d", i)
+	}
+	conn := protocol.ConnectionInfo{IPAddress: "127.0.0.1", Port: 7777}
+	err := c.MarkMatched(ctx, tickets, "sess-test", conn, playerSessions)
+	require.Error(t, err)
+	assert.False(t, errors.Is(err, db.ErrTransactionConflict), "expected a condition failure, not a transaction conflict: %v", err)
+
+	for i, tk := range tickets {
+		got, err := c.GetTicket(ctx, tk.TicketID)
+		require.NoError(t, err)
+		if i < 3 {
+			assert.Equal(t, protocol.StatusMatching, got.Status)
+		} else {
+			assert.Equal(t, protocol.StatusWaiting, got.Status)
+		}
 	}
 }
 
