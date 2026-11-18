@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# 負荷テスト（tests/load/load-test-large.js）が Cognito に作ったテストユーザーを一掃するスクリプト。
+# 負荷テスト（tests/load/load-test-large.js）用のテストユーザーを Cognito から一掃するスクリプト。
 #
-# k6 は teardown() と setup() の失敗時に自分で作ったユーザーを消すが、ネットワーク断や
-# k6 の強制終了（Ctrl+C）ではどちらも動かずユーザーが残る。その残りをここで消す。
+# テストユーザーは scripts/create-load-test-users.sh で作って使い回すので、普段は消さない。
+# 負荷テストを終えるときや、作り直したいときに使う。以前の k6 が実行ごとに作っていた
+# k6run+<runId>+<連番> 形式のユーザーも、同じ PREFIX で始まるので一緒に消える。
 # 対象はメールアドレスが PREFIX で始まるユーザーだけで、一覧を表示して確認してから消す。
 #
 # 使い方:

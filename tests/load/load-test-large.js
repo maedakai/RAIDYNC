@@ -2,23 +2,25 @@ import http from 'k6/http';
 import {check, sleep } from 'k6';
 import exec from 'k6/execution';
 import{Rate} from 'k6/metrics';
-import{Endpoint,SignatureV4} from 'https://jslib.k6.io/aws/0.14.0/signature.js';
 
 const VUS =  Number(__ENV.VUS || 4);
 // テストユーザー共通のパスワード。プールのポリシー（8 文字以上・大文字・小文字・数字・記号）を満たす値にする。
-// AdminSetUserPassword で設定し、InitiateAuth のログインでも同じ値を使う。
+// scripts/create-load-test-users.sh が設定した値で、InitiateAuth のログインに使う。変えるときは両方を揃える。
 const PASSWORD = 'LoadTest#2026';
-// テストユーザーのメールアドレスの先頭に付ける固定の文字列（k6run+<runId>+<連番>@example.com）。
-// scripts/cleanup-load-test-users.sh がこの値の前方一致で削除対象を選ぶので、変えるときは両方を揃える。
+// テストユーザーのメールアドレスの先頭に付ける固定の文字列（k6run+<連番>@example.com）。
+// ユーザーは scripts/create-load-test-users.sh で一度だけ作って使い回す（毎回作ると Cognito の MAU が増えるため）。
+// 作成スクリプトと掃除スクリプト（cleanup-load-test-users.sh）も同じ値を使うので、変えるときは揃える。
 const PREFIX = 'k6run+';
 const API_URL = __ENV.API_URL;
+const ITERATIONS = Number(__ENV.ITERATIONS || 20)
 
 export const options = {
     scenarios: {
         loop: {
-            executor: 'constant-vus',
+            executor: 'per-vu-iterations',
             vus: VUS,
-            duration: '3m',
+            iterations: ITERATIONS,
+            maxDuration: '10m',
             gracefulStop: '80s',
         }
     },
@@ -33,42 +35,17 @@ export function setup() {
     if(!API_URL){
         throw new Error('API_URL environment variable is not set');
     }
+    if(VUS%4!==0){
+        throw new Error(`VUS is not a Multiples of 4 (got ${VUS})`)
+    }
     const tokens = [];
-    // 署名の作成
-    const signer = createSigner();
+    // questId を実行ごとに変え、前回の実行で残った待ちチケットとマッチしないようにする
     const runId = Date.now();
     try{
         var i = 0;
         for (i = 0; i < VUS; i++) {
-            const username = `${PREFIX}${runId}+${i}@example.com`;
-            var body = JSON.stringify({
-                UserAttributes: [
-                    { Name : 'email', Value: username },
-                    { Name: 'email_verified', Value: 'true' }
-                ],
-                UserPoolId: 'ap-northeast-1_u6Y87N8S1',
-                'Username': username, 
-                'MessageAction': 'SUPPRESS',
-                
-            })
-            let response = callCognito(signer, 'AdminCreateUser', body);
-            if (response.status !== 200) {
-                throw new Error(`Failed to 'AdminCreateUser': ${response.status} ${response.body}`);
-            }
-            // 認証情報の渡し方
-            // パスワード
-            body = JSON.stringify({
-                UserPoolId: 'ap-northeast-1_u6Y87N8S1',
-                'Username': username, 
-                'Password': PASSWORD,
-                'Permanent': true
-            })
-            response = callCognito(signer, 'AdminSetUserPassword', body);
-            if (response.status !== 200) {
-                throw new Error(`Failed to 'AdminSetUserPassword': ${response.status} ${response.body}`);
-            }
-            
-            body = JSON.stringify({
+            const username = `${PREFIX}${i}@example.com`;
+            const body = JSON.stringify({
                 AuthFlow: 'USER_PASSWORD_AUTH',
                 ClientId: '2i3d508aqfla13dmksip64s5sv',
                 AuthParameters: {
@@ -76,82 +53,31 @@ export function setup() {
                     PASSWORD: PASSWORD
                 }
             })
-            response = http.post(
+            const response = http.post(
                 'https://cognito-idp.ap-northeast-1.amazonaws.com/',
                 body,
                 {headers:{
                     'Content-Type': 'application/x-amz-json-1.1',
                     'X-Amz-Target': 'AWSCognitoIdentityProviderService.InitiateAuth'
                 }})
-                
-                if (response.status !== 200) {
-                    throw new Error(`Failed to login test user: ${response.status} ${response.body}`);
-                }
-                // setup() の制限時間
-                tokens.push(response.json().AuthenticationResult.IdToken);
+            if (response.status !== 200) {
+                // ユーザーが VUS 人より少ないと、ここで失敗する（UserNotFoundException など）
+                throw new Error(`Failed to login ${username}: ${response.status} ${response.body}`
+                    + ` (VUS 人以上いるか確認: ./scripts/create-load-test-users.sh ${VUS})`);
             }
-        }
-        catch (err) {
-            deleteTestUsers(signer, runId, i+1);  // 作成済みのユーザーを削除
-            console.error(`Error during setup: ${err.message}`);
-            throw err;  // エラーを再スローしてテストを失敗させる
-        }
-
-        return {runId: runId, questId: `load-test-${runId}`, tokens: tokens};
-    }
-
-function callCognito(signer, target, body){
-    const signedRequest = signer.sign({
-        method: 'POST',
-        endpoint: new Endpoint('https://cognito-idp.ap-northeast-1.amazonaws.com'), 
-        path: '/',
-        headers: {
-            'Content-Type': 'application/x-amz-json-1.1', 
-            'X-Amz-Target': `AWSCognitoIdentityProviderService.${target}`
-        }, 
-        body: body
-    });
-
-    const response = http.post(signedRequest.url, body, { headers: signedRequest.headers });
-    return response;
-}
-
-function createSigner(){
-    return new SignatureV4({
-        service: 'cognito-idp',
-        region: 'ap-northeast-1',
-        credentials: {
-            accessKeyId: __ENV.AWS_ACCESS_KEY_ID,
-            secretAccessKey: __ENV.AWS_SECRET_ACCESS_KEY,
-            sessionToken: __ENV.AWS_SESSION_TOKEN,
-        },
-        uriEscapePath: true,
-    });
-}
-
-function deleteTestUsers(signer, runId, count) {
-    for (let i = 0; i < count; i++) {
-        const username = `${PREFIX}${runId}+${i}@example.com`;
-        const body = JSON.stringify({
-            UserPoolId: 'ap-northeast-1_u6Y87N8S1',
-            Username: username
-        });
-        const response = callCognito(signer, 'AdminDeleteUser', body);
-        if (response.status !== 200) {
-            console.error(`Failed to 'AdminDeleteUser' ${username}: ${response.status} ${response.body}`);
+            tokens.push(response.json().AuthenticationResult.IdToken);
         }
     }
-}
+    catch (err) {
+        console.error(`Error during setup: ${err.message}`);
+        throw err;  // エラーを再スローしてテストを失敗させる
+    }
 
-export function teardown(data) {
-    // 後片付けの処理
-    // 例: テストユーザーの削除
-    const signer = createSigner();
-    const runId = data.runId;
-    deleteTestUsers(signer, runId, data.tokens.length);
+    return {questId: `load-test-${runId}`, tokens: tokens};
 }
 
 const matched = new Rate('matched');
+const matchFailed = new Rate('matchFailed')
 export default function(data) {
     const deadline = Date.now() + 70 * 1000;
     var response = http.post(`${API_URL}/match/request`, 
@@ -170,4 +96,5 @@ export default function(data) {
         'match status is MATCHED': (s) => s === 'MATCHED',
     });
     matched.add(state === 'MATCHED');
+    matchFailed.add(state === 'FAILED');
 }
