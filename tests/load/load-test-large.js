@@ -13,6 +13,9 @@ const PASSWORD = 'LoadTest#2026';
 const PREFIX = 'k6run+';
 const API_URL = __ENV.API_URL;
 const ITERATIONS = Number(__ENV.ITERATIONS || 20)
+// 最初の iteration を VU ごとにずらす間隔（秒）。0.05 なら 1 秒に 20 本ずつ新しい接続を作る。
+// 400 VU が一斉に接続すると、PC 側の経路で約 50 件がタイムアウトしたため（docs/qa-log.md）。
+const PERIOD = Number(__ENV.PERIOD || 0.05)
 
 export const options = {
     scenarios: {
@@ -24,9 +27,12 @@ export const options = {
             gracefulStop: '80s',
         }
     },
+    // 不具合そのものにだけしきい値を置く。matched は終わり際に相手がそろわない TIMEOUT が必ず出るので
+    // 記録だけにし、正しさは server/cmd/sessions でセッション人数の合計と照らし合わせる（docs/qa-log.md）。
     thresholds: {
         http_req_failed: ['rate==0'],
-        matched: ['rate==1'],   // 4 で作る自前の指標の名前
+        matchFailed: ['rate==0'],
+        matchStuck: ['rate==0'],
     },
     setupTimeout: '20m',  // setup() の制限時間を 20 分に設定
 };
@@ -35,6 +41,7 @@ export function setup() {
     if(!API_URL){
         throw new Error('API_URL environment variable is not set');
     }
+    // 4 人組でマッチするので、4 の倍数でないと全体のチケット数が割り切れない
     if(VUS%4!==0){
         throw new Error(`VUS is not a Multiples of 4 (got ${VUS})`)
     }
@@ -72,13 +79,21 @@ export function setup() {
         console.error(`Error during setup: ${err.message}`);
         throw err;  // エラーを再スローしてテストを失敗させる
     }
-
-    return {questId: `load-test-${runId}`, tokens: tokens};
+    const questId = `load-test-${runId}`;
+    console.log(questId);
+    return {questId: questId, tokens: tokens};
 }
 
 const matched = new Rate('matched');
 const matchFailed = new Rate('matchFailed')
+// 締め切りまで終わりの状態（MATCHED / TIMEOUT / FAILED）にならなかった割合。MATCHING のまま止まる不具合を捕まえる
+const matchStuck = new Rate('matchStuck')
 export default function(data) {
+    // 最初の 1 回だけ待つ。2 回目以降は接続を使い回すので一斉接続にならない。
+    // この待ちは最初の iteration_duration に含まれる（マッチの遅さは http_req_duration で見る）
+    if(exec.vu.iterationInScenario === 0){
+        sleep((exec.vu.idInTest-1)*PERIOD);
+    }
     const deadline = Date.now() + 70 * 1000;
     var response = http.post(`${API_URL}/match/request`, 
         JSON.stringify({'questId': data.questId}),
@@ -92,9 +107,7 @@ export default function(data) {
         {headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${data.tokens[exec.vu.idInTest - 1]}` } });
         state = response.json().status;
     }
-    check(state, {
-        'match status is MATCHED': (s) => s === 'MATCHED',
-    });
     matched.add(state === 'MATCHED');
     matchFailed.add(state === 'FAILED');
+    matchStuck.add(state !== 'MATCHED' && state !== 'TIMEOUT'&&state!== 'FAILED');
 }
