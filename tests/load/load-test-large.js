@@ -13,9 +13,10 @@ const PASSWORD = 'LoadTest#2026';
 const PREFIX = 'k6run+';
 const API_URL = __ENV.API_URL;
 const ITERATIONS = Number(__ENV.ITERATIONS || 20)
-// 最初の iteration を VU ごとにずらす間隔（秒）。0.05 なら 1 秒に 20 本ずつ新しい接続を作る。
-// 400 VU が一斉に接続すると、PC 側の経路で約 50 件がタイムアウトしたため（docs/qa-log.md）。
-const PERIOD = Number(__ENV.PERIOD || 0.05)
+// 最初の iteration を VU ごとにずらす間隔（秒）。0.1 なら 1 秒に 10 本ずつ新しい接続を作る（1,000 VU で 100 秒）。
+// 一斉に接続すると、PC 側の経路で最初の POST がタイムアウトする。1 秒に 20 本（0.05）でも 1,000 VU では
+// 数百本目から失敗したため、作る速さを落としている（docs/qa-log.md）。
+const PERIOD = Number(__ENV.PERIOD || 0.1)
 
 export const options = {
     scenarios: {
@@ -94,20 +95,33 @@ export default function(data) {
     if(exec.vu.iterationInScenario === 0){
         sleep((exec.vu.idInTest-1)*PERIOD);
     }
-    const deadline = Date.now() + 70 * 1000;
     var response = http.post(`${API_URL}/match/request`, 
         JSON.stringify({'questId': data.questId}),
         { headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${data.tokens[exec.vu.idInTest - 1]}` } });
-        const ticketId = response.json().ticketId;
     check(response, { 'request is 200': (r) => r.status === 200 })
+    if(response.status !== 200){
+        matched.add(false);
+        return;
+    }
+    // 締め切りは POST が成功してから数える。サーバーの見切り（作成から 60 秒）より必ず 10 秒以上あとになり、
+    // 接続に時間がかかっても k6 が先に諦めない（docs/qa-log.md）
+    const deadline = Date.now() + 70 * 1000;
+    const ticketId = response.json().ticketId;
+    const createdAt = response.json().createdAt;
     let state = '';
     while (state !== 'MATCHED' && state !== 'TIMEOUT'&&state!== 'FAILED'&& Date.now() < deadline) {
         sleep(2);
         response = http.get(`${API_URL}/match/status/${ticketId}`,
-        {headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${data.tokens[exec.vu.idInTest - 1]}` } });
+        {headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${data.tokens[exec.vu.idInTest - 1]}` },tags: { name: 'match/status/{ticketId}'} });
+        if(response.status !== 200){
+            continue;
+        }
         state = response.json().status;
+    }
+    if(state !== 'MATCHED' && state !== 'TIMEOUT' && state !== 'FAILED'){
+        console.warn(`stuck: ticketId=${ticketId} state=${state} age=${Date.now()-createdAt}ms lastStatus=${response.status}`) 
     }
     matched.add(state === 'MATCHED');
     matchFailed.add(state === 'FAILED');
-    matchStuck.add(state !== 'MATCHED' && state !== 'TIMEOUT'&&state!== 'FAILED');
+    matchStuck.add(state !== 'MATCHED' && state !== 'TIMEOUT' && state !== 'FAILED');
 }
