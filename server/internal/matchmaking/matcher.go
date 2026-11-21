@@ -8,6 +8,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/raidync/server/internal/db"
 	"github.com/raidync/server/internal/metrics"
 	"github.com/raidync/server/pkg/protocol"
@@ -26,7 +27,7 @@ const candidateFetchLimit = 50
 type Store interface {
 	GetTicket(ctx context.Context, ticketID string) (*protocol.Ticket, error)
 	QueryWaitingByQuest(ctx context.Context, questID string, limit int32) ([]protocol.Ticket, error)
-	ClaimTickets(ctx context.Context, tickets []protocol.Ticket) error
+	ClaimTickets(ctx context.Context, tickets []protocol.Ticket, matchingAt int64, idempotencyToken string) error
 	MarkMatched(ctx context.Context, tickets []protocol.Ticket, sessionID string, conn protocol.ConnectionInfo, playerSessions map[string]string) error
 	MarkFailed(ctx context.Context, tickets []protocol.Ticket) error
 	PutSession(ctx context.Context, s protocol.Session) error
@@ -115,23 +116,38 @@ func (m *Matcher) tryForm(ctx context.Context, self *protocol.Ticket, minSize in
 	if len(group) < minSize {
 		return nil, nil
 	}
-	if err := m.store.ClaimTickets(ctx, group); err != nil {
+	matchingAt := m.nowMs()
+	idempotencyToken := uuid.NewString()
+	if err := m.store.ClaimTickets(ctx, group, matchingAt, idempotencyToken); err != nil {
 		if errors.Is(err, db.ErrConflict) {
 			return nil, nil // 他マッチャーが先に確保 → 次のポーリングで再試行
 		}
 		return nil, err
+	}
+	self.Version++
+	self.MatchingAt = matchingAt
+	self.IdempotencyToken = idempotencyToken
+	for i := 0; i < len(group); i++ {
+		group[i].Version++
+		group[i].MatchingAt = matchingAt
+		group[i].IdempotencyToken = idempotencyToken
 	}
 	return m.finalize(ctx, self, group)
 }
 
 // formSolo は自分だけのセッションを即時生成する。
 func (m *Matcher) formSolo(ctx context.Context, self *protocol.Ticket) (*protocol.Ticket, error) {
-	if err := m.store.ClaimTickets(ctx, []protocol.Ticket{*self}); err != nil {
+	matchingAt := m.nowMs()
+	idempotencyToken := uuid.NewString()
+	if err := m.store.ClaimTickets(ctx, []protocol.Ticket{*self}, matchingAt, idempotencyToken); err != nil {
 		if errors.Is(err, db.ErrConflict) {
 			return m.store.GetTicket(ctx, self.TicketID)
 		}
 		return nil, err
 	}
+	self.Version++
+	self.MatchingAt = matchingAt
+	self.IdempotencyToken = idempotencyToken
 	return m.finalize(ctx, self, []protocol.Ticket{*self})
 }
 

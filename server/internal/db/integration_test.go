@@ -99,13 +99,16 @@ func TestClaimTickets_AtomicSuccess(t *testing.T) {
 		require.NoError(t, c.PutTicket(ctx, tk))
 		tickets = append(tickets, tk)
 	}
-
-	require.NoError(t, c.ClaimTickets(ctx, tickets))
+	matchingAt := time.Now().UnixMilli()
+	idempotencyToken := uuid.NewString()
+	require.NoError(t, c.ClaimTickets(ctx, tickets, matchingAt, idempotencyToken))
 
 	for _, tk := range tickets {
 		got, err := c.GetTicket(ctx, tk.TicketID)
 		require.NoError(t, err)
 		require.NotNil(t, got)
+		assert.Equal(t, matchingAt, got.MatchingAt)
+		assert.Equal(t, idempotencyToken, got.IdempotencyToken)
 		assert.Equal(t, protocol.StatusMatching, got.Status)
 		assert.Equal(t, tk.Version+1, got.Version)
 	}
@@ -123,11 +126,14 @@ func TestMarkMatched_AllMatched(t *testing.T) {
 		require.NoError(t, c.PutTicket(ctx, tk))
 		tickets = append(tickets, tk)
 	}
-	require.NoError(t, c.ClaimTickets(ctx, tickets))
+	matchingAt := time.Now().UnixMilli()
+	idempotencyToken := uuid.NewString()
+	require.NoError(t, c.ClaimTickets(ctx, tickets, matchingAt, idempotencyToken))
 
 	playerSessions := map[string]string{}
 	for i, tk := range tickets {
 		playerSessions[tk.PlayerID] = fmt.Sprintf("psess-%d", i)
+		tickets[i].Version++
 	}
 	conn := protocol.ConnectionInfo{IPAddress: "127.0.0.1", Port: 7777}
 	require.NoError(t, c.MarkMatched(ctx, tickets, "sess-test", conn, playerSessions))
@@ -139,6 +145,7 @@ func TestMarkMatched_AllMatched(t *testing.T) {
 		assert.Equal(t, "sess-test", got.SessionID)
 		// 共通の conn に、本人の座席番号だけが差し込まれていること（全員同じ値になっていないこと）
 		assert.Equal(t, fmt.Sprintf("psess-%d", i), got.ConnectionInfo.PlayerSessionID)
+		assert.Equal(t, tk.Version+1, got.Version)
 	}
 }
 
@@ -153,7 +160,13 @@ func TestMarkFailed_AllFailed(t *testing.T) {
 		require.NoError(t, c.PutTicket(ctx, tk))
 		tickets = append(tickets, tk)
 	}
-	require.NoError(t, c.ClaimTickets(ctx, tickets))
+	matchingAt := time.Now().UnixMilli()
+	idempotencyToken := uuid.NewString()
+	require.NoError(t, c.ClaimTickets(ctx, tickets, matchingAt, idempotencyToken))
+
+	for i := range tickets {
+		tickets[i].Version++
+	}
 
 	require.NoError(t, c.MarkFailed(ctx, tickets))
 
@@ -161,6 +174,7 @@ func TestMarkFailed_AllFailed(t *testing.T) {
 		got, err := c.GetTicket(ctx, tk.TicketID)
 		require.NoError(t, err)
 		assert.Equal(t, protocol.StatusFailed, got.Status)
+		assert.Equal(t, tk.Version+1, got.Version)
 	}
 }
 
@@ -178,11 +192,16 @@ func TestMarkMatched_NotAllMatching(t *testing.T) {
 		tickets = append(tickets, tk)
 	}
 	// 3 枚だけ確保し、4 枚目は WAITING のまま残す。
-	require.NoError(t, c.ClaimTickets(ctx, tickets[:3]))
+	matchingAt := time.Now().UnixMilli()
+	idempotencyToken := uuid.NewString()
+	require.NoError(t, c.ClaimTickets(ctx, tickets[:3], matchingAt, idempotencyToken))
 
 	playerSessions := map[string]string{}
 	for i, tk := range tickets {
 		playerSessions[tk.PlayerID] = fmt.Sprintf("psess-%d", i)
+		if i < 3 {
+			tickets[i].Version++
+		}
 	}
 	conn := protocol.ConnectionInfo{IPAddress: "127.0.0.1", Port: 7777}
 	err := c.MarkMatched(ctx, tickets, "sess-test", conn, playerSessions)
@@ -216,8 +235,9 @@ func TestClaimTickets_VersionConflict(t *testing.T) {
 	// 1 件目の version を意図的にずらして「他者が先に変更した」状況を作る。
 	stale := tickets
 	stale[0].Version = 99
-
-	err := c.ClaimTickets(ctx, stale)
+	matchingAt := time.Now().UnixMilli()
+	idempotencyToken := uuid.NewString()
+	err := c.ClaimTickets(ctx, stale, matchingAt, idempotencyToken)
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, db.ErrConflict), "expected ErrConflict, got %v", err)
 
@@ -246,4 +266,44 @@ func TestCancelTicket(t *testing.T) {
 	// 2 度目は条件 (#s = WAITING) が満たせず ErrConflict
 	err = c.CancelTicket(ctx, tk.TicketID)
 	assert.True(t, errors.Is(err, db.ErrConflict))
+}
+
+// TestMarkMatched_LateAfterFailed は、救済で FAILED になった後、確保時の version のまま遅れて届いた
+// MarkMatched が弾かれ、MATCHED に戻らないことを確認する。
+func TestMarkMatched_LateAfterFailed(t *testing.T) {
+	c, ctx := setup(t)
+	prefix := "mark-matched"
+
+	tickets := make([]protocol.Ticket, 0, 4)
+	for i := 0; i < 4; i++ {
+		tk := makeTicket(prefix, i)
+		require.NoError(t, c.PutTicket(ctx, tk))
+		tickets = append(tickets, tk)
+	}
+
+	matchingAt := time.Now().UnixMilli()
+	idempotencyToken := uuid.NewString()
+	require.NoError(t, c.ClaimTickets(ctx, tickets, matchingAt, idempotencyToken))
+	for i := range tickets {
+		tickets[i].Version++
+	}
+
+	playerSessions := map[string]string{}
+	for i, tk := range tickets {
+		playerSessions[tk.PlayerID] = fmt.Sprintf("psess-%d", i)
+	}
+	conn := protocol.ConnectionInfo{IPAddress: "127.0.0.1", Port: 7777}
+	// 救済: DynamoDB の今の version（確保後の値）を条件に FAILED にする。成功する。
+	require.NoError(t, c.MarkFailed(ctx, tickets))
+
+	// 遅れて届いた A の MarkMatched: 確保後の version のままなので弾かれる。送り直しの対象でもない。
+	err := c.MarkMatched(ctx, tickets, "sess-test", conn, playerSessions)
+	require.Error(t, err)
+	assert.False(t, errors.Is(err, db.ErrTransactionConflict), "expected a condition failure, not a transaction conflict: %v", err)
+	for _, tk := range tickets {
+		got, err := c.GetTicket(ctx, tk.TicketID)
+		require.NoError(t, err)
+		assert.Equal(t, protocol.StatusFailed, got.Status)
+		assert.Equal(t, tk.Version+1, got.Version)
+	}
 }

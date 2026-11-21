@@ -39,20 +39,22 @@ const (
 
 // Ticket は MatchmakingTickets テーブルの 1 項目（PK: ticketId）。
 type Ticket struct {
-	TicketID       string          `dynamodbav:"ticketId"       json:"ticketId"`
-	PlayerID       string          `dynamodbav:"playerId"       json:"playerId"`
-	QuestID        string          `dynamodbav:"questId"        json:"questId"`
-	PartyID        string          `dynamodbav:"partyId,omitempty" json:"partyId,omitempty"`
-	Status         TicketStatus    `dynamodbav:"status"         json:"status"`
-	Version        int             `dynamodbav:"version"        json:"version"` // 楽観ロック用
-	Region         string          `dynamodbav:"region"         json:"region"`
-	SoloAllowed    bool            `dynamodbav:"soloAllowed"    json:"soloAllowed"`
-	LatencyHint    int             `dynamodbav:"latencyHint,omitempty" json:"latencyHint,omitempty"` // ms
-	SessionID      string          `dynamodbav:"sessionId,omitempty"   json:"sessionId,omitempty"`
-	ConnectionInfo *ConnectionInfo `dynamodbav:"connectionInfo,omitempty" json:"connectionInfo,omitempty"`
-	CreatedAt      int64           `dynamodbav:"createdAt"      json:"createdAt"` // UnixTime ms
-	ExpiresAt      int64           `dynamodbav:"expiresAt"      json:"expiresAt"` // UnixTime ms
-	TTL            int64           `dynamodbav:"ttl"            json:"-"`         // UnixTime 秒（DynamoDB TTL 属性）
+	TicketID         string          `dynamodbav:"ticketId"       json:"ticketId"`
+	PlayerID         string          `dynamodbav:"playerId"       json:"playerId"`
+	QuestID          string          `dynamodbav:"questId"        json:"questId"`
+	PartyID          string          `dynamodbav:"partyId,omitempty" json:"partyId,omitempty"`
+	Status           TicketStatus    `dynamodbav:"status"         json:"status"`
+	Version          int             `dynamodbav:"version"        json:"version"` // 楽観ロック用
+	Region           string          `dynamodbav:"region"         json:"region"`
+	SoloAllowed      bool            `dynamodbav:"soloAllowed"    json:"soloAllowed"`
+	LatencyHint      int             `dynamodbav:"latencyHint,omitempty" json:"latencyHint,omitempty"` // ms
+	SessionID        string          `dynamodbav:"sessionId,omitempty"   json:"sessionId,omitempty"`
+	ConnectionInfo   *ConnectionInfo `dynamodbav:"connectionInfo,omitempty" json:"connectionInfo,omitempty"`
+	IdempotencyToken string          `dynamodbav:"idempotencyToken,omitempty" json:"-"`
+	CreatedAt        int64           `dynamodbav:"createdAt"      json:"createdAt"`                      // UnixTime ms
+	ExpiresAt        int64           `dynamodbav:"expiresAt"      json:"expiresAt"`                      // UnixTime ms
+	MatchingAt       int64           `dynamodbav:"matchingAt,omitempty"     json:"matchingAt,omitempty"` // UnixTime ms
+	TTL              int64           `dynamodbav:"ttl"            json:"-"`                              // UnixTime 秒（DynamoDB TTL 属性）
 }
 
 // Session は Sessions テーブルの 1 項目（PK: sessionId）。

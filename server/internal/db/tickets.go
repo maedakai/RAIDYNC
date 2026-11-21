@@ -106,7 +106,7 @@ func (c *Client) FindWaitingByPlayer(ctx context.Context, playerID string) (*pro
 
 // ClaimTickets は対象チケット群を version 一致条件付きで WAITING → MATCHING に原子的に遷移する。
 // 1 件でも条件不一致なら全体が失敗し ErrConflict を返す（他マッチャーが先に確保した合図）。
-func (c *Client) ClaimTickets(ctx context.Context, tickets []protocol.Ticket) error {
+func (c *Client) ClaimTickets(ctx context.Context, tickets []protocol.Ticket, matchingAt int64, idempotencyToken string) error {
 	if len(tickets) == 0 {
 		return nil
 	}
@@ -116,17 +116,21 @@ func (c *Client) ClaimTickets(ctx context.Context, tickets []protocol.Ticket) er
 			Update: &ddbtypes.Update{
 				TableName:           aws.String(c.tables.MatchmakingTickets),
 				Key:                 ticketKey(t.TicketID),
-				UpdateExpression:    aws.String("SET #s = :matching, #v = :next"),
+				UpdateExpression:    aws.String("SET #s = :matching, #v = :next, #m = :matchingAt, #i = :idempotencyToken"),
 				ConditionExpression: aws.String("#s = :waiting AND #v = :cur"),
 				ExpressionAttributeNames: map[string]string{
 					"#s": "status",
 					"#v": "version",
+					"#m": "matchingAt",
+					"#i": "idempotencyToken",
 				},
 				ExpressionAttributeValues: map[string]ddbtypes.AttributeValue{
-					":matching": &ddbtypes.AttributeValueMemberS{Value: string(protocol.StatusMatching)},
-					":waiting":  &ddbtypes.AttributeValueMemberS{Value: string(protocol.StatusWaiting)},
-					":cur":      &ddbtypes.AttributeValueMemberN{Value: strconv.Itoa(t.Version)},
-					":next":     &ddbtypes.AttributeValueMemberN{Value: strconv.Itoa(t.Version + 1)},
+					":matching":         &ddbtypes.AttributeValueMemberS{Value: string(protocol.StatusMatching)},
+					":waiting":          &ddbtypes.AttributeValueMemberS{Value: string(protocol.StatusWaiting)},
+					":cur":              &ddbtypes.AttributeValueMemberN{Value: strconv.Itoa(t.Version)},
+					":next":             &ddbtypes.AttributeValueMemberN{Value: strconv.Itoa(t.Version + 1)},
+					":matchingAt":       &ddbtypes.AttributeValueMemberN{Value: strconv.FormatInt(matchingAt, 10)},
+					":idempotencyToken": &ddbtypes.AttributeValueMemberS{Value: idempotencyToken},
 				},
 			},
 		})
@@ -161,13 +165,16 @@ func (c *Client) MarkMatched(ctx context.Context, tickets []protocol.Ticket, ses
 			Update: &ddbtypes.Update{
 				TableName:           aws.String(c.tables.MatchmakingTickets),
 				Key:                 ticketKey(t.TicketID),
-				UpdateExpression:    aws.String("SET #s = :matched, sessionId = :sid, connectionInfo = :conn"),
-				ConditionExpression: aws.String("#s = :matching"),
+				UpdateExpression:    aws.String("SET #s = :matched, #v = :next, sessionId = :sid, connectionInfo = :conn"),
+				ConditionExpression: aws.String("#s = :matching AND #v = :cur"),
 				ExpressionAttributeNames: map[string]string{
 					"#s": "status",
+					"#v": "version",
 				},
 				ExpressionAttributeValues: map[string]ddbtypes.AttributeValue{
 					":matched":  &ddbtypes.AttributeValueMemberS{Value: string(protocol.StatusMatched)},
+					":cur":      &ddbtypes.AttributeValueMemberN{Value: strconv.Itoa(t.Version)},
+					":next":     &ddbtypes.AttributeValueMemberN{Value: strconv.Itoa(t.Version + 1)},
 					":sid":      &ddbtypes.AttributeValueMemberS{Value: sessionID},
 					":conn":     connAV,
 					":matching": &ddbtypes.AttributeValueMemberS{Value: string(protocol.StatusMatching)},
@@ -187,14 +194,17 @@ func (c *Client) MarkFailed(ctx context.Context, tickets []protocol.Ticket) erro
 			Update: &ddbtypes.Update{
 				TableName:           aws.String(c.tables.MatchmakingTickets),
 				Key:                 ticketKey(t.TicketID),
-				UpdateExpression:    aws.String("SET #s = :failed"),
-				ConditionExpression: aws.String("#s = :matching"),
+				UpdateExpression:    aws.String("SET #s = :failed, #v = :next"),
+				ConditionExpression: aws.String("#s = :matching AND #v = :cur"),
 				ExpressionAttributeNames: map[string]string{
 					"#s": "status",
+					"#v": "version",
 				},
 				ExpressionAttributeValues: map[string]ddbtypes.AttributeValue{
 					":matching": &ddbtypes.AttributeValueMemberS{Value: string(protocol.StatusMatching)},
 					":failed":   &ddbtypes.AttributeValueMemberS{Value: string(protocol.StatusFailed)},
+					":cur":      &ddbtypes.AttributeValueMemberN{Value: strconv.Itoa(t.Version)},
+					":next":     &ddbtypes.AttributeValueMemberN{Value: strconv.Itoa(t.Version + 1)},
 				},
 			},
 		})

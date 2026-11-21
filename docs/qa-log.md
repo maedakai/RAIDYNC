@@ -3229,3 +3229,35 @@ k6 run -q --vus 1 --iterations 1 --no-thresholds tests/load/load-test-large.js
 - 本番でも、全員が同じイベントクエストに並ぶ場面では同じ集中が起こる。k6 だけの問題ではなく設計上の弱点
 - 4 倍でほぼ比例するもの: Lambda の同時実行（1,000 VU で最大 47 → 約 200。上限 1,000）
 - **決定: 6-6 では直さず、4,000 VU の推定に「既知の限界」として書く。** 直し方（パーティションキーの分散など）は宿題に回す（2026-11-20）
+
+### Q. Phase 6 の残りの宿題をどう仕分けたか
+
+**本番の正しさに関わる 3 つだけ直し、ほかは手を加えない（2026-11-20）。**
+
+- **直す**: ゲームサーバーが `/session/end` を呼ばない（Sessions が ACTIVE のまま溜まり MatchHistory も書かれない）／マッチ確定が FAILED になったとき、先に作ったゲームセッションと Sessions レコードが残る／Lambda が `ClaimTickets` の後に止まると、チケットが MATCHING のまま残る
+- **ポートフォリオで補う**: GSI のホットキー、一斉接続（バースト）、GameLift の UDP 負荷。`docs/load-test-results.md` §7 に既知の限界・未検証として書いてある
+- **スキップ**: GameLift のセカンダリ（us-east-1）での実機 E2E。フリートの起動に費用がかかり、同じ構成を ap-northeast-1 で確認済みのため
+- **手を加えない**: 確保の競合と finalize の直列書き込み（1,000 VU で問題なし）、`internal/handlers` のテスト、`build-lambdas.sh` の全再作成、IAM の index 権限の付けすぎ、`gofmt` の残り 1 件
+
+### Q. 止まったままの MATCHING は、止まっているのか正常に処理中なのか判断できないのではないか
+
+**今の情報だけでは判断できない。ただし、Lambda の寿命に上限があることを使えば、時間で判定できる（2026-11-20）。**
+
+- チケットには `status = MATCHING` と `version` しかなく、「別の Lambda が finalize 中」と「担当の Lambda が死んで止まった」は見た目が同じ
+- MATCHING にした Lambda は、finalize が終われば必ず MATCHED か FAILED に進める。そしてその Lambda はタイムアウト（30 秒、`terraform/modules/lambda/variables.tf`）を超えて動けない
+- よって **MATCHING になってから 30 秒 + 余裕を過ぎていれば、担当の Lambda はもういない**と言える。期限付きの担当権（リース）の考え方
+- そのために、`ClaimTickets` で MATCHING にするとき、その時刻も書く必要がある（今は `status` と `version` だけ）
+- 検討点: 余裕の秒数（Lambda 間の時計のずれ、書き込みの遅れ）。救済の後に、もとの Lambda の `MarkMatched` が遅れて届く場合（今の条件は `status = MATCHING` だけで `version` を見ていない）
+
+### Q. マッチ確定が途中で失敗したり、Lambda が途中で止まったりしたとき、残ったものをどう片付けるか
+
+**FAILED で終わったら同じ Lambda で片付け、止まった MATCHING はポーリングで見つけて FAILED にする。ゲームセッションの特定には `IdempotencyToken` を使う（2026-11-20 設計）。**
+
+- `ClaimTickets`: WAITING → MATCHING と同じ書き込みで、MATCHING になった時刻とトークン（UUID）を書く
+- `CreateGameSession`: トークンを `IdempotencyToken` に渡す。ゲームセッションの ID は `arn:aws:gamelift:<location>::gamesession/<fleet ID>/<トークン>` になり、`NormalizeGameSessionID` で取り出す sessionId がトークンそのものになる。同じトークンで送り直しても二重に作られない（トークンは終了後 30 日再利用不可、最大 48 文字）
+- `MarkMatched` / `MarkFailed`: 条件を `status = MATCHING` かつ確保時の version にし、version を上げる。**version は増やす一方**。戻すと A → B → A で条件付き書き込みが変化に気づけない（ABA 問題）
+- **MarkMatched が FAILED に終わった場合**: 誰も接続情報を受け取っていないので、同じ Lambda ですぐ片付ける。GameLift は `TerminateGameSession` の通常の終了（サーバーの `OnProcessTerminate` が動く）。Sessions は消さずに FAILED に書き換える（調査用に残す）
+- **Lambda が止まった場合**: MATCHING になってから 40 秒（Lambda のタイムアウト 30 秒 + 余裕 10 秒）過ぎたら、`match/status` のポーリングで見つけて FAILED にする。WAITING に戻しても `createdAt` から 60 秒を過ぎていてすぐ TIMEOUT になるので意味が薄い。トークンからゲームセッションを終わらせ、Sessions も FAILED にする
+- チケットに sessionId を書き足す案は採らない。書き込みが 1 回増え、既知の限界の GSI ホットキーを悪化させるため
+- `CreateGameSession` の後、何も書く前に止まった分は、ゲームサーバーが「誰も来なければ終える」で塞ぐ（ゲームサーバーが `/session/end` を呼ぶ宿題とまとめる）。その際 `/session/end` は ACTIVE のときだけ ENDED にし、FAILED を上書きしない
+- 影響: `SessionStatus` に FAILED を追加、`cmd/sessions` は FAILED を数えない、Lambda の IAM に `gamelift:TerminateGameSession`、`SessionProvider` に終了の処理（GameLift・スタブ・hub の 3 実装）

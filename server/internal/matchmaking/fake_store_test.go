@@ -48,7 +48,7 @@ func (f *fakeStore) QueryWaitingByQuest(_ context.Context, questID string, _ int
 	return out, nil
 }
 
-func (f *fakeStore) ClaimTickets(_ context.Context, tickets []protocol.Ticket) error {
+func (f *fakeStore) ClaimTickets(_ context.Context, tickets []protocol.Ticket, matchingAt int64, idempotencyToken string) error {
 	if f.claimErr != nil {
 		return f.claimErr
 	}
@@ -64,6 +64,8 @@ func (f *fakeStore) ClaimTickets(_ context.Context, tickets []protocol.Ticket) e
 		cur := f.tickets[t.TicketID]
 		cur.Status = protocol.StatusMatching
 		cur.Version = t.Version + 1
+		cur.MatchingAt = matchingAt
+		cur.IdempotencyToken = idempotencyToken
 	}
 	return nil
 }
@@ -74,11 +76,12 @@ func (f *fakeStore) MarkMatched(_ context.Context, tickets []protocol.Ticket, se
 	}
 	for _, t := range tickets {
 		cur, ok := f.tickets[t.TicketID]
-		if !ok {
+		if !ok || cur.Status != protocol.StatusMatching || cur.Version != t.Version {
 			return db.ErrConflict
 		}
 		cur.Status = protocol.StatusMatched
 		cur.SessionID = sessionID
+		cur.Version = t.Version + 1
 		connCopy := conn
 		connCopy.PlayerSessionID = playerSessions[t.PlayerID]
 		cur.ConnectionInfo = &connCopy
@@ -89,10 +92,11 @@ func (f *fakeStore) MarkMatched(_ context.Context, tickets []protocol.Ticket, se
 func (f *fakeStore) MarkFailed(_ context.Context, tickets []protocol.Ticket) error {
 	for _, t := range tickets {
 		cur, ok := f.tickets[t.TicketID]
-		if !ok {
+		if !ok || cur.Status != protocol.StatusMatching || cur.Version != t.Version {
 			return db.ErrConflict
 		}
 		cur.Status = protocol.StatusFailed
+		cur.Version = t.Version + 1
 	}
 	return nil
 }
