@@ -88,3 +88,28 @@ func TestHub_TickEndsSessionAtTimeout(t *testing.T) {
 	assert.Equal(t, protocol.EndTimeout, pl.Reason)
 	assert.Equal(t, 0, hub.SessionCount(), "終了セッションは登録解除される")
 }
+
+func TestHub_EndRemovesSession(t *testing.T) {
+	fs := &fakeSender{}
+	hub := NewHub(fs)
+	s := NewSession("sess-1", "quest-001", []string{"p1"}, 0)
+	hub.Register(s)
+	// プレイヤーは接続中（SESSION_END の送り先がある）想定。
+	require.NoError(t, hub.Route(moveMsg("sess-1", "p1", 1, protocol.Vector3{}, protocol.ActorIdle), addr(5001), 10))
+
+	hub.End("sess-1", 100)
+
+	ends := fs.byType(protocol.MsgSessionEnd)
+	require.Len(t, ends, 1)
+	var pl protocol.SessionEndPayload
+	require.NoError(t, json.Unmarshal(ends[0].msg.Payload, &pl))
+	assert.Equal(t, protocol.EndAbandoned, pl.Reason)
+	assert.Equal(t, 0, hub.SessionCount(), "終了セッションは登録解除される")
+}
+
+func TestHub_EndUnknownSessionIsNoop(t *testing.T) {
+	fs := &fakeSender{}
+	hub := NewHub(fs)
+	hub.End("ghost", 100)
+	assert.Equal(t, 0, hub.SessionCount(), "無い id では何も変わらない")
+}

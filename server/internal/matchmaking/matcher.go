@@ -158,7 +158,7 @@ func (m *Matcher) finalize(ctx context.Context, self *protocol.Ticket, group []p
 		playerIDs = append(playerIDs, g.PlayerID)
 	}
 
-	sessionID, conn, playerSessions, err := m.sessions.CreateGameSession(ctx, self.QuestID, playerIDs)
+	sessionID, conn, playerSessions, err := m.sessions.CreateGameSession(ctx, self.IdempotencyToken, self.QuestID, playerIDs)
 	if err != nil {
 		return nil, err
 	}

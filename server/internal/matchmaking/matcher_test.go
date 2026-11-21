@@ -68,7 +68,8 @@ func TestTryMatch_FullPartyOf4(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Equal(t, protocol.StatusMatched, got.Status)
-	assert.Equal(t, sessions.sessionID, got.SessionID)
+	assert.Equal(t, got.IdempotencyToken, got.SessionID)
+	assert.NotEmpty(t, got.SessionID)
 	assert.Equal(t, 1, sessions.calls)
 	// 4 件すべてが MATCHED で、各自「共通 IP/Port ＋ 本人だけの psid」を受け取ること
 	seen := map[string]bool{}
@@ -111,7 +112,8 @@ func TestTryMatch_SoloAllowed(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Equal(t, protocol.StatusMatched, got.Status)
-	assert.Equal(t, sessions.sessionID, got.SessionID)
+	assert.Equal(t, got.IdempotencyToken, got.SessionID)
+	assert.NotEmpty(t, got.SessionID)
 	assert.NotNil(t, got.ConnectionInfo)
 }
 

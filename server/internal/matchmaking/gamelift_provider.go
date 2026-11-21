@@ -2,7 +2,9 @@ package matchmaking
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -18,6 +20,7 @@ import (
 type gameLiftAPI interface {
 	CreateGameSession(ctx context.Context, in *gamelift.CreateGameSessionInput, optFns ...func(*gamelift.Options)) (*gamelift.CreateGameSessionOutput, error)
 	CreatePlayerSessions(ctx context.Context, in *gamelift.CreatePlayerSessionsInput, optFns ...func(*gamelift.Options)) (*gamelift.CreatePlayerSessionsOutput, error)
+	TerminateGameSession(ctx context.Context, in *gamelift.TerminateGameSessionInput, optFns ...func(*gamelift.Options)) (*gamelift.TerminateGameSessionOutput, error)
 }
 
 // 実 SDK クライアントが gameLiftAPI を満たすことをコンパイル時に保証する。
@@ -30,6 +33,7 @@ type GameLiftProvider struct {
 	fleetID    string
 	location   string // Anywhere のカスタムロケーション（"custom-..."）。managed EC2 では空
 	maxPlayers int32  // セッション定員（RAIDYNC は 4）
+	region     string // フリートのリージョン。managed EC2 では location の代わりに ARN へ入れる
 }
 
 // SessionProvider を満たすことをコンパイル時に保証する。
@@ -37,24 +41,27 @@ var _ SessionProvider = (*GameLiftProvider)(nil)
 
 // NewGameLiftProvider は注入済み API クライアントで Provider を生成する（テスト/DI 用）。
 // location が空でなければ CreateGameSession に付与する（Anywhere 用）。
-func NewGameLiftProvider(api gameLiftAPI, fleetID, location string) *GameLiftProvider {
-	return &GameLiftProvider{api: api, fleetID: fleetID, location: location, maxPlayers: protocol.MaxPartySize}
+func NewGameLiftProvider(api gameLiftAPI, fleetID, location, region string) *GameLiftProvider {
+	return &GameLiftProvider{api: api, fleetID: fleetID, location: location, maxPlayers: protocol.MaxPartySize, region: region}
 }
 
 // NewGameLiftProviderFromConfig は aws.Config から実 SDK クライアントを組んで Provider を生成する。
 func NewGameLiftProviderFromConfig(cfg aws.Config, fleetID, location string) *GameLiftProvider {
 	otelaws.AppendMiddlewares(&cfg.APIOptions)
-	return NewGameLiftProvider(gamelift.NewFromConfig(cfg), fleetID, location)
+	return NewGameLiftProvider(gamelift.NewFromConfig(cfg), fleetID, location, cfg.Region)
 }
 
 // CreateGameSession は GameLift に (1) ゲームセッションを 1 つ作り、(2) プレイヤー毎に
 // プレイヤーセッションを作って psid を得る。返す conn は全員共通の接続先（psid 空）、
 // playerSessions は playerId→psid。
 //
+// sessionID は IdempotencyToken として渡す。GameLift はこのトークンを ARN 末尾の ID にするので、
+// 返す ID は sessionID と同じになる。同じトークンで呼び直しても、新しいセッションは作られない。
+//
 // RAIDYNC は FlexMatch を使わないため、roster/questId は GameProperties で受け渡す
 // （ゲームサーバの parseSessionConfig が読む）。psid はセッション作成後に発行されるため
 // GameProperties には含めず、各クライアントへ match/status 経由で配って UDP 接続時に提示させる。
-func (p *GameLiftProvider) CreateGameSession(ctx context.Context, questID string, playerIDs []string) (string, protocol.ConnectionInfo, map[string]string, error) {
+func (p *GameLiftProvider) CreateGameSession(ctx context.Context, sessionID, questID string, playerIDs []string) (string, protocol.ConnectionInfo, map[string]string, error) {
 	var zero protocol.ConnectionInfo
 
 	out, err := p.api.CreateGameSession(ctx, &gamelift.CreateGameSessionInput{
@@ -65,6 +72,7 @@ func (p *GameLiftProvider) CreateGameSession(ctx context.Context, questID string
 			{Key: aws.String("questId"), Value: aws.String(questID)},
 			{Key: aws.String("playerIds"), Value: aws.String(strings.Join(playerIDs, ","))},
 		},
+		IdempotencyToken: aws.String(sessionID),
 	})
 	if err != nil {
 		return "", zero, nil, fmt.Errorf("CreateGameSession: %w", err)
@@ -99,12 +107,34 @@ func (p *GameLiftProvider) CreateGameSession(ctx context.Context, questID string
 	if len(playerSessions) != len(playerIDs) {
 		return "", zero, nil, fmt.Errorf("CreatePlayerSessions: psid 数が不足 (want=%d got=%d)", len(playerIDs), len(playerSessions))
 	}
-	// GameLift は GameSessionId を ARN で返す（例: arn:aws:gamelift:...:gamesession/fleet-xxx/gsess-xxx）。
+	// GameLift は GameSessionId を ARN で返す（例: arn:aws:gamelift:...:gamesession/fleet-xxx/<sessionID>）。
 	// ARN をそのまま HTTP パスやDynamoDB PKに使うとスラッシュがセパレータとして扱われて壊れるため、
-	// 末尾のショート ID（gsess-xxx）に正規化する。ゲームサーバ側(gamelift.go)も同じ正規化を行い、
+	// 末尾のショート ID（= IdempotencyToken に渡した sessionID）に正規化する。ゲームサーバ側(gamelift.go)も同じ正規化を行い、
 	// Hub のルーティングキーと一致させる。
-	sessionID := protocol.NormalizeGameSessionID(rawSessionID)
-	return sessionID, conn, playerSessions, nil
+	gotID := protocol.NormalizeGameSessionID(rawSessionID)
+	return gotID, conn, playerSessions, nil
+}
+
+// EndGameSession は GameLift のゲームセッションを終わらせる。TerminateGameSession は完全な ARN を
+// 要求するので、sessionID から組み立てて渡す。TriggerOnProcessTerminate でサーバープロセスに
+// OnProcessTerminate を送り、プロセス側の片付けを経て終わらせる。
+// セッションが無い（NotFound）・すでに終わっている（InvalidGameSessionStatus）場合は、
+// 目的は果たされているので成功として扱う。
+func (p *GameLiftProvider) EndGameSession(ctx context.Context, sessionID string) error {
+	_, err := p.api.TerminateGameSession(ctx, &gamelift.TerminateGameSessionInput{
+		GameSessionId:   aws.String(gameSessionARN(p.location, p.region, p.fleetID, sessionID)),
+		TerminationMode: gltypes.TerminationModeTriggerOnProcessTerminate,
+	})
+	if err == nil {
+		return nil
+	}
+	var notFound *gltypes.NotFoundException
+	var invalidGameSession *gltypes.InvalidGameSessionStatusException
+	if errors.As(err, &notFound) || errors.As(err, &invalidGameSession) {
+		slog.InfoContext(ctx, "game session already gone", "sessionId", sessionID, "error", err)
+		return nil
+	}
+	return fmt.Errorf("TerminateGameSession: %w", err)
 }
 
 // locationPtr は空文字なら nil を返す（managed EC2 では Location を省略する）。
@@ -113,4 +143,16 @@ func locationPtr(loc string) *string {
 		return nil
 	}
 	return aws.String(loc)
+}
+
+// gameSessionARN は sessionID からゲームセッションの完全な ARN を組み立てる。
+// ARN のリージョン部分には、Anywhere ではカスタムロケーション、managed EC2 ではリージョンが入る。
+//
+//	arn:aws:gamelift:<location|region>::gamesession/<fleetID>/<sessionID>
+func gameSessionARN(location, region, fleetID, sessionID string) string {
+	loc := location
+	if loc == "" {
+		loc = region
+	}
+	return fmt.Sprintf("arn:aws:gamelift:%s::gamesession/%s/%s", loc, fleetID, sessionID)
 }

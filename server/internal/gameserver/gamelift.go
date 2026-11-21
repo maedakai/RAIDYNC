@@ -117,7 +117,7 @@ func (b *GameLiftBridge) enqueue(e playerEvent) {
 func (b *GameLiftBridge) onStartGameSession(gs model.GameSession) {
 	questID, roster, playerSessions := parseSessionConfig(gs)
 	// GameLift SDK は GameSessionID を ARN で渡す。Lambda 側（gamelift_provider.go）が
-	// 同じ正規化でショート ID（gsess-xxx）を DynamoDB / クライアントへ配っているため、
+	// 同じ正規化でショート ID（ARN 末尾 = マッチ確保時のトークン）を DynamoDB / クライアントへ配っているため、
 	// Hub のルーティングキーもショート ID に揃える（不一致だと ErrSessionNotFound になる）。
 	sessionID := protocol.NormalizeGameSessionID(gs.GameSessionID)
 	b.hub.Register(game.NewSession(sessionID, questID, roster, nowMs(),

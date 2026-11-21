@@ -110,3 +110,13 @@ func (h *Hub) SessionCount() int {
 	defer h.mu.RUnlock()
 	return len(h.sessions)
 }
+
+// End は外から指定されたセッションを、時間切れを待たずに終わらせる（理由は EndAbandoned）。
+// マッチの確定に失敗したセッションを片付けるために使う。登録されていない id では何もしない。
+func (h *Hub) End(id string, now int64) {
+	s := h.session(id)
+	if s == nil {
+		return
+	}
+	h.endSession(s, protocol.EndAbandoned, now)
+}
