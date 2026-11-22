@@ -18,9 +18,13 @@ locals {
         AUTH_CLIENT_ID = var.auth_client_id
       }
     }
+    # API_BASE_URL はセッションアフィニティ用のリージョン固定 URL。
+    # 空なら Lambda がリクエストから導出する（変数の説明を参照）。
     match_request = {
       role_arn = var.matchmaking_role_arn
-      env      = {}
+      env = {
+        API_BASE_URL = var.api_base_url
+      }
     }
     # マッチ成立時に実 GameLift へセッションを作るのは match_status のみ
     # （matcher が status ポーリング契機でマッチングを実行するため）。
@@ -45,14 +49,26 @@ locals {
     }
   }
 
+  # 全関数に共通の環境変数。関数ごとの env と merge し、同じキーなら関数ごとの値が勝つ。
+  # TRACE_EXPORTER は Span の送り先（internal/telemetry の newExporter）。Lambda は AWS でしか動かないため
+  # 常に xray で、変数にしない（未設定だと gRPC で localhost に送ろうとして Span が捨てられる）。
+  common_env = {
+    TRACE_EXPORTER = "xray"
+  }
+
   # 空文字の環境変数は「未設定」と同義なので落とす。
   # （コード側は Getenv の空文字で分岐するため、空を渡しても害はないがノイズになる）
   functions_resolved = {
     for name, cfg in local.functions : name => merge(cfg, {
-      env = { for k, v in cfg.env : k => v if v != "" }
+      env = { for k, v in merge(local.common_env, cfg.env) : k => v if v != "" }
     })
   }
 }
+
+# このモジュールがどのリージョンに適用されているかを知るために引く。
+# マルチリージョン構成では同じモジュールが provider alias 違いで複数回インスタンス化され、
+# zip の出力先が衝突するため、パスにリージョン名を混ぜて分離する。
+data "aws_region" "current" {}
 
 # ビルド済み bootstrap を関数ごとに zip 化する。
 # 事前に scripts/build-lambdas.sh の実行が必要（未実行だと plan 時に source_dir 不在で失敗）。
@@ -61,7 +77,7 @@ data "archive_file" "this" {
 
   type        = "zip"
   source_dir  = "${var.artifacts_dir}/${each.key}"
-  output_path = "${var.artifacts_dir}/${each.key}.zip"
+  output_path = "${var.artifacts_dir}/${each.key}-${data.aws_region.current.name}.zip"
 }
 
 # ロググループを明示的に作る。Lambda の自動作成に任せると保持期間が「無期限」になり
@@ -97,6 +113,10 @@ resource "aws_lambda_function" "this" {
     content {
       variables = environment.value
     }
+  }
+
+  tracing_config {
+    mode = "Active"
   }
 
   # ロググループを Lambda より先に作らせる（Lambda 側の自動作成と競合させない）。

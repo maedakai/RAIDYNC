@@ -118,6 +118,68 @@ resource "aws_api_gateway_resource" "session_end" {
   path_part   = "end"
 }
 
+# ---- ヘルスチェック用エンドポイント（GET /health） ----
+#
+# Route 53 のヘルスチェックは 2xx/3xx を返す URL を必要とするが、業務 API は
+# すべて認証必須か POST なので流用できない（401 は「異常」と判定される）。
+# そこで MOCK 統合で 200 を返すだけの経路を用意する。
+#
+# MOCK は API Gateway がバックエンドを呼ばずに応答を組み立てる統合方式。
+# **Lambda を呼ばないので実行課金もコールドスタートも無い**。
+# ヘルスチェックが見るのは「API Gateway がそのリージョンで生きているか」なので、
+# Lambda や DynamoDB まで到達する必要はなく、この浅さが適切。
+
+resource "aws_api_gateway_resource" "health" {
+  rest_api_id = aws_api_gateway_rest_api.this.id
+  parent_id   = aws_api_gateway_rest_api.this.root_resource_id
+  path_part   = "health"
+}
+
+# Route 53 のヘルスチェッカーは認証情報を持てないため認証なしで公開する。
+# 返すのは固定文字列だけで、内部情報は一切含まない。
+resource "aws_api_gateway_method" "health" {
+  rest_api_id   = aws_api_gateway_rest_api.this.id
+  resource_id   = aws_api_gateway_resource.health.id
+  http_method   = "GET"
+  authorization = "NONE"
+}
+
+resource "aws_api_gateway_integration" "health" {
+  rest_api_id = aws_api_gateway_rest_api.this.id
+  resource_id = aws_api_gateway_resource.health.id
+  http_method = aws_api_gateway_method.health.http_method
+
+  type = "MOCK"
+  # MOCK は「どの statusCode の応答を組み立てるか」をこのテンプレートで指示する。
+  request_templates = {
+    "application/json" = jsonencode({ statusCode = 200 })
+  }
+}
+
+resource "aws_api_gateway_method_response" "health" {
+  rest_api_id = aws_api_gateway_rest_api.this.id
+  resource_id = aws_api_gateway_resource.health.id
+  http_method = aws_api_gateway_method.health.http_method
+  status_code = "200"
+
+  response_models = {
+    "application/json" = "Empty"
+  }
+}
+
+resource "aws_api_gateway_integration_response" "health" {
+  rest_api_id = aws_api_gateway_rest_api.this.id
+  resource_id = aws_api_gateway_resource.health.id
+  http_method = aws_api_gateway_method.health.http_method
+  status_code = aws_api_gateway_method_response.health.status_code
+
+  response_templates = {
+    "application/json" = jsonencode({ status = "ok" })
+  }
+
+  depends_on = [aws_api_gateway_integration.health]
+}
+
 # ---- メソッド / 統合 ----
 
 locals {
@@ -198,6 +260,10 @@ resource "aws_api_gateway_deployment" "this" {
       aws_api_gateway_authorizer.this.id,
       [for k, m in aws_api_gateway_method.this : "${k}:${m.http_method}:${m.authorization}"],
       [for k, i in aws_api_gateway_integration.this : "${k}:${i.uri}"],
+      # /health も含める。含め忘れると MOCK 統合を足しても再デプロイされず、
+      # ステージには反映されないまま（Route 53 のヘルスチェックが 403 を見る）。
+      aws_api_gateway_integration.health.id,
+      aws_api_gateway_integration_response.health.id,
     ]))
   }
 
@@ -210,6 +276,11 @@ resource "aws_api_gateway_stage" "this" {
   rest_api_id   = aws_api_gateway_rest_api.this.id
   deployment_id = aws_api_gateway_deployment.this.id
   stage_name    = var.stage_name
+
+  # X-Ray のトレースを有効にする。API Gateway が自分の区間（滞在時間・authorizer の呼び出し）を記録し、
+  # 呼び出す Lambda に親の ID を渡す。Lambda の OTel（xrayconfig）がそれを親として読むので 1 本につながる。
+  # 記録する割合はここではなく X-Ray のサンプリングルールで決まる（既定は毎秒 1 件 + 5%）。
+  xray_tracing_enabled = true
 
   tags = var.tags
 }

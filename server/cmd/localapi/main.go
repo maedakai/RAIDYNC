@@ -16,6 +16,8 @@ import (
 	"context"
 	"errors"
 	"log"
+	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -25,8 +27,11 @@ import (
 
 	"github.com/raidync/server/internal/auth"
 	"github.com/raidync/server/internal/db"
+	"github.com/raidync/server/internal/gameserver"
 	"github.com/raidync/server/internal/handlers"
 	"github.com/raidync/server/internal/matchmaking"
+	"github.com/raidync/server/internal/telemetry"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
 
 type server struct {
@@ -34,7 +39,13 @@ type server struct {
 }
 
 func main() {
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
 	ctx := context.Background()
+
+	shutdown, err := telemetry.Init(ctx, "localapi")
+	if err != nil {
+		log.Fatalf("localapi: init telemetry: %v", err)
+	}
 
 	client, err := db.NewClient(ctx)
 	if err != nil {
@@ -60,13 +71,17 @@ func main() {
 	// これがマッチ成立時のセッション生成（本番 GameLift の代役）を担う。
 	bindAddr := getenv("GAMESERVER_BIND_ADDR", "127.0.0.1:7777")
 	advertiseHost := getenv("GAMESERVER_ADVERTISE_HOST", "127.0.0.1")
-	provider, gameSrv, err := startGameServer(shutdownCtx, bindAddr, advertiseHost)
+	addr := getenv("LOCALAPI_ADDR", ":8080")
+	// 報告係は、自分自身の HTTP の /session/end に向ける（本番と同じ HTTP の経路を通す）。
+	sessionAPIURL := getenv("SESSION_API_URL", selfURL(addr))
+	reporter := gameserver.NewSessionReporter(sessionAPIURL)
+	provider, gameSrv, err := startGameServer(shutdownCtx, bindAddr, advertiseHost, reporter)
 	if err != nil {
 		log.Fatalf("localapi: start gameserver: %v", err)
 	}
 	defer gameSrv.Close()
-	log.Printf("localapi: gameserver(udp) listening on %s (advertise %s:%d)",
-		gameSrv.LocalAddr(), advertiseHost, gameSrv.LocalAddr().Port)
+	log.Printf("localapi: gameserver(udp) listening on %s (advertise %s:%d, report to %s)",
+		gameSrv.LocalAddr(), advertiseHost, gameSrv.LocalAddr().Port, sessionAPIURL)
 
 	// ハンドラは本番 Lambda と同じものを生成（依存だけ LocalStack / 同居 Hub 向けに）。
 	matchRequest := handlers.NewMatchRequest(client)
@@ -82,16 +97,15 @@ func main() {
 	})
 
 	// /match・/player 配下は本番の authorizer Lambda 相当（JWT 検証 → sub 注入）を前段に置く。
-	mux.Handle("POST /match/request", s.withAuth(adapt(matchRequest.Handle)))
-	mux.Handle("GET /match/status/{ticketId}", s.withAuth(adapt(matchStatus.Handle, "ticketId")))
-	mux.Handle("DELETE /match/cancel/{ticketId}", s.withAuth(adapt(matchCancel.Handle, "ticketId")))
-	mux.Handle("GET /player/{playerId}/history", s.withAuth(adapt(matchHistory.Handle, "playerId")))
+	handleTraced(mux, "POST /match/request", s.withAuth(adapt(matchRequest.Handle)))
+	handleTraced(mux, "GET /match/status/{ticketId}", s.withAuth(adapt(matchStatus.Handle, "ticketId")))
+	handleTraced(mux, "DELETE /match/cancel/{ticketId}", s.withAuth(adapt(matchCancel.Handle, "ticketId")))
+	handleTraced(mux, "GET /player/{playerId}/history", s.withAuth(adapt(matchHistory.Handle, "playerId")))
 
 	// /session/end は server-to-server 経路（ゲームサーバが呼ぶ）。本番ではフリートの
 	// IAM ロール／内部ネットワークで保護する前提のため、プレイヤー JWT は要求しない。
-	mux.Handle("POST /session/{sessionId}/end", adapt(sessionEnd.Handle, "sessionId"))
+	handleTraced(mux, "POST /session/{sessionId}/end", adapt(sessionEnd.Handle, "sessionId"))
 
-	addr := getenv("LOCALAPI_ADDR", ":8080")
 	srv := &http.Server{
 		Addr:              addr,
 		Handler:           logging(mux),
@@ -107,10 +121,17 @@ func main() {
 
 	<-shutdownCtx.Done()
 	log.Printf("localapi: shutting down")
+	// 報告の受け手は自分自身の HTTP なので、HTTP を止める前に送りかけの報告を待つ
+	// （ゲームサーバーは shutdownCtx で止まっているので、新しい報告は増えない）。
+	reporter.Wait()
 	timeout, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := srv.Shutdown(timeout); err != nil {
 		log.Printf("localapi: shutdown: %v", err)
+	}
+	// HTTP を止めた後に、溜まった Span を送り切る（逆順だと HTTP 終了中の Span が欠ける）。
+	if err := shutdown(timeout); err != nil {
+		log.Printf("localapi: shutdown telemetry: %v", err)
 	}
 }
 
@@ -166,4 +187,23 @@ func getenv(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// selfURL は listen アドレス（例: ":8080"）から、同じプロセスが自分の HTTP を呼ぶための URL を作る。
+// ホストを省略した（全インターフェースで listen する）場合は 127.0.0.1 を使う。
+func selfURL(listenAddr string) string {
+	host, port, err := net.SplitHostPort(listenAddr)
+	if err != nil {
+		return "http://127.0.0.1:8080"
+	}
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		host = "127.0.0.1"
+	}
+	return "http://" + net.JoinHostPort(host, port)
+}
+
+// handleTraced は mux.Handle と同じくルートを登録し、OTel の HTTP 計測で包む。
+// Span 名にはルートのパターンを使う（パスそのままだと ID ごとに名前が分かれてしまうため）。
+func handleTraced(mux *http.ServeMux, pattern string, handler http.Handler) {
+	mux.Handle(pattern, otelhttp.NewHandler(handler, pattern))
 }

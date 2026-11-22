@@ -9,7 +9,9 @@
 # なぜ start.sh が要るか:
 #   GameLift の runtime configuration には「環境変数を渡す」機能が無く、渡せるのは
 #   コマンドライン引数(parameters)だけ。cmd/gameserver は GAMELIFT_ENABLED /
-#   GAMESERVER_BIND を環境変数で読むため、export してから exec するラッパーを噛ませる。
+#   GAMESERVER_BIND / SESSION_API_URL を環境変数で読むため、export してから exec するラッパーを噛ませる。
+#   SESSION_API_URL（セッション終了の報告先）はリージョンごとに違うので、ビルドには焼き込まず、
+#   Terraform（modules/gamelift_ec2 の parameters）から第 1 引数で受け取る。
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -44,11 +46,13 @@ EOF
 # SDK ライフサイクル（InitSDK→ProcessReady→OnStartGameSession…）に入る。
 # Managed EC2 では SDK の接続情報が実行環境に自動で与えられるため、
 # Anywhere のような AuthToken / WebSocket URL の設定は不要。
+# 第 1 引数は /session/end の報告先（runtime_configuration の parameters）。空なら報告しない。
 cat > "$OUT_DIR/start.sh" <<'EOF'
 #!/bin/sh
 set -e
 export GAMELIFT_ENABLED=true
 export GAMESERVER_BIND=:7777
+export SESSION_API_URL="${1:-}"
 exec /local/game/gameserver
 EOF
 

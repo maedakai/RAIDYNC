@@ -50,13 +50,12 @@ type hubSessionProvider struct {
 }
 
 // CreateGameSession は本番 GameLift CreateGameSession + CreatePlayerSessions の代役。
-// sessionID を採番し、roster 付きセッションを Hub に登録して接続先を返す。プレイヤー毎に
+// 受け取った sessionID で roster 付きセッションを Hub に登録して接続先を返す。プレイヤー毎に
 // psid を採番して返す（本番の CreatePlayerSessions 相当）。各クライアントはこの psid を
 // match/status で受け取り、UDP 接続時に提示する。セッションには loggingObserver を注入し、
 // 提示 psid が参加/離脱で observer まで到達する様子をローカルで観測できるようにする。
 // 対応表(WithPlayerSessions)は事前投入しない＝実フロー同様、psid はクライアント提示で埋まる。
-func (p *hubSessionProvider) CreateGameSession(_ context.Context, questID string, playerIDs []string) (string, protocol.ConnectionInfo, map[string]string, error) {
-	sessionID := "sess-" + uuid.NewString()
+func (p *hubSessionProvider) CreateGameSession(_ context.Context, sessionID, questID string, playerIDs []string) (string, protocol.ConnectionInfo, map[string]string, error) {
 	p.hub.Register(game.NewSession(sessionID, questID, playerIDs, time.Now().UnixMilli(),
 		game.WithPlayerObserver(loggingObserver{})))
 	conn := protocol.ConnectionInfo{IPAddress: p.host, Port: p.port}
@@ -67,15 +66,23 @@ func (p *hubSessionProvider) CreateGameSession(_ context.Context, questID string
 	return sessionID, conn, playerSessions, nil
 }
 
+// EndGameSession は本番 GameLift TerminateGameSession の代役。Hub からセッションを外し、
+// 接続中のプレイヤーに SESSION_END を送る。セッションが無ければ何もせず成功を返す。
+func (p *hubSessionProvider) EndGameSession(_ context.Context, sessionID string) error {
+	p.hub.End(sessionID, time.Now().UnixMilli())
+	return nil
+}
+
 // startGameServer は GameLift モード（固定セッションを作らない）で UDP ゲームサーバを
 // 起動し、Serve を ctx 連動でバックグラウンド駆動する。返す provider をマッチャーに渡すと、
 // マッチ成立でこの Hub にセッションが登録され、クライアントは advertised host:port へ
 // UDP 接続できる。ctx キャンセルで Serve は停止する。
-func startGameServer(ctx context.Context, bindAddr, advertiseHost string) (*hubSessionProvider, *gameserver.Server, error) {
+// reporter はセッションが終わったときに /session/end を呼ぶ報告係（本番のゲームサーバーと同じもの）。
+func startGameServer(ctx context.Context, bindAddr, advertiseHost string, reporter *gameserver.SessionReporter) (*hubSessionProvider, *gameserver.Server, error) {
 	srv, err := gameserver.New(gameserver.Config{
 		BindAddr:        bindAddr,
 		GameLiftEnabled: true, // 固定セッションを作らず、provider が動的に登録する
-	})
+	}, game.WithSessionEndObserver(reporter))
 	if err != nil {
 		return nil, nil, err
 	}

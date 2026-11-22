@@ -123,12 +123,53 @@ func TestPruneIdle_RemovesTimedOut(t *testing.T) {
 
 func TestEndReason_TimeoutAfterMax(t *testing.T) {
 	s := NewSession("sess-1", "quest-001", []string{"p1"}, 0)
+	// 接続中のプレイヤーを置き、誰も来ない・全員抜けたの判定に引っかからないようにする
+	// （EndReason は PruneIdle を呼ばないので、0ms の受信のままでも players に残る）。
+	require.NoError(t, s.Ingest(moveMsg("sess-1", "p1", 1, protocol.Vector3{}, protocol.ActorIdle), addr(5001), 0))
 	_, ok := s.EndReason(maxSessionMs - 1)
 	assert.False(t, ok)
 
 	reason, ok := s.EndReason(maxSessionMs)
 	require.True(t, ok)
 	assert.Equal(t, protocol.EndTimeout, reason)
+}
+
+func TestEndReason_NoShow(t *testing.T) {
+	s := NewSession("sess-1", "quest-001", []string{"p1"}, 0)
+
+	_, ok := s.EndReason(noShowTimeoutMs - 1)
+	assert.False(t, ok, "見切る直前はまだ待つ")
+
+	reason, ok := s.EndReason(noShowTimeoutMs)
+	require.True(t, ok)
+	assert.Equal(t, protocol.EndAbandoned, reason)
+}
+
+func TestEndReason_AllLeft(t *testing.T) {
+	s := NewSession("sess-1", "quest-001", []string{"p1", "p2"}, 0)
+	require.NoError(t, s.Ingest(moveMsg("sess-1", "p1", 1, protocol.Vector3{}, protocol.ActorIdle), addr(5001), 0))
+	require.NoError(t, s.Ingest(moveMsg("sess-1", "p2", 1, protocol.Vector3{}, protocol.ActorIdle), addr(5002), 0))
+
+	// 10 秒を超えて無音 → 2 人とも離脱扱い。猶予はここで済んでいるので、すぐ終える
+	now := int64(protocol.PlayerIdleTimeoutMs + 1)
+	require.Equal(t, 2, s.PruneIdle(now))
+
+	reason, ok := s.EndReason(now)
+	require.True(t, ok)
+	assert.Equal(t, protocol.EndAbandoned, reason)
+}
+
+func TestEndReason_KeepsWhilePlayerRemains(t *testing.T) {
+	s := NewSession("sess-1", "quest-001", []string{"p1", "p2"}, 0)
+	require.NoError(t, s.Ingest(moveMsg("sess-1", "p1", 1, protocol.Vector3{}, protocol.ActorIdle), addr(5001), 0))
+	require.NoError(t, s.Ingest(moveMsg("sess-1", "p2", 1, protocol.Vector3{}, protocol.ActorIdle), addr(5002), 0))
+	// p2 だけ送り続ける。p1 は抜けるが、1 人残っているので終えない
+	now := int64(noShowTimeoutMs + 1)
+	require.NoError(t, s.Ingest(moveMsg("sess-1", "p2", 2, protocol.Vector3{}, protocol.ActorIdle), addr(5002), now))
+	require.Equal(t, 1, s.PruneIdle(now))
+
+	_, ok := s.EndReason(now)
+	assert.False(t, ok, "40 秒を過ぎても、来たことがあり 1 人残っていれば終えない")
 }
 
 func TestEndMessage_Idempotent(t *testing.T) {

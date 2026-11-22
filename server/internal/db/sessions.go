@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -44,23 +45,94 @@ func (c *Client) GetSession(ctx context.Context, sessionID string) (*protocol.Se
 	return &s, nil
 }
 
-// EndSession はセッションを ENDED に遷移し、終了時刻を記録する。
-func (c *Client) EndSession(ctx context.Context, sessionID string, endedAt int64) error {
+// EndSession はセッションを ENDED に遷移し、プレイヤー全員分のマッチ履歴を、1 つのトランザクションで書く。
+// 遷移は ACTIVE のときだけ行う。ENDED（二重の報告）や FAILED（片付け済み）なら ErrConflict を返し、履歴も書かない。
+// 途中で落ちても何も書かれないため、報告し直せばやり直せる。
+func (c *Client) EndSession(ctx context.Context, sessionID string, entries []protocol.MatchHistoryEntry, endedAt int64) error {
+	writes := make([]ddbtypes.TransactWriteItem, 0, len(entries)+1)
+	writes = append(writes, ddbtypes.TransactWriteItem{
+		Update: &ddbtypes.Update{
+			TableName:                aws.String(c.tables.Sessions),
+			Key:                      sessionKey(sessionID),
+			UpdateExpression:         aws.String("SET #s = :ended, endedAt = :t"),
+			ConditionExpression:      aws.String("#s = :active"),
+			ExpressionAttributeNames: map[string]string{"#s": "status"},
+			ExpressionAttributeValues: map[string]ddbtypes.AttributeValue{
+				":active": &ddbtypes.AttributeValueMemberS{Value: string(protocol.SessionActive)},
+				":ended":  &ddbtypes.AttributeValueMemberS{Value: string(protocol.SessionEnded)},
+				":t":      &ddbtypes.AttributeValueMemberN{Value: itoa64(endedAt)},
+			},
+		},
+	})
+	for _, e := range entries {
+		item, err := attributevalue.MarshalMap(e)
+		if err != nil {
+			return fmt.Errorf("marshal history entry: %w", err)
+		}
+		writes = append(writes, ddbtypes.TransactWriteItem{
+			Put: &ddbtypes.Put{
+				TableName: aws.String(c.tables.MatchHistory),
+				Item:      item,
+			},
+		})
+	}
+	return c.transactWithRetry(ctx, writes)
+}
+
+// FailSession はセッションを FAILED に遷移し、片付けた時刻を endedAt に記録する。
+// マッチの確定に失敗し、ゲームセッションを終わらせたときに使う（ENDED と区別して残す）。
+// 行が無ければ何もせず nil を返す。救済では Sessions の行を書く前に止まっている場合があり、
+// UpdateItem のままだと中身の無い行を新しく作ってしまうため、attribute_exists を条件にする。
+func (c *Client) FailSession(ctx context.Context, sessionID string, endedAt int64) error {
 	_, err := c.ddb.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName:                aws.String(c.tables.Sessions),
 		Key:                      sessionKey(sessionID),
-		UpdateExpression:         aws.String("SET #s = :ended, endedAt = :t"),
+		UpdateExpression:         aws.String("SET #s = :failed, endedAt = :t"),
+		ConditionExpression:      aws.String("attribute_exists(sessionId)"),
 		ExpressionAttributeNames: map[string]string{"#s": "status"},
 		ExpressionAttributeValues: map[string]ddbtypes.AttributeValue{
-			":ended": &ddbtypes.AttributeValueMemberS{Value: string(protocol.SessionEnded)},
-			":t":     &ddbtypes.AttributeValueMemberN{Value: itoa64(endedAt)},
+			":failed": &ddbtypes.AttributeValueMemberS{Value: string(protocol.SessionFailed)},
+			":t":      &ddbtypes.AttributeValueMemberN{Value: itoa64(endedAt)},
 		},
 	})
-	return err
+	if err != nil {
+		var failed *ddbtypes.ConditionalCheckFailedException
+		if errors.As(err, &failed) {
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 func sessionKey(sessionID string) map[string]ddbtypes.AttributeValue {
 	return map[string]ddbtypes.AttributeValue{
 		"sessionId": &ddbtypes.AttributeValueMemberS{Value: sessionID},
 	}
+}
+
+// ScanByQuest は questId が一致するセッションを全件返す（ページングを辿る）。
+// Sessions に questId の索引は無く全件 Scan になるため、負荷テストの検証専用。本番経路では使わない。
+func (c *Client) ScanByQuest(ctx context.Context, questID string) ([]protocol.Session, error) {
+	p := dynamodb.NewScanPaginator(c.ddb, &dynamodb.ScanInput{
+		TableName:        aws.String(c.tables.Sessions),
+		FilterExpression: aws.String("questId = :q"),
+		ExpressionAttributeValues: map[string]ddbtypes.AttributeValue{
+			":q": &ddbtypes.AttributeValueMemberS{Value: questID},
+		},
+	})
+	var sessions []protocol.Session
+	for p.HasMorePages() {
+		var pageSessions []protocol.Session
+		page, err := p.NextPage(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("scan sessions: %w", err)
+		}
+		err = attributevalue.UnmarshalListOfMaps(page.Items, &pageSessions)
+		if err != nil {
+			return nil, fmt.Errorf("unmarshal sessions: %w", err)
+		}
+		sessions = append(sessions, pageSessions...)
+	}
+	return sessions, nil
 }

@@ -12,6 +12,11 @@ import (
 // maxSessionMs は 1 セッションの最大継続時間（ms）。
 const maxSessionMs = protocol.MaxSessionMinutes * 60 * 1000
 
+// noShowTimeoutMs は、セッションを作ってから誰も来ないときに見切るまでの時間（ms）。
+// クライアントは 2 秒ごとのポーリングで MATCHED を受け取ってから UDP で接続するため、その遅れを見込んだ値。
+// サーバーが一方的に見切るだけでクライアントは知る必要がないため、protocol ではなくここに置く。
+const noShowTimeoutMs = 40_000
+
 // PlayerObserver はセッションへのプレイヤー参加/離脱を受け取る。GameLift Bridge が
 // AcceptPlayerSession(psid) / RemovePlayerSession(psid) を呼ぶために実装する。
 // 各コールバックは Session の Mutex を保持していない状態で呼ばれる（実装側が
@@ -59,6 +64,7 @@ type Session struct {
 	outSeq         uint32            // SESSION_STATE の送信シーケンス（サーバー採番）
 	createdAt      int64             // UnixTime ms
 	endsAt         int64             // createdAt + 20 分。これを過ぎたら timeout 終了
+	everJoined     bool              // 一度でも誰かが接続したか。立てたら戻さない（誰も来ないと全員抜けたを見分ける）
 	ended          bool
 
 	observer PlayerObserver // 参加/離脱通知先。nil=通知しない（ローカル既定）
@@ -113,6 +119,7 @@ func (s *Session) Ingest(msg *protocol.GameMessage, addr *net.UDPAddr, now int64
 	if p == nil {
 		p = newPlayer(msg.PlayerID, now)
 		s.players[msg.PlayerID] = p
+		s.everJoined = true
 		// クライアントが提示した psid を優先採用し、対応表に書き戻す。以降の離脱通知
 		// （PruneIdle/EndMessage）もこの表を引くため、参加/離脱で同じ psid が使われる。
 		// 提示が無い経路（ローカル）は WithPlayerSessions で事前投入された値をそのまま使う。
@@ -227,9 +234,10 @@ func (s *Session) PruneIdle(now int64) int {
 	return removed
 }
 
-// EndReason はセッションを終了すべきか判定し、終了理由を返す。
+// EndReason はセッションを終了すべきか判定し、終了理由を返す。上から順に判定する。
 //   - 最大時間（20 分）到達 → timeout
-//   - 一度でも接続したが全員離脱 → abandoned
+//   - 誰も来ないまま noShowTimeoutMs 経過 → abandoned
+//   - 一度でも接続したが全員離脱 → abandoned（離脱の猶予は PruneIdle の PlayerIdleTimeoutMs が持つため、すぐ終える）
 //
 // まだ終了すべきでなければ ok=false。
 func (s *Session) EndReason(now int64) (protocol.SessionEndReason, bool) {
@@ -241,6 +249,12 @@ func (s *Session) EndReason(now int64) (protocol.SessionEndReason, bool) {
 	}
 	if now >= s.endsAt {
 		return protocol.EndTimeout, true
+	}
+	if !s.everJoined && now-s.createdAt >= noShowTimeoutMs {
+		return protocol.EndAbandoned, true
+	}
+	if s.everJoined && len(s.players) == 0 {
+		return protocol.EndAbandoned, true
 	}
 	return "", false
 }
@@ -290,6 +304,13 @@ func (s *Session) PlayerCount() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return len(s.players)
+}
+
+// Duration はセッションを作ってから now までの経過時間を秒で返す（/session/end の durationSec に使う）。
+func (s *Session) Duration(now int64) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return int((now - s.createdAt) / 1000)
 }
 
 // Ended はセッションが終了済みかを返す。
