@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -61,18 +62,28 @@ func (c *Client) EndSession(ctx context.Context, sessionID string, endedAt int64
 
 // FailSession はセッションを FAILED に遷移し、片付けた時刻を endedAt に記録する。
 // マッチの確定に失敗し、ゲームセッションを終わらせたときに使う（ENDED と区別して残す）。
+// 行が無ければ何もせず nil を返す。救済では Sessions の行を書く前に止まっている場合があり、
+// UpdateItem のままだと中身の無い行を新しく作ってしまうため、attribute_exists を条件にする。
 func (c *Client) FailSession(ctx context.Context, sessionID string, endedAt int64) error {
 	_, err := c.ddb.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName:                aws.String(c.tables.Sessions),
 		Key:                      sessionKey(sessionID),
 		UpdateExpression:         aws.String("SET #s = :failed, endedAt = :t"),
+		ConditionExpression:      aws.String("attribute_exists(sessionId)"),
 		ExpressionAttributeNames: map[string]string{"#s": "status"},
 		ExpressionAttributeValues: map[string]ddbtypes.AttributeValue{
 			":failed": &ddbtypes.AttributeValueMemberS{Value: string(protocol.SessionFailed)},
 			":t":      &ddbtypes.AttributeValueMemberN{Value: itoa64(endedAt)},
 		},
 	})
-	return err
+	if err != nil {
+		var failed *ddbtypes.ConditionalCheckFailedException
+		if errors.As(err, &failed) {
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 func sessionKey(sessionID string) map[string]ddbtypes.AttributeValue {

@@ -161,6 +161,16 @@ func (f *fakeSessionProvider) EndGameSession(_ context.Context, sessionID string
 	return f.endErr
 }
 
+func (f *fakeStore) FindMatchingByToken(ctx context.Context, questID, token string) ([]protocol.Ticket, error) {
+	var out []protocol.Ticket
+	for _, t := range f.tickets {
+		if t.QuestID == questID && t.Status == protocol.StatusMatching && t.IdempotencyToken == token {
+			out = append(out, *t)
+		}
+	}
+	return out, nil
+}
+
 func newFakeSessionProvider() *fakeSessionProvider {
 	return &fakeSessionProvider{
 		conn: protocol.ConnectionInfo{IPAddress: "10.0.0.1", Port: 7777},

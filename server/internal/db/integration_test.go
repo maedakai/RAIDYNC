@@ -307,3 +307,81 @@ func TestMarkMatched_LateAfterFailed(t *testing.T) {
 		assert.Equal(t, tk.Version+1, got.Version)
 	}
 }
+
+func TestFindMatchingByToken(t *testing.T) {
+	c, ctx := setup(t)
+	prefix := "find-token" // makeTicket は QuestID を "quest-" + prefix にするので、3 グループとも同じクエストになる
+	matchingAt := time.Now().UnixMilli()
+
+	// A を 4 枚作って、トークン A で確保
+	tokenA := uuid.NewString()
+	ticketsA := make([]protocol.Ticket, 0, 4)
+	for i := 0; i < 4; i++ {
+		tk := makeTicket(prefix, i)
+		require.NoError(t, c.PutTicket(ctx, tk))
+		ticketsA = append(ticketsA, tk)
+	}
+	require.NoError(t, c.ClaimTickets(ctx, ticketsA, matchingAt, tokenA))
+
+	// B を 2 枚作って、トークン B で確保
+	tokenB := uuid.NewString()
+	ticketsB := make([]protocol.Ticket, 0, 2)
+	for i := 0; i < 2; i++ {
+		tk := makeTicket(prefix, i)
+		require.NoError(t, c.PutTicket(ctx, tk))
+		ticketsB = append(ticketsB, tk)
+	}
+	require.NoError(t, c.ClaimTickets(ctx, ticketsB, matchingAt, tokenB))
+
+	// C を 1 枚作るだけ
+	require.NoError(t, c.PutTicket(ctx, makeTicket(prefix, 0)))
+
+	// got の TicketID の集まりが、A の 4 枚の TicketID とちょうど一致すること
+	got, err := c.FindMatchingByToken(ctx, "quest-"+prefix, tokenA)
+	require.NoError(t, err)
+
+	// 並び順は決まっていないので、TicketID の集まりとして比べる
+	wantIDs := make([]string, 0, len(ticketsA))
+	for _, tk := range ticketsA {
+		wantIDs = append(wantIDs, tk.TicketID)
+	}
+	gotIDs := make([]string, 0, len(got))
+	for _, tk := range got {
+		gotIDs = append(gotIDs, tk.TicketID)
+	}
+	assert.ElementsMatch(t, wantIDs, gotIDs)
+}
+
+// TestFailSession は、行があれば FAILED にして endedAt を記録し、行が無ければ作らずに nil を返すことを確認する。
+func TestFailSession(t *testing.T) {
+	c, ctx := setup(t)
+
+	t.Run("existing", func(t *testing.T) {
+		sessionID := uuid.NewString()
+		require.NoError(t, c.PutSession(ctx, protocol.Session{
+			SessionID: sessionID,
+			QuestID:   "quest-fail-session",
+			Status:    protocol.SessionActive,
+			CreatedAt: time.Now().UnixMilli(),
+		}))
+		endedAt := time.Now().UnixMilli()
+
+		require.NoError(t, c.FailSession(ctx, sessionID, endedAt))
+
+		got, err := c.GetSession(ctx, sessionID)
+		require.NoError(t, err)
+		require.NotNil(t, got)
+		assert.Equal(t, protocol.SessionFailed, got.Status)
+		assert.Equal(t, endedAt, got.EndedAt)
+	})
+
+	t.Run("missing", func(t *testing.T) {
+		sessionID := uuid.NewString() // PutSession していない ID
+
+		require.NoError(t, c.FailSession(ctx, sessionID, time.Now().UnixMilli()))
+
+		got, err := c.GetSession(ctx, sessionID)
+		require.NoError(t, err)
+		assert.Nil(t, got, "行が無ければ作らない（upsert しない）")
+	})
+}

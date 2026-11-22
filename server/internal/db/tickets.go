@@ -336,3 +336,34 @@ func (c *Client) transactWithRetry(ctx context.Context, writes []ddbtypes.Transa
 	}
 	return err
 }
+
+// FindMatchingByToken は、questId-status-index で同じクエストの MATCHING チケットを集め、
+// 確保時に書いた idempotencyToken が token と一致するもの（＝同じグループの仲間）だけを返す。
+// 止まった MATCHING の救済で使う。FilterExpression は読んだ後に効くため Limit は付けず、ページをたどる。
+func (c *Client) FindMatchingByToken(ctx context.Context, questID, token string) ([]protocol.Ticket, error) {
+	p := dynamodb.NewQueryPaginator(c.ddb, &dynamodb.QueryInput{
+		TableName:                aws.String(c.tables.MatchmakingTickets),
+		IndexName:                aws.String(indexQuestStatus),
+		FilterExpression:         aws.String("idempotencyToken = :tok"),
+		KeyConditionExpression:   aws.String("questId = :q AND #s = :m"),
+		ExpressionAttributeNames: map[string]string{"#s": "status"},
+		ExpressionAttributeValues: map[string]ddbtypes.AttributeValue{
+			":q":   &ddbtypes.AttributeValueMemberS{Value: questID},
+			":m":   &ddbtypes.AttributeValueMemberS{Value: string(protocol.StatusMatching)},
+			":tok": &ddbtypes.AttributeValueMemberS{Value: token},
+		},
+	})
+	var tickets []protocol.Ticket
+	for p.HasMorePages() {
+		page, err := p.NextPage(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("query matching tickets: %w", err)
+		}
+		pageTickets, err := unmarshalTickets(page.Items)
+		if err != nil {
+			return nil, err
+		}
+		tickets = append(tickets, pageTickets...)
+	}
+	return tickets, nil
+}
