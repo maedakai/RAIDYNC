@@ -131,6 +131,15 @@ func (b *GameLiftBridge) onStartGameSession(gs model.GameSession) {
 	log.Printf("game session started: %s (quest=%s roster=%v psids=%d)", sessionID, questID, roster, len(playerSessions))
 }
 
+// OnSessionEnd は game.SessionEndObserver を満たし、受信ループを止める。
+// GameLift は 1 プロセス 1 セッションなので、セッションが終わればプロセスも終える。
+// ここでは stop だけを呼んですぐ戻る（Tick から呼ばれるため）。ProcessEnding は、
+// main が報告係の送りかけの報告を待ってから End で呼ぶ（先に呼ぶと報告が強制終了で消えうる）。
+func (b *GameLiftBridge) OnSessionEnd(sessionID string, reason protocol.SessionEndReason, durationSec int) {
+	log.Printf("game session ended: %s (reason=%s duration=%ds); shutting down", sessionID, reason, durationSec)
+	b.stop()
+}
+
 // onProcessTerminate は GameLift からの停止要求（Spot 中断/スケールダウン）で呼ばれる。
 // 受信ループを止め、main 側が End()→ProcessEnding を呼べるようにする。
 func (b *GameLiftBridge) onProcessTerminate() {

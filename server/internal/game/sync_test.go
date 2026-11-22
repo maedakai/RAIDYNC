@@ -154,3 +154,17 @@ func TestHub_NotifiesSessionEndOnce(t *testing.T) {
 	require.Len(t, obs.calls, 1, "2 回目の終了では通知しない")
 	assert.Equal(t, protocol.EndAbandoned, obs.calls[0].reason)
 }
+
+func TestHub_NotifiesAllSessionEndObservers(t *testing.T) {
+	first, second := &fakeEndObserver{}, &fakeEndObserver{}
+	hub := NewHub(&fakeSender{}, WithSessionEndObserver(first))
+	hub.AddSessionEndObserver(second) // 作った後から足した通知先にも届く
+	s := NewSession("sess-1", "quest-001", []string{"p1"}, 0)
+	hub.Register(s)
+
+	hub.End("sess-1", 1_000)
+
+	want := []endCall{{sessionID: "sess-1", reason: protocol.EndAbandoned, durationSec: 1}}
+	assert.Equal(t, want, first.calls)
+	assert.Equal(t, want, second.calls)
+}

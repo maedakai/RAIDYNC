@@ -25,9 +25,9 @@ type SessionEndObserver interface {
 // HubOption は NewHub の任意設定。既存呼び出し（オプション無し）は挙動不変。
 type HubOption func(*Hub)
 
-// WithSessionEndObserver はセッション終了の通知先を設定する。
+// WithSessionEndObserver はセッション終了の通知先を足す。複数回渡せば、渡した順に全員へ知らせる。
 func WithSessionEndObserver(obs SessionEndObserver) HubOption {
-	return func(h *Hub) { h.endObserver = obs }
+	return func(h *Hub) { h.endObservers = append(h.endObservers, obs) }
 }
 
 // Hub は同一プロセス上の複数セッションを束ね、受信ルーティングと
@@ -40,7 +40,7 @@ type Hub struct {
 	mu       sync.RWMutex
 	sessions map[string]*Session
 
-	endObserver SessionEndObserver // セッション終了の通知先。nil=通知しない（ローカル既定）
+	endObservers []SessionEndObserver // セッション終了の通知先。空=通知しない（ローカル既定）。mu で保護
 }
 
 // NewHub は送信手段 sender を注入して Hub を生成する。
@@ -111,10 +111,15 @@ func (h *Hub) endSession(s *Session, reason protocol.SessionEndReason, now int64
 	}
 	h.mu.Lock()
 	delete(h.sessions, s.ID)
+	observers := h.endObservers // ロックの外で回すため、ここで手元に取る
 	h.mu.Unlock()
 
-	if ok && h.endObserver != nil {
-		h.endObserver.OnSessionEnd(s.ID, reason, s.Duration(now))
+	if !ok {
+		return
+	}
+	durationSec := s.Duration(now)
+	for _, obs := range observers {
+		obs.OnSessionEnd(s.ID, reason, durationSec)
 	}
 }
 
@@ -130,6 +135,15 @@ func (h *Hub) broadcast(msg protocol.GameMessage, recipients []*net.UDPAddr) {
 	for _, addr := range recipients {
 		_ = h.sender.SendTo(addr, data) // UDP は送りっぱなし。個別失敗は無視
 	}
+}
+
+// AddSessionEndObserver は Hub を作った後から、セッション終了の通知先を足す。
+// Hub を引数に取って後から作られるもの（GameLift Bridge）を通知先にするために使う。
+// mu で保護するので、Tick が動いている最中に呼んでもよい（足す前に終わったセッションは知らせない）。
+func (h *Hub) AddSessionEndObserver(obs SessionEndObserver) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.endObservers = append(h.endObservers, obs)
 }
 
 // SessionCount は登録中のセッション数を返す。

@@ -17,19 +17,29 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/raidync/server/internal/game"
 	"github.com/raidync/server/internal/gameserver"
 )
 
 func main() {
 	cfg := loadConfig()
 
-	srv, err := gameserver.New(cfg)
+	// SESSION_API_URL があれば、セッションが終わったときに /session/end で結果を報告する。
+	// 空なら報告しない（ローカルでゲームサーバーだけを動かす場合）。
+	var reporter *gameserver.SessionReporter
+	var hubOpts []game.HubOption
+	if cfg.SessionAPIURL != "" {
+		reporter = gameserver.NewSessionReporter(cfg.SessionAPIURL)
+		hubOpts = append(hubOpts, game.WithSessionEndObserver(reporter))
+	}
+
+	srv, err := gameserver.New(cfg, hubOpts...)
 	if err != nil {
 		log.Fatalf("start gameserver: %v", err)
 	}
 	defer srv.Close()
-	log.Printf("gameserver listening on udp %s (session=%q quest=%s roster=%v)",
-		srv.LocalAddr(), cfg.SessionID, cfg.QuestID, cfg.Roster)
+	log.Printf("gameserver listening on udp %s (session=%q quest=%s roster=%v report=%t)",
+		srv.LocalAddr(), cfg.SessionID, cfg.QuestID, cfg.Roster, reporter != nil)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -39,6 +49,9 @@ func main() {
 	var bridge *gameserver.GameLiftBridge
 	if cfg.GameLiftEnabled {
 		bridge = gameserver.NewGameLiftBridge(srv.Hub(), srv.LocalAddr().Port, stop)
+		// セッションが終わったらプロセスを終える（1 プロセス 1 セッション）。
+		// Bridge は Hub を受け取って後から作られるので、通知先は作った後に足す。
+		srv.Hub().AddSessionEndObserver(bridge)
 		if err := bridge.Activate(); err != nil {
 			log.Fatalf("gamelift activate: %v", err)
 		}
@@ -47,6 +60,11 @@ func main() {
 
 	srv.Serve(ctx)
 
+	// 終わりの順番: 報告を待つ → ProcessEnding → ソケットを閉じる（defer）。
+	// ProcessEnding を先に呼ぶと、GameLift がプロセスを片付け始め、送りかけの報告が消えうる。
+	if reporter != nil {
+		reporter.Wait()
+	}
 	if bridge != nil {
 		if err := bridge.End(); err != nil {
 			log.Printf("ProcessEnding: %v", err)
@@ -62,6 +80,7 @@ func loadConfig() gameserver.Config {
 		QuestID:         env("GAMESERVER_QUEST_ID", "quest-001"),
 		Roster:          splitRoster(env("GAMESERVER_ROSTER", "p1,p2,p3,p4")),
 		GameLiftEnabled: env("GAMELIFT_ENABLED", "false") == "true",
+		SessionAPIURL:   env("SESSION_API_URL", ""),
 	}
 }
 
