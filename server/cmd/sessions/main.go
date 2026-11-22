@@ -45,8 +45,17 @@ func main() {
 	// マッチ成功 1 回は必ず 1 枠に対応するので、枠の合計（全セッションの人数の和）が matched と一致するかを見る。
 	// 二重マッチ（1 チケットが 2 セッションに入る）があると、枠の合計が matched より多くなる。
 	// 人数は 60 秒後の見切り発車があるため MinMatchSize〜MaxPartySize。ソロ指定はしないので 1 人は NG。
+	// FAILED（マッチの確定に失敗して片付けたセッション）は誰も遊んでいないので、枠にも人数のチェックにも入れない。
+	// k6 の matchFailed は rate == 0 が合格なので、本来は 0 件。件数はログに出して、出ていれば気づけるようにする。
 	slots := 0
+	failedSessions := 0
+	activeSessions := 0
 	for _, s := range sessions {
+		if s.Status == protocol.SessionFailed {
+			failedSessions++
+			continue
+		}
+		activeSessions++
 		if len(s.PlayerIDs) < protocol.MinMatchSize || len(s.PlayerIDs) > protocol.MaxPartySize {
 			log.Printf("NG: session %s has %d players, expected %d-%d", s.SessionID, len(s.PlayerIDs), protocol.MinMatchSize, protocol.MaxPartySize)
 			failed = true
@@ -62,5 +71,5 @@ func main() {
 	if failed {
 		os.Exit(1)
 	}
-	log.Printf("OK: %d sessions / %d matched", len(sessions), matched)
+	log.Printf("OK: %d sessions (%d failed, excluded) / %d matched", activeSessions, failedSessions, matched)
 }

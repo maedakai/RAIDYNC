@@ -61,13 +61,16 @@ data "aws_iam_policy_document" "matchmaking" {
     )
   }
 
-  # GameLift: セッション作成に必要な 2 アクション。CreateGameSession/CreatePlayerSessions は
+  # GameLift: セッションの作成と終了に必要な 3 アクション。CreateGameSession/CreatePlayerSessions は
   # resource-level 権限のサポートが限定的で、かつ fleet はこの時点で未作成のため Resource="*"。
+  # TerminateGameSession はマッチの確定に失敗したときと、止まった MATCHING の救済で使う。
+  # 終わらせるセッションの ARN は実行時に決まる（fleet ID とトークンから組み立てる）ため、これも "*"。
   statement {
-    sid = "GameLiftCreateSessions"
+    sid = "GameLiftSessions"
     actions = [
       "gamelift:CreateGameSession",
       "gamelift:CreatePlayerSessions",
+      "gamelift:TerminateGameSession",
     ]
     resources = ["*"]
   }
