@@ -11,7 +11,7 @@ client ─UDP →  localapi 同居 gameserver(:7777)  … PLAYER_MOVE / SESSION_
 localapi ─→ LocalStack DynamoDB(:4566)        … Tickets / Sessions / MatchHistory
 ```
 
-E2E フロー: `login → match/request → poll status → UDP play → session/end → history`。
+E2E フロー: `login → match/request → poll status → UDP play → （ゲームサーバーが session/end を報告）→ history`。
 
 ---
 
@@ -77,7 +77,7 @@ $env:OTEL_EXPORTER_OTLP_INSECURE = "true"   # ローカルの Jaeger は平文�
 期待ログ（抜粋）:
 
 ```
-localapi: gameserver(udp) listening on 127.0.0.1:7777 (advertise 127.0.0.1:7777)
+localapi: gameserver(udp) listening on 127.0.0.1:7777 (advertise 127.0.0.1:7777, report to http://127.0.0.1:8080)
 localapi: listening on :8080
 ```
 
@@ -98,7 +98,6 @@ cd C:\work\RAIDYNC
 | `-quest` | `quest-rathalos` | マッチ対象クエスト |
 | `-solo` | `true` | 単独で即マッチ成立させる |
 | `-moves` | `10` | 送る PLAYER_MOVE 数 |
-| `-result` | `CLEAR` | 報告する結末（CLEAR/FAILED/ABANDONED） |
 
 期待ログ（抜粋・順序）:
 
@@ -110,13 +109,15 @@ client: udp connected to 127.0.0.1:7777
 client: <- SESSION_STATE seq=1 players=1 self.health=100
 ...
 client: play done sent=10 moves +1 action, received=N SESSION_STATE
-client: result reported status=ENDED playersSaved=1 result=CLEAR
-client: history entries=1
-client:   [0] session=sess-... quest=quest-rathalos result=CLEAR duration=...s
+client: waiting for session end report…
+...（送信をやめてから約 10 秒）
+client: history found session=... quest=quest-rathalos result=ABANDONED duration=11s
 client: E2E completed
 ```
 
-**`client: E2E completed`** が出れば成功（report→history が DynamoDB を介してつながったことの確証）。
+**`client: E2E completed`** が出れば成功（ゲームサーバーの報告 → history が DynamoDB を介してつながったことの確証）。
+
+> **結果の報告はゲームサーバーが行う（Phase 6 B1）**：client は送信をやめるだけで、`/session/end` を呼ばない。同居ゲームサーバー側で 10 秒無音 → 離脱扱い → 全員抜けたとしてセッションが終わり、報告係（`SessionReporter`）が localapi 自身の `/session/end` に `ABANDONED` を報告する。ゲームには `completed`（クエスト達成）で終わる条件がまだ無いため、結果は常に `ABANDONED` になる。ターミナルA には `session end reported ... result=ABANDONED` が出る。
 
 > **psid 配管の確認（G1-full）**：client は match/status で受け取った `psid=psess-...` を UDP 毎パケットに提示する。ターミナルA（localapi）側には参加/離脱時に次のログが出る（`loggingObserver` が実 AWS の `GameLiftBridge` の代役で、`AcceptPlayerSession`/`RemovePlayerSession` 呼び出しに相当）:
 > ```

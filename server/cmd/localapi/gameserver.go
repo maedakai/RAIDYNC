@@ -77,11 +77,12 @@ func (p *hubSessionProvider) EndGameSession(_ context.Context, sessionID string)
 // 起動し、Serve を ctx 連動でバックグラウンド駆動する。返す provider をマッチャーに渡すと、
 // マッチ成立でこの Hub にセッションが登録され、クライアントは advertised host:port へ
 // UDP 接続できる。ctx キャンセルで Serve は停止する。
-func startGameServer(ctx context.Context, bindAddr, advertiseHost string) (*hubSessionProvider, *gameserver.Server, error) {
+// reporter はセッションが終わったときに /session/end を呼ぶ報告係（本番のゲームサーバーと同じもの）。
+func startGameServer(ctx context.Context, bindAddr, advertiseHost string, reporter *gameserver.SessionReporter) (*hubSessionProvider, *gameserver.Server, error) {
 	srv, err := gameserver.New(gameserver.Config{
 		BindAddr:        bindAddr,
 		GameLiftEnabled: true, // 固定セッションを作らず、provider が動的に登録する
-	})
+	}, game.WithSessionEndObserver(reporter))
 	if err != nil {
 		return nil, nil, err
 	}
