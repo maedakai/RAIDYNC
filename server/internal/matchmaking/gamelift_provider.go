@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/gamelift"
@@ -26,14 +27,22 @@ type gameLiftAPI interface {
 // 実 SDK クライアントが gameLiftAPI を満たすことをコンパイル時に保証する。
 var _ gameLiftAPI = (*gamelift.Client)(nil)
 
+const (
+	// playerSessionsAttempts は CreatePlayerSessions を送る回数の上限（最初の 1 回 + 送り直し 5 回）。
+	playerSessionsAttempts = 6
+	// playerSessionsRetryWait は送り直しの最初の間隔。200ms → 400ms → … と倍にし、待ちは合計で最大 6.2 秒。
+	playerSessionsRetryWait = 200 * time.Millisecond
+)
+
 // GameLiftProvider は実 GameLift でゲームセッションとプレイヤーセッションを作る SessionProvider。
 // GameLiftStub / hubSessionProvider の本番差し替え先（G2）。
 type GameLiftProvider struct {
 	api        gameLiftAPI
 	fleetID    string
-	location   string // Anywhere のカスタムロケーション（"custom-..."）。managed EC2 では空
-	maxPlayers int32  // セッション定員（RAIDYNC は 4）
-	region     string // フリートのリージョン。managed EC2 では location の代わりに ARN へ入れる
+	location   string        // Anywhere のカスタムロケーション（"custom-..."）。managed EC2 では空
+	maxPlayers int32         // セッション定員（RAIDYNC は 4）
+	region     string        // フリートのリージョン。managed EC2 では location の代わりに ARN へ入れる
+	retryWait  time.Duration // CreatePlayerSessions の送り直しの最初の間隔。テストでは短くする
 }
 
 // SessionProvider を満たすことをコンパイル時に保証する。
@@ -42,7 +51,7 @@ var _ SessionProvider = (*GameLiftProvider)(nil)
 // NewGameLiftProvider は注入済み API クライアントで Provider を生成する（テスト/DI 用）。
 // location が空でなければ CreateGameSession に付与する（Anywhere 用）。
 func NewGameLiftProvider(api gameLiftAPI, fleetID, location, region string) *GameLiftProvider {
-	return &GameLiftProvider{api: api, fleetID: fleetID, location: location, maxPlayers: protocol.MaxPartySize, region: region}
+	return &GameLiftProvider{api: api, fleetID: fleetID, location: location, maxPlayers: protocol.MaxPartySize, region: region, retryWait: playerSessionsRetryWait}
 }
 
 // NewGameLiftProviderFromConfig は aws.Config から実 SDK クライアントを組んで Provider を生成する。
@@ -89,14 +98,9 @@ func (p *GameLiftProvider) CreateGameSession(ctx context.Context, sessionID, que
 	}
 	conn := protocol.ConnectionInfo{IPAddress: *gs.IpAddress, Port: int(*gs.Port)}
 
-	// CreatePlayerSessions は GameSessionId として ARN またはショート ID の両方を受け入れる。
-	// ここでは GameLift API が返した生の値をそのまま渡す（確実に有効なため）。
-	ps, err := p.api.CreatePlayerSessions(ctx, &gamelift.CreatePlayerSessionsInput{
-		GameSessionId: aws.String(rawSessionID),
-		PlayerIds:     playerIDs,
-	})
+	ps, err := p.createPlayerSessions(ctx, rawSessionID, playerIDs)
 	if err != nil {
-		return "", zero, nil, fmt.Errorf("CreatePlayerSessions: %w", err)
+		return "", zero, nil, err
 	}
 	playerSessions := make(map[string]string, len(ps.PlayerSessions))
 	for _, s := range ps.PlayerSessions {
@@ -113,6 +117,35 @@ func (p *GameLiftProvider) CreateGameSession(ctx context.Context, sessionID, que
 	// Hub のルーティングキーと一致させる。
 	gotID := protocol.NormalizeGameSessionID(rawSessionID)
 	return gotID, conn, playerSessions, nil
+}
+
+// createPlayerSessions はプレイヤーセッションを作る。作った直後のゲームセッションは、サーバーが
+// ActivateGameSession を呼ぶまで ACTIVATING で、その間は InvalidGameSessionStatusException になる
+// （managed EC2 では毎回起きる）。そのエラーのときだけ、間隔を倍にしながら送り直す。
+// GameSessionId は ARN とショート ID のどちらも受け付けるが、GameLift API が返した生の値をそのまま渡す（確実に有効なため）。
+func (p *GameLiftProvider) createPlayerSessions(ctx context.Context, rawSessionID string, playerIDs []string) (*gamelift.CreatePlayerSessionsOutput, error) {
+	wait := p.retryWait
+	for attempt := 1; ; attempt++ {
+		ps, err := p.api.CreatePlayerSessions(ctx, &gamelift.CreatePlayerSessionsInput{
+			GameSessionId: aws.String(rawSessionID),
+			PlayerIds:     playerIDs,
+		})
+		if err == nil {
+			return ps, nil
+		}
+		var notActive *gltypes.InvalidGameSessionStatusException
+		if !errors.As(err, &notActive) || attempt == playerSessionsAttempts {
+			return nil, fmt.Errorf("CreatePlayerSessions: %w", err)
+		}
+		slog.InfoContext(ctx, "game session not active yet, retrying CreatePlayerSessions",
+			"gameSessionId", rawSessionID, "attempt", attempt, "wait", wait)
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("CreatePlayerSessions: %w", ctx.Err())
+		case <-time.After(wait):
+		}
+		wait *= 2
+	}
 }
 
 // EndGameSession は GameLift のゲームセッションを終わらせる。TerminateGameSession は完全な ARN を

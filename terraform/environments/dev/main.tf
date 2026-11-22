@@ -80,6 +80,9 @@ module "gamelift_ec2" {
   name_prefix = "raidync-dev"
   # scripts/build-gameserver.sh の出力先。apply 前に必ずビルドしておくこと。
   build_dir = "${path.root}/../../../build/gameserver"
+  # セッション終了の報告先。module.api_gateway.invoke_url を使うと、Stage → Lambda（GAMELIFT_FLEET_ID）→
+  # フリートと参照が一周して循環になるため、Lambda に依存しない REST API ID から組み立てる（"dev" は stage_name）。
+  session_api_url = "https://${module.api_gateway.rest_api_id}.execute-api.${var.region}.amazonaws.com/dev"
 
   tags = var.tags
 }
@@ -100,6 +103,8 @@ module "gamelift_ec2_secondary" {
 
   name_prefix = "raidync-dev"
   build_dir   = "${path.root}/../../../build/gameserver"
+  # 自分のリージョンの API に報告する。組み立て方の理由はプライマリと同じ（循環参照を避ける）。
+  session_api_url = "https://${module.api_gateway_secondary.rest_api_id}.execute-api.${var.secondary_region}.amazonaws.com/dev"
 
   tags = var.tags
 }

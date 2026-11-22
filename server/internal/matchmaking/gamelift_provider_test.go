@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/gamelift"
@@ -23,6 +24,9 @@ type fakeGameLift struct {
 	gsErr error
 	psErr error
 	tgErr error
+
+	psErrSeq []error // 設定時は CreatePlayerSessions が呼ばれるたびに順に返す（尽きたら最後の値）。nil の番は psOut を返す
+	psCalls  int     // CreatePlayerSessions が呼ばれた回数
 }
 
 func (f *fakeGameLift) CreateGameSession(_ context.Context, in *gamelift.CreateGameSessionInput, _ ...func(*gamelift.Options)) (*gamelift.CreateGameSessionOutput, error) {
@@ -32,6 +36,13 @@ func (f *fakeGameLift) CreateGameSession(_ context.Context, in *gamelift.CreateG
 
 func (f *fakeGameLift) CreatePlayerSessions(_ context.Context, in *gamelift.CreatePlayerSessionsInput, _ ...func(*gamelift.Options)) (*gamelift.CreatePlayerSessionsOutput, error) {
 	f.psIn = in
+	f.psCalls++
+	if len(f.psErrSeq) > 0 {
+		if err := f.psErrSeq[min(f.psCalls, len(f.psErrSeq))-1]; err != nil {
+			return nil, err
+		}
+		return f.psOut, nil
+	}
 	return f.psOut, f.psErr
 }
 
@@ -193,4 +204,50 @@ func gamePropsToMap(props []gltypes.GameProperty) map[string]string {
 		m[aws.ToString(p.Key)] = aws.ToString(p.Value)
 	}
 	return m
+}
+
+// TestGameLiftProvider_RetriesPlayerSessionsWhileActivating は、作った直後のゲームセッションが
+// ACTIVATING の間は CreatePlayerSessions を送り直し、ACTIVE になったら psid を返すことを確認する。
+func TestGameLiftProvider_RetriesPlayerSessionsWhileActivating(t *testing.T) {
+	activating := &gltypes.InvalidGameSessionStatusException{Message: aws.String("Players can only join ACTIVE game sessions (status=ACTIVATING)")}
+	fake := &fakeGameLift{
+		gsOut:    activeGameSession(),
+		psErrSeq: []error{activating, activating, nil},
+		psOut: &gamelift.CreatePlayerSessionsOutput{PlayerSessions: []gltypes.PlayerSession{
+			{PlayerId: aws.String("p1"), PlayerSessionId: aws.String("psess-1")},
+		}},
+	}
+	p := NewGameLiftProvider(fake, "fleet-1", "", "ap-northeast-1")
+	p.retryWait = time.Millisecond
+
+	_, _, psids, err := p.CreateGameSession(context.Background(), "sess-1", "quest-001", []string{"p1"})
+
+	require.NoError(t, err)
+	assert.Equal(t, 3, fake.psCalls, "ACTIVATING の 2 回を送り直し、3 回目で通る")
+	assert.Equal(t, map[string]string{"p1": "psess-1"}, psids)
+}
+
+// TestGameLiftProvider_GivesUpPlayerSessionsAfterMaxAttempts は、ACTIVATING が続いたら上限で諦めることを確認する。
+func TestGameLiftProvider_GivesUpPlayerSessionsAfterMaxAttempts(t *testing.T) {
+	activating := &gltypes.InvalidGameSessionStatusException{Message: aws.String("status=ACTIVATING")}
+	fake := &fakeGameLift{gsOut: activeGameSession(), psErrSeq: []error{activating}}
+	p := NewGameLiftProvider(fake, "fleet-1", "", "ap-northeast-1")
+	p.retryWait = time.Millisecond
+
+	_, _, _, err := p.CreateGameSession(context.Background(), "sess-1", "quest-001", []string{"p1"})
+
+	assert.ErrorAs(t, err, &activating)
+	assert.Equal(t, playerSessionsAttempts, fake.psCalls)
+}
+
+// TestGameLiftProvider_DoesNotRetryOtherPlayerSessionsErrors は、ACTIVATING 以外のエラーは送り直さないことを確認する。
+func TestGameLiftProvider_DoesNotRetryOtherPlayerSessionsErrors(t *testing.T) {
+	fake := &fakeGameLift{gsOut: activeGameSession(), psErr: errors.New("boom")}
+	p := NewGameLiftProvider(fake, "fleet-1", "", "ap-northeast-1")
+	p.retryWait = time.Millisecond
+
+	_, _, _, err := p.CreateGameSession(context.Background(), "sess-1", "quest-001", []string{"p1"})
+
+	assert.Error(t, err)
+	assert.Equal(t, 1, fake.psCalls)
 }

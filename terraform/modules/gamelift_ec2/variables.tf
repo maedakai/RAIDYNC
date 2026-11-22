@@ -64,6 +64,11 @@ variable "server_sdk_version" {
   default     = "5.3.0"
 }
 
+variable "session_api_url" {
+  description = "ゲームサーバーがセッション終了時に /session/end で結果を報告する API のベース URL（例: https://<id>.execute-api.<region>.amazonaws.com/dev）。フリートと同じリージョンの API を渡す。"
+  type        = string
+}
+
 variable "tags" {
   description = "共通タグ。"
   type        = map(string)

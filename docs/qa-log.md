@@ -3261,3 +3261,104 @@ k6 run -q --vus 1 --iterations 1 --no-thresholds tests/load/load-test-large.js
 - チケットに sessionId を書き足す案は採らない。書き込みが 1 回増え、既知の限界の GSI ホットキーを悪化させるため
 - `CreateGameSession` の後、何も書く前に止まった分は、ゲームサーバーが「誰も来なければ終える」で塞ぐ（ゲームサーバーが `/session/end` を呼ぶ宿題とまとめる）。その際 `/session/end` は ACTIVE のときだけ ENDED にし、FAILED を上書きしない
 - 影響: `SessionStatus` に FAILED を追加、`cmd/sessions` は FAILED を数えない、Lambda の IAM に `gamelift:TerminateGameSession`、`SessionProvider` に終了の処理（GameLift・スタブ・hub の 3 実装）
+
+### Q. MarkMatched が失敗したとき、片付けるのは誰か。救済と同時に走ったら二重に片付けないか
+
+**`MarkFailed`（条件 `status = MATCHING` かつ確保時の version）が通った 1 者だけが片付ける（2026-11-21 実装）。**
+
+- `MarkFailed` が通った＝その時点でグループの誰も MATCHED になっていない、の証明になる。`Interlocked.CompareExchange` で勝った側だけが処理するのと同じ考え方
+- 条件に合わなかった（`ErrConflict`）なら、別の誰か（遅れて通った自分の `MarkMatched`、または救済）がすでに状態を進めている。片付けずにチケットを読み直して、今の状態を返す
+- そのために `transactWithRetry` は、トランザクションが `ConditionalCheckFailed` で取り消されたときに `ErrConflict` を返すようにした（`TransactionConflict` を送り直しきれなかったときの `ErrTransactionConflict` とは分ける）
+- 片付け（`EndGameSession`・`FailSession`）が失敗しても、ログを残して FAILED を返す。チケットはもう FAILED なので、クライアントにエラーを返すと失敗を二重に伝えることになる
+
+### Q. `FailSession` が「行が無ければ何もしない」ようにしているのはなぜか
+
+**`UpdateItem` は行が無いと新しく作ってしまう（upsert）ため（2026-11-21）。**
+
+- 救済の対象には、`CreateGameSession` の後、Sessions の行を書く前に止まったものも含まれる。その場合、普通に `UpdateItem` すると `status` と `endedAt` だけの中身の無い行ができる
+- `ConditionExpression: attribute_exists(sessionId)` を付け、条件不一致は `nil` に変える。「行が無い」は片付けの目的を果たしている状態なので、エラーにしない
+
+### Q. 救済で、止まったチケットの仲間（同じグループ）をどう見つけるか
+
+**確保時のトークンで探す。`questId-status-index` で MATCHING を引き、`idempotencyToken` で絞る（2026-11-22 実装）。**
+
+- `FilterExpression` は読んだ後に掛かるので、`Limit` を付けると仲間を取りこぼす。`Limit` を付けず、ページを最後まで辿る（`NewQueryPaginator`）
+- 0 件なら、別の誰かがもう進めたということなので、読み直して今の状態を返す
+- GSI は結果整合なので、直前の書き込みが見えないことがある。40 秒のリースがその遅れを吸収する
+
+### Q. `/session/end` で、履歴の追記と ENDED への遷移を 1 つのトランザクションにしたのはなぜか
+
+**状態を読んでから書くまでの間に、救済が行を FAILED にする場合があるため（2026-11-23）。**
+
+- 以前の順番は「状態を読む → 履歴を 1 人ずつ書く → ENDED にする」。最後の書き込みに `status = ACTIVE` の条件を付けても、条件に負けたときには履歴がもう書かれている（遊んでいない試合の履歴が残る）
+- 順番を入れ替える案（先に ENDED → 履歴）は、途中で落ちると ENDED なのに履歴が欠け、再報告も 409 で弾かれて戻せない
+- `TransactWriteItems` で「Sessions の Update（条件 `status = ACTIVE`）＋ MatchHistory の Put × 人数」をまとめると、全部か無しかになる。落ちても何も書かれないので、報告し直せばやり直せる
+- 以前のコメントにあった「再報告で復旧できる」は、実は成り立っていなかった。`timestamp` が毎回 `time.Now()` なので、途中まで書けたプレイヤーの履歴が二重になるため
+- 条件に合わなければ `ErrConflict` → 409。`FailSession` と違って `nil` にしないのは、何も書いていないのに 200 を返すと嘘になるため
+- Sessions と MatchHistory は Global Tables。全部か無しかが保証されるのは書いたリージョンの中だけで、もう片方への複製は項目ごとにずれて届きうる
+
+### Q. ゲームセッションは、どんなときに終わるか
+
+**20 分の時間切れ、誰も来ないまま 40 秒、一度来てから全員が抜けたとき（2026-11-23）。**
+
+- 誰も来ない 40 秒: クライアントは 2 秒ごとのポーリングで MATCHED を受け取ってから UDP で接続するため、その遅れを見込んだ値。サーバーが一方的に見切るだけなので、`protocol` ではなく `game` の中の定数にした
+- 全員抜けた: すぐ終える。離脱の猶予は、`PruneIdle` の 10 秒（`PlayerIdleTimeoutMs`）がすでに持っている
+- 「いま 0 人」だけでは、まだ誰も来ていないのか、全員抜けたのか見分けられない。そこで `Session.everJoined`（一度でも誰かが接続したか。立てたら戻さない）を足した
+- 判定は時間切れから順に行う。誰も来ないまま 20 分も重なりうるが、どちらも ABANDONED で報告するので結果は変わらない
+- ローカルモードの固定セッション（`cmd/gameserver`）も、同じ条件で終わる。本番は「1 プロセス 1 セッション、終わったらプロセスも終わる」ので、ローカルだけ動きを変えるとずれを見落としやすい。試すたびにサーバーを起動し直す
+
+### Q. HTTP を知らない `game` パッケージから、どうやって `/session/end` を呼ぶか
+
+**Hub に `SessionEndObserver` を渡し、HTTP は `gameserver` の報告係が受け持つ（2026-11-23）。**
+
+- `PlayerObserver`（参加・離脱を GameLift Bridge に知らせる）と同じ形。C# の `event` に購読者を登録するイメージ
+- セッションを終える処理は `Hub.endSession` に集まっているので、通知先は Hub に持たせる。`EndMessage` が ok を返した 1 回だけ知らせるので、`Tick` と `End` が重なっても二重に報告しない
+- 通知は `Tick`（50ms ごとに全セッションを処理する）の中から呼ばれる。実装は待たせない、という取り決めにして、報告係はゴルーチンで HTTP を呼ぶ
+- 通知先は複数持てる（報告係と GameLift Bridge）。Bridge は Hub を受け取って後から作られるので、`AddSessionEndObserver` で後から足す。`mu` で守るので、Tick が動いていても足せる
+- マッチ確定の失敗で片付けるときも `Hub.End` → 報告になるが、行はもう FAILED なので 409 で何も書かれない
+
+### Q. 報告に失敗したらどうするか
+
+**5xx とネットワークの失敗だけ、1 → 2 秒あけて最大 3 回まで送り直す（2026-11-23）。**
+
+- 409（ENDED / FAILED）、404、そのほかの 4xx は、送り直しても結果が変わらないので、ログを残して終わる
+- `/session/end` は全部か無しかのトランザクションなので、送り直しても二重には書かれない
+- 1 回の HTTP は 20 秒まで。最悪、報告を待つのに 20 秒 × 3 回 + 3 秒かかる
+- 結果は `completed` だけ CLEAR、時間切れ・誰も来ない・全員抜けたは ABANDONED。ゲームにはまだ `completed` で終わる条件が無いので、今は常に ABANDONED になる
+
+### Q. GameLift で、セッションが終わった後のプロセスはどうなるか
+
+**受信ループを止め、報告を待ってから `ProcessEnding` を呼んで終わる（2026-11-23）。**
+
+- GameLift（SDK 5）は 1 プロセス 1 セッションが基本。プロセスが終わると、GameLift が新しいプロセスを立ち上げて次のセッションを受けられるようにする
+- Bridge の `OnSessionEnd` は `stop` を呼ぶだけ（Tick から呼ばれるので待たせない）
+- main での順番は「報告を待つ（`reporter.Wait`）→ `ProcessEnding` → ソケットを閉じる」。先に `ProcessEnding` を呼ぶと、GameLift がプロセスを片付け始め、送りかけの報告が強制終了で消えうる
+- マッチ確定の失敗で `TerminateGameSession`（`TriggerOnProcessTerminate`）を受けた場合は、以前からある `OnProcessTerminate` → stop の経路で終わる
+
+### Q. 結果の報告を、クライアントではなくゲームサーバーにしたのはなぜか。E2E はどう変わったか
+
+**クライアントの報告は、ゲームサーバーが報告できないあいだの仮の役だった。ゲームサーバーの経路を E2E で通すため、クライアントの報告を消した（2026-11-23）。**
+
+- 両方が報告すると、クライアントが先に CLEAR を報告し、ゲームサーバーの報告は毎回 409 になる。ゲームサーバーの報告係が働く経路を、一度も確かめられない
+- `cmd/client` は報告をやめ、今回のセッションが履歴に現れるまで最大 30 秒待つ。サーバー側で送信が止まって 10 秒 → 全員抜けた → 報告 → 履歴、の順に進む（実測: 送信をやめてから約 11 秒で履歴に ABANDONED が現れた）
+- localapi の同居ゲームサーバーも、自分自身の HTTP の `/session/end` に報告する。報告の受け手が自分なので、HTTP を止める前に送りかけの報告を待つ
+- 本番の改造クライアントが勝手に CLEAR を報告できない、という利点もある（ただし `/session/end` は認証なしのままで、既知のリスクとして残っている）
+
+### Q. AWS dev の実機で、A2/A3・B1 は想定どおりに動いたか
+
+**動いた。途中で、以前からあった不具合（`CreatePlayerSessions` が ACTIVATING で失敗する）が見つかり、送り直しで直した（2026-11-23）。**
+
+- **見つかった不具合**: Lambda は `CreateGameSession` の直後に `CreatePlayerSessions` を呼ぶ。managed EC2 では、その時点でゲームサーバーがまだ `ActivateGameSession` を呼んでおらず、`InvalidGameSessionStatusException: Players can only join ACTIVE game sessions (status=ACTIVATING)` で毎回失敗した。1 秒もかからず ACTIVE になる
+- **直し方**: そのエラーのときだけ、200ms から間隔を倍にして最大 6 回送り直す（`gamelift_provider.go` の `createPlayerSessions`）。`DescribeGameSessions` で ACTIVE を待つ案は IAM 権限が増えるので採らなかった。実機では 200ms 後の 1 回の送り直しで通った
+- **不具合が起きている間に確認できたこと**: 失敗は Sessions の行を書く前に起きる。チケットは MATCHING のまま残り、40 秒後の `match/status` で FAILED になり（A3）、ゲームセッションも TERMINATED になった。Sessions に中身の無い行は作られなかった（`FailSession` の `attribute_exists`）。別のセッションは、誰も接続しないまま 40 秒でゲームサーバーが自分から終わり、`/session/end` に報告した（B1-2・B1-4・B1-5）
+- **直した後の E2E**: マッチ → UDP でプレイ → 送信をやめて約 11 秒でセッションが終わる → ゲームサーバーが報告 → 履歴に ABANDONED。Sessions の行は ENDED、GameLift のゲームセッションも TERMINATED になった
+- **k6（フリートを止め、Lambda はスタブ）**: 40 VU × 5 回で matched 200/200、matchFailed・matchStuck 0、`cmd/sessions` は 50 セッションで一致
+- **apply の 1 回目の失敗**: 作ったばかりのビルド用 IAM ロールを GameLift が引き受けられなかった（IAM の伝播の遅れ）。2 回目の apply で通った
+- **フリートに報告先を渡す方法**: runtime configuration は環境変数を渡せないので、`parameters`（`start.sh` の第 1 引数）でそのリージョンの API の URL を渡す。`module.api_gateway.invoke_url` を使うと Stage → Lambda（`GAMELIFT_FLEET_ID`）→ フリートで参照が循環するため、REST API ID から URL を組み立てる
+
+### Q. 6-7（オートスケーリング）はどうしたか
+
+**費用がかかるため見送った（2026-11-23）。**
+
+- GameLift フリートはこのプロジェクトで唯一の時間課金リソースで、スケーリングを確かめるには、負荷をかけたまま複数台を起動し続ける必要がある
+- スケーリングの設定（spec の最小 1・最大 20）は Terraform に入れていない。k6 の負荷テストは Lambda のスタブで行っていて、GameLift の UDP 側の負荷は測っていない（`docs/load-test-results.md` §7 の既知の限界）
