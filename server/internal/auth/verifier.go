@@ -32,6 +32,8 @@ type Config struct {
 	ClientID string // 例: raidync-local-client（空なら未チェック）
 }
 
+var ErrInvalidToken = errors.New("auth: invalid token")
+
 // New は JWKS を取得して Verifier を構築する。
 // Refresh は keyfunc 既定（1 時間）のままで運用する想定。
 func New(ctx context.Context, cfg Config) (*Verifier, error) {
@@ -60,20 +62,27 @@ func (v *Verifier) Verify(tokenString string) (*Claims, error) {
 
 	token, err := jwt.Parse(tokenString, v.keyfn, parserOpts...)
 	if err != nil {
-		return nil, fmt.Errorf("auth: parse: %w", err)
+		if !errors.Is(err, jwt.ErrTokenExpired) &&
+			!errors.Is(err, jwt.ErrTokenMalformed) &&
+			!errors.Is(err, jwt.ErrTokenSignatureInvalid) &&
+			!errors.Is(err, jwt.ErrTokenInvalidIssuer) {
+			return nil, fmt.Errorf("auth: parse: %w", err)
+		}
+
+		return nil, fmt.Errorf("auth: parse: %w: %w", ErrInvalidToken, err)
 	}
 	if !token.Valid {
-		return nil, errors.New("auth: token invalid")
+		return nil, fmt.Errorf("auth: token invalid: %w", ErrInvalidToken)
 	}
 
 	claims, ok := token.Claims.(jwt.MapClaims)
 	if !ok {
-		return nil, errors.New("auth: claims type")
+		return nil, fmt.Errorf("auth: auth claims: %w", ErrInvalidToken)
 	}
 
 	sub, _ := claims["sub"].(string)
 	if sub == "" {
-		return nil, errors.New("auth: missing sub")
+		return nil, fmt.Errorf("auth: missing sub: %w", ErrInvalidToken)
 	}
 
 	tokenUse, _ := claims["token_use"].(string)
@@ -81,7 +90,7 @@ func (v *Verifier) Verify(tokenString string) (*Claims, error) {
 	// aud / client_id チェック（Cognito 流儀: id token=aud / access token=client_id）。
 	if v.clientID != "" {
 		if err := v.checkAudience(claims, tokenUse); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("auth: %w: %w", ErrInvalidToken, err)
 		}
 	}
 

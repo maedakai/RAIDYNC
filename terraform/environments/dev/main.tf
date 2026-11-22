@@ -80,6 +80,9 @@ module "gamelift_ec2" {
   name_prefix = "raidync-dev"
   # scripts/build-gameserver.sh の出力先。apply 前に必ずビルドしておくこと。
   build_dir = "${path.root}/../../../build/gameserver"
+  # セッション終了の報告先。module.api_gateway.invoke_url を使うと、Stage → Lambda（GAMELIFT_FLEET_ID）→
+  # フリートと参照が一周して循環になるため、Lambda に依存しない REST API ID から組み立てる（"dev" は stage_name）。
+  session_api_url = "https://${module.api_gateway.rest_api_id}.execute-api.${var.region}.amazonaws.com/dev"
 
   tags = var.tags
 }
@@ -100,6 +103,8 @@ module "gamelift_ec2_secondary" {
 
   name_prefix = "raidync-dev"
   build_dir   = "${path.root}/../../../build/gameserver"
+  # 自分のリージョンの API に報告する。組み立て方の理由はプライマリと同じ（循環参照を避ける）。
+  session_api_url = "https://${module.api_gateway_secondary.rest_api_id}.execute-api.${var.secondary_region}.amazonaws.com/dev"
 
   tags = var.tags
 }
@@ -205,4 +210,45 @@ module "api_gateway_secondary" {
   lambda_function_names = module.lambda_secondary.function_names
 
   tags = var.tags
+}
+
+
+# monitoring
+module "monitoring" {
+  source               = "../../modules/monitoring"
+  alarm_function_names = module.lambda.function_names
+  notification_email   = var.notification_email
+  sampling_fixed_rate  = var.sampling_fixed_rate
+  tags                 = var.tags
+}
+
+module "monitoring_secondary" {
+  source = "../../modules/monitoring"
+  providers = {
+    aws   = aws.secondary
+    awscc = awscc.secondary
+  }
+  alarm_function_names = module.lambda_secondary.function_names
+  notification_email   = var.notification_email
+  sampling_fixed_rate  = var.sampling_fixed_rate
+  tags                 = var.tags
+}
+
+# monitoring_dashboard
+module "monitoring_dashboard" {
+  source                   = "../../modules/monitoring_dashboard"
+  dashboard_name           = "raidync-dev-loadtest"
+  function_names_primary   = module.lambda.function_names
+  function_names_secondary = module.lambda_secondary.function_names
+  primary_region           = var.region
+  secondary_region         = var.secondary_region
+
+  table_names = concat(
+    values(module.dynamodb.table_names),
+    [module.dynamodb_tickets.table_name]
+  )
+
+  rest_api_name_primary   = module.api_gateway.rest_api_name
+  rest_api_name_secondary = module.api_gateway_secondary.rest_api_name
+  stage_name              = "dev"
 }

@@ -12,19 +12,6 @@ import (
 	"github.com/raidync/server/pkg/protocol"
 )
 
-// PutMatchResult はマッチ結果を 1 件追記する（PK: playerId, SK: timestamp）。
-func (c *Client) PutMatchResult(ctx context.Context, e protocol.MatchHistoryEntry) error {
-	item, err := attributevalue.MarshalMap(e)
-	if err != nil {
-		return fmt.Errorf("marshal history entry: %w", err)
-	}
-	_, err = c.ddb.PutItem(ctx, &dynamodb.PutItemInput{
-		TableName: aws.String(c.tables.MatchHistory),
-		Item:      item,
-	})
-	return err
-}
-
 // QueryByPlayer は playerId の履歴を新しい順（timestamp 降順）に limit 件返す。
 func (c *Client) QueryByPlayer(ctx context.Context, playerID string, limit int32) ([]protocol.MatchHistoryEntry, error) {
 	out, err := c.ddb.Query(ctx, &dynamodb.QueryInput{

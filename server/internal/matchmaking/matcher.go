@@ -5,10 +5,13 @@ package matchmaking
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"sort"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/raidync/server/internal/db"
+	"github.com/raidync/server/internal/metrics"
 	"github.com/raidync/server/pkg/protocol"
 )
 
@@ -20,15 +23,22 @@ var ErrTicketNotFound = errors.New("ticket not found")
 // candidateFetchLimit は 1 回のマッチ試行で取得する WAITING 候補の上限。
 const candidateFetchLimit = 50
 
+// matchingLeaseMs は MATCHING のまま止まったチケットを救済するまでの時間。
+// Lambda のタイムアウト（30 秒）を過ぎれば確定の処理はもう走っていないので、余裕 10 秒を足す。
+const matchingLeaseMs = 40_000
+
 // Store は matcher が必要とする DynamoDB 操作のみを切り出したインターフェース。
 // 本番は *db.Client が、テストはモックが満たす。
 type Store interface {
 	GetTicket(ctx context.Context, ticketID string) (*protocol.Ticket, error)
 	QueryWaitingByQuest(ctx context.Context, questID string, limit int32) ([]protocol.Ticket, error)
-	ClaimTickets(ctx context.Context, tickets []protocol.Ticket) error
-	MarkMatched(ctx context.Context, ticketID, sessionID string, conn protocol.ConnectionInfo) error
+	ClaimTickets(ctx context.Context, tickets []protocol.Ticket, matchingAt int64, idempotencyToken string) error
+	MarkMatched(ctx context.Context, tickets []protocol.Ticket, sessionID string, conn protocol.ConnectionInfo, playerSessions map[string]string) error
+	MarkFailed(ctx context.Context, tickets []protocol.Ticket) error
 	PutSession(ctx context.Context, s protocol.Session) error
 	TimeoutTicket(ctx context.Context, ticketID string) error
+	FailSession(ctx context.Context, sessionID string, endedAt int64) error
+	FindMatchingByToken(ctx context.Context, questID, token string) ([]protocol.Ticket, error)
 }
 
 // *db.Client が Store を満たすことをコンパイル時に保証する。
@@ -55,6 +65,9 @@ func (m *Matcher) TryMatch(ctx context.Context, ticketID string) (*protocol.Tick
 	}
 	if t == nil {
 		return nil, ErrTicketNotFound
+	}
+	if t.Status == protocol.StatusMatching && m.nowMs()-t.MatchingAt >= matchingLeaseMs {
+		return m.rescue(ctx, t)
 	}
 	// WAITING 以外（MATCHING/MATCHED/TIMEOUT/CANCELLED）は現状をそのまま返す。
 	if t.Status != protocol.StatusWaiting {
@@ -98,6 +111,7 @@ func (m *Matcher) handleExpired(ctx context.Context, t *protocol.Ticket) (*proto
 		return nil, err
 	}
 	t.Status = protocol.StatusTimeout
+	metrics.MatchTimeout(ctx, t.QuestID)
 	return t, nil
 }
 
@@ -112,23 +126,38 @@ func (m *Matcher) tryForm(ctx context.Context, self *protocol.Ticket, minSize in
 	if len(group) < minSize {
 		return nil, nil
 	}
-	if err := m.store.ClaimTickets(ctx, group); err != nil {
+	matchingAt := m.nowMs()
+	idempotencyToken := uuid.NewString()
+	if err := m.store.ClaimTickets(ctx, group, matchingAt, idempotencyToken); err != nil {
 		if errors.Is(err, db.ErrConflict) {
 			return nil, nil // 他マッチャーが先に確保 → 次のポーリングで再試行
 		}
 		return nil, err
+	}
+	self.Version++
+	self.MatchingAt = matchingAt
+	self.IdempotencyToken = idempotencyToken
+	for i := 0; i < len(group); i++ {
+		group[i].Version++
+		group[i].MatchingAt = matchingAt
+		group[i].IdempotencyToken = idempotencyToken
 	}
 	return m.finalize(ctx, self, group)
 }
 
 // formSolo は自分だけのセッションを即時生成する。
 func (m *Matcher) formSolo(ctx context.Context, self *protocol.Ticket) (*protocol.Ticket, error) {
-	if err := m.store.ClaimTickets(ctx, []protocol.Ticket{*self}); err != nil {
+	matchingAt := m.nowMs()
+	idempotencyToken := uuid.NewString()
+	if err := m.store.ClaimTickets(ctx, []protocol.Ticket{*self}, matchingAt, idempotencyToken); err != nil {
 		if errors.Is(err, db.ErrConflict) {
 			return m.store.GetTicket(ctx, self.TicketID)
 		}
 		return nil, err
 	}
+	self.Version++
+	self.MatchingAt = matchingAt
+	self.IdempotencyToken = idempotencyToken
 	return m.finalize(ctx, self, []protocol.Ticket{*self})
 }
 
@@ -139,7 +168,7 @@ func (m *Matcher) finalize(ctx context.Context, self *protocol.Ticket, group []p
 		playerIDs = append(playerIDs, g.PlayerID)
 	}
 
-	sessionID, conn, playerSessions, err := m.sessions.CreateGameSession(ctx, self.QuestID, playerIDs)
+	sessionID, conn, playerSessions, err := m.sessions.CreateGameSession(ctx, self.IdempotencyToken, self.QuestID, playerIDs)
 	if err != nil {
 		return nil, err
 	}
@@ -158,13 +187,28 @@ func (m *Matcher) finalize(ctx context.Context, self *protocol.Ticket, group []p
 		return nil, err
 	}
 
-	// 各チケットには「共通 conn ＋ 本人の playerSessionId」を配る（1 プレイヤー 1 枠）。
-	for _, g := range group {
-		pc := conn
-		pc.PlayerSessionID = playerSessions[g.PlayerID]
-		if err := m.store.MarkMatched(ctx, g.TicketID, sessionID, pc); err != nil {
-			return nil, err
+	// グループ全員を 1 つのトランザクションで MATCHED にする（全員なるか、誰もならないか）。
+	// 1 枚ずつ書くと途中で失敗したときに「一部だけ MATCHED」が残り、MATCHED を見た
+	// クライアントはポーリングをやめるので取り消せない。本人の playerSessionId は MarkMatched が配る。
+	if err := m.store.MarkMatched(ctx, group, sessionID, conn, playerSessions); err != nil {
+		ferr := m.store.MarkFailed(ctx, group)
+		if ferr == nil {
+			// MarkFailed が通った = 誰も MATCHED になっていないので、片付けてよい。
+			// 片付けの失敗はログに残して続ける（チケットはもう FAILED で、エラーを返しても送り直しにならない）。
+			if err := m.sessions.EndGameSession(ctx, sessionID); err != nil {
+				slog.ErrorContext(ctx, "end game session failed", "sessionId", sessionID, "error", err)
+			}
+			if err := m.store.FailSession(ctx, sessionID, m.nowMs()); err != nil {
+				slog.ErrorContext(ctx, "fail session record failed", "sessionId", sessionID, "error", err)
+			}
+			self.Status = protocol.StatusFailed
+			return self, nil
 		}
+		if errors.Is(ferr, db.ErrConflict) {
+			// 救済で FAILED にされたか、MarkMatched が実は通っていて MATCHED。片付けずに今の状態を返す。
+			return m.reload(ctx, self.TicketID)
+		}
+		return nil, ferr
 	}
 
 	selfConn := conn
@@ -172,7 +216,48 @@ func (m *Matcher) finalize(ctx context.Context, self *protocol.Ticket, group []p
 	self.Status = protocol.StatusMatched
 	self.SessionID = sessionID
 	self.ConnectionInfo = &selfConn
+
+	metrics.MatchFormed(ctx, self.QuestID, len(group), m.nowMs()-self.CreatedAt)
 	return self, nil
+}
+
+// reload はチケットを読み直して、今の状態を返す。無ければ ErrTicketNotFound。
+func (m *Matcher) reload(ctx context.Context, ticketID string) (*protocol.Ticket, error) {
+	cur, err := m.store.GetTicket(ctx, ticketID)
+	if err != nil {
+		return nil, err
+	}
+	if cur == nil {
+		return nil, ErrTicketNotFound
+	}
+	return cur, nil
+}
+
+func (m *Matcher) rescue(ctx context.Context, t *protocol.Ticket) (*protocol.Ticket, error) {
+	group, err := m.store.FindMatchingByToken(ctx, t.QuestID, t.IdempotencyToken)
+	if err != nil {
+		return nil, err
+	}
+	if len(group) == 0 {
+		// 読んだ後に、ほかのポーリングが先に救済した
+		return m.reload(ctx, t.TicketID)
+	}
+
+	ferr := m.store.MarkFailed(ctx, group)
+	if ferr == nil {
+		if err := m.sessions.EndGameSession(ctx, t.IdempotencyToken); err != nil {
+			slog.ErrorContext(ctx, "rescue: end game session failed", "sessionId", t.IdempotencyToken, "error", err)
+		}
+		if err := m.store.FailSession(ctx, t.IdempotencyToken, m.nowMs()); err != nil {
+			slog.ErrorContext(ctx, "rescue: fail session record failed", "sessionId", t.IdempotencyToken, "error", err)
+		}
+		t.Status = protocol.StatusFailed
+		return t, nil
+	}
+	if errors.Is(ferr, db.ErrConflict) {
+		return m.reload(ctx, t.TicketID)
+	}
+	return nil, ferr
 }
 
 // selectGroup は self を必ず含み、partyId を優先しつつ最大 4 人のグループを返す。

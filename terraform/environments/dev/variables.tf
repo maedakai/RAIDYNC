@@ -77,3 +77,37 @@ variable "tags" {
     Phase   = "4"
   }
 }
+
+variable "notification_email" {
+  description = <<-EOT
+    CloudWatch アラームの通知先メールアドレス。monitoring モジュールへ渡す。
+
+    渡し方（tfvars には書かない。dev.tfvars は Git 管理下のため）:
+      PowerShell> $env:TF_VAR_notification_email = "you@example.com"
+      bash$       export TF_VAR_notification_email="you@example.com"
+
+    空（既定）なら SNS の購読を作らない。監視と無関係な apply のたびに
+    値を要求されないよう、あえて必須変数にしていない。
+  EOT
+  type        = string
+  default     = ""
+  sensitive   = true
+}
+
+variable "sampling_fixed_rate" {
+  description = <<-EOT
+    X-Ray のサンプリングルールの割合（fixed_rate）。0.0〜1.0 で指定する（%ではない）。
+    毎秒 1 件（reservoir_size）は必ず記録し、それを超えたリクエストのうちこの割合を記録する。
+    既定 0.05 は X-Ray の既定ルールと同じ動き。1.0 にすると全リクエストを記録する。
+
+    記録した Span は aws/spans（CloudWatch Logs）への取り込みで課金される（Span 約 1 KB、
+    1 リクエスト 15〜18 Span）。上げるのは負荷テストでの検証時だけにして、終わったら戻す。
+  EOT
+  type        = number
+  default     = 0.05
+
+  validation {
+    condition     = var.sampling_fixed_rate >= 0 && var.sampling_fixed_rate <= 1
+    error_message = "sampling_fixed_rate は 0.0 から 1.0 の範囲で指定する必要があります。"
+  }
+}

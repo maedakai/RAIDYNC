@@ -1,6 +1,6 @@
 # Lambda 実行ロールを用途別に 2 つ定義する。
-#   - authorizer_role : JWT 検証のみ（DynamoDB/GameLift に触れない）→ Logs 権限だけ
-#   - matchmaking_role: match_* / session_end 用。DynamoDB CRUD + GameLift セッション作成 + Logs
+#   - authorizer_role : JWT 検証のみ（DynamoDB/GameLift に触れない）→ Logs + X-Ray
+#   - matchmaking_role: match_* / session_end 用。DynamoDB CRUD + GameLift セッション作成 + Logs + X-Ray
 # dev E2E の狙いのひとつが「最小権限で本当に動くか」の実効性検証なので、role を分ける。
 
 # Lambda サービスが assume できることを示す信頼ポリシー（両ロール共通）。
@@ -61,13 +61,16 @@ data "aws_iam_policy_document" "matchmaking" {
     )
   }
 
-  # GameLift: セッション作成に必要な 2 アクション。CreateGameSession/CreatePlayerSessions は
+  # GameLift: セッションの作成と終了に必要な 3 アクション。CreateGameSession/CreatePlayerSessions は
   # resource-level 権限のサポートが限定的で、かつ fleet はこの時点で未作成のため Resource="*"。
+  # TerminateGameSession はマッチの確定に失敗したときと、止まった MATCHING の救済で使う。
+  # 終わらせるセッションの ARN は実行時に決まる（fleet ID とトークンから組み立てる）ため、これも "*"。
   statement {
-    sid = "GameLiftCreateSessions"
+    sid = "GameLiftSessions"
     actions = [
       "gamelift:CreateGameSession",
       "gamelift:CreatePlayerSessions",
+      "gamelift:TerminateGameSession",
     ]
     resources = ["*"]
   }
@@ -77,4 +80,39 @@ resource "aws_iam_role_policy" "matchmaking" {
   name   = "raidync-dev-matchmaking-inline"
   role   = aws_iam_role.matchmaking.id
   policy = data.aws_iam_policy_document.matchmaking.json
+}
+
+# ---- X-Ray への送信（両ロール共通） ----
+# 送り手は 2 つある。OTel の Span（internal/telemetry が OTLP エンドポイントへ送る）は xray:PutSpans、
+# tracing_config = Active の Lambda 基盤が送る自分の区間（コールドスタートの Init など）は
+# 旧来の xray:PutTraceSegments / xray:PutTelemetryRecords。
+# AWS の managed policy（AWSXRayDaemonWriteAccess）は PutSpans を含まず、サンプリングルールの読み取りなど
+# 使わない権限も含むため、必要な 3 つだけを自前で定義する。
+# Logs と同じく業務に依らない横断的な権限なので、1 つのポリシーを両ロールに attachment で付ける（定義を 1 か所に保つ）。
+data "aws_iam_policy_document" "xray" {
+  statement {
+    sid = "XRayWrite"
+    actions = [
+      "xray:PutSpans",
+      "xray:PutTelemetryRecords",
+      "xray:PutTraceSegments",
+    ]
+    resources = ["*"]
+  }
+}
+
+resource "aws_iam_policy" "xray" {
+  name   = "raidync-dev-xray-write"
+  policy = data.aws_iam_policy_document.xray.json
+  tags   = var.tags
+}
+
+resource "aws_iam_role_policy_attachment" "authorizer_xray" {
+  role       = aws_iam_role.authorizer.name
+  policy_arn = aws_iam_policy.xray.arn
+}
+
+resource "aws_iam_role_policy_attachment" "matchmaking_xray" {
+  role       = aws_iam_role.matchmaking.name
+  policy_arn = aws_iam_policy.xray.arn
 }

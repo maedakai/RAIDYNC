@@ -1,6 +1,6 @@
 // session_end: POST /session/{sessionId}/end
 // ゲームサーバがセッション終了時に結果を報告する。セッションの全プレイヤー分の
-// マッチ履歴を 1 件ずつ追記し、最後にセッションを ENDED へ遷移する。
+// マッチ履歴の追記と ENDED への遷移を、1 つのトランザクションで行う。ACTIVE のセッションだけを受け付ける。
 //
 // 認証注記: 本エンドポイントはプレイヤーではなくゲームサーバ（本番では GameLift
 // プロセス）が呼ぶ server-to-server 経路。本番ではフリートの IAM ロール／内部
@@ -10,6 +10,7 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"time"
 
 	"github.com/aws/aws-lambda-go/events"
@@ -51,29 +52,32 @@ func (h *SessionEnd) Handle(ctx context.Context, req events.APIGatewayProxyReque
 	if sess == nil {
 		return apigw.Error(ctx, 404, "session not found", nil), nil
 	}
-	// 既に終了済みなら二重報告として弾く（冪等性ガード）。
-	if sess.Status == protocol.SessionEnded {
-		return apigw.Error(ctx, 409, "session already ended", nil), nil
+	// ACTIVE 以外（ENDED＝二重の報告、FAILED＝マッチの確定に失敗して片付け済み）は受け付けない。
+	// ここは無駄なトランザクションを省くための早めの確認で、本当の守りは EndSession の条件。
+	if sess.Status != protocol.SessionActive {
+		return apigw.Error(ctx, 409, "session is not active", nil), nil
 	}
 
-	// 履歴を先に全員分書き、最後にセッションを終了する。
-	// （途中失敗時はセッションが ACTIVE のまま残り、再報告で復旧できる側に倒す。）
+	// 全員分の履歴と ENDED への遷移を、1 つのトランザクションで書く。
+	// 読んだ後に別の経路で ENDED / FAILED になっていれば、条件に合わず何も書かれない（409）。
+	// 途中で落ちても何も残らないため、報告し直せばやり直せる。
 	now := time.Now().UnixMilli()
+	entries := make([]protocol.MatchHistoryEntry, 0, len(sess.PlayerIDs))
 	for _, playerID := range sess.PlayerIDs {
-		entry := protocol.MatchHistoryEntry{
+		entries = append(entries, protocol.MatchHistoryEntry{
 			PlayerID:    playerID,
 			Timestamp:   now,
 			SessionID:   sessionID,
 			QuestID:     sess.QuestID,
 			Result:      in.Result,
 			DurationSec: in.DurationSec,
-		}
-		if err := h.db.PutMatchResult(ctx, entry); err != nil {
-			return apigw.Error(ctx, 500, "failed to save match result", err), nil
-		}
+		})
 	}
 
-	if err := h.db.EndSession(ctx, sessionID, now); err != nil {
+	if err := h.db.EndSession(ctx, sessionID, entries, now); err != nil {
+		if errors.Is(err, db.ErrConflict) {
+			return apigw.Error(ctx, 409, "session is not active", nil), nil
+		}
 		return apigw.Error(ctx, 500, "failed to end session", err), nil
 	}
 

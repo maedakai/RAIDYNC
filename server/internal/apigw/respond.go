@@ -4,11 +4,10 @@ package apigw
 import (
 	"context"
 	"encoding/json"
-	"log/slog"
 	"net/http"
 
 	"github.com/aws/aws-lambda-go/events"
-	"github.com/aws/aws-lambda-go/lambdacontext"
+	"github.com/raidync/server/internal/metrics"
 )
 
 var jsonHeaders = map[string]string{"Content-Type": "application/json"}
@@ -29,12 +28,8 @@ func JSON(ctx context.Context, status int, body any) events.APIGatewayProxyRespo
 // Error は {"error": message} 形式のエラー応答を返す。
 func Error(ctx context.Context, status int, message string, err error) events.APIGatewayProxyResponse {
 	b, _ := json.Marshal(map[string]string{"error": message})
-	if err != nil {
-		reqID := ""
-		if lc, ok := lambdacontext.FromContext(ctx); ok {
-			reqID = lc.AwsRequestID
-		}
-		slog.ErrorContext(ctx, message, "status", status, "requestId", reqID, "err", err)
+	if err != nil && status >= 500 {
+		metrics.EmitError(ctx, status, message, err)
 	}
 
 	return events.APIGatewayProxyResponse{
@@ -42,4 +37,8 @@ func Error(ctx context.Context, status int, message string, err error) events.AP
 		Headers:    jsonHeaders,
 		Body:       string(b),
 	}
+}
+
+func JWTError(ctx context.Context, message string, err error) {
+	metrics.EmitError(ctx, 500, message, err)
 }

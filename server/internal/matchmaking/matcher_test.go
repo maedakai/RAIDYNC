@@ -68,7 +68,8 @@ func TestTryMatch_FullPartyOf4(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Equal(t, protocol.StatusMatched, got.Status)
-	assert.Equal(t, sessions.sessionID, got.SessionID)
+	assert.Equal(t, got.IdempotencyToken, got.SessionID)
+	assert.NotEmpty(t, got.SessionID)
 	assert.Equal(t, 1, sessions.calls)
 	// 4 件すべてが MATCHED で、各自「共通 IP/Port ＋ 本人だけの psid」を受け取ること
 	seen := map[string]bool{}
@@ -111,7 +112,8 @@ func TestTryMatch_SoloAllowed(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Equal(t, protocol.StatusMatched, got.Status)
-	assert.Equal(t, sessions.sessionID, got.SessionID)
+	assert.Equal(t, got.IdempotencyToken, got.SessionID)
+	assert.NotEmpty(t, got.SessionID)
 	assert.NotNil(t, got.ConnectionInfo)
 }
 
@@ -162,6 +164,33 @@ func TestTryMatch_ClaimConflictKeepsWaiting(t *testing.T) {
 	assert.Equal(t, protocol.StatusWaiting, got.Status)
 }
 
+// TestTryMatch_MarkMatchedConflictFails は、確定の書き込み（MarkMatched）が送り直しても衝突した場合に、
+// グループ 4 人全員が FAILED になり、ポーリングした本人にもその場で FAILED が返ることを確認する。
+func TestTryMatch_MarkMatchedConflictFails(t *testing.T) {
+	store := newFakeStore()
+	for i, id := range []string{"t1", "t2", "t3", "t4"} {
+		store.put(makeWaiting(id, "p"+id, "", int64(1000+i)))
+	}
+	store.markMatchedErr = db.ErrTransactionConflict // 確保は成功したが、MATCHED の書き込みが衝突し続けた想定
+
+	sessions := newFakeSessionProvider()
+	m := newMatcherFor(store, sessions, 1500)
+	got, err := m.TryMatch(context.Background(), "t1")
+	require.NoError(t, err)
+	assert.Equal(t, protocol.StatusFailed, got.Status)
+
+	// 本人だけでなく、グループ全員が FAILED（MATCHING のまま残らない）
+	for _, id := range []string{"t1", "t2", "t3", "t4"} {
+		stored, _ := store.GetTicket(context.Background(), id)
+		assert.Equal(t, protocol.StatusFailed, stored.Status, id)
+	}
+	assert.Equal(t, []string{got.IdempotencyToken}, sessions.endedIDs)
+	require.Len(t, store.sessions, 1)
+	for _, s := range store.sessions {
+		assert.Equal(t, protocol.SessionFailed, s.Status, "片付けたので Failed になる")
+	}
+}
+
 func TestTryMatch_PartyPreserved(t *testing.T) {
 	store := newFakeStore()
 	// self はソロ。同じクエストにパーティ 3 + ソロが居る。
@@ -192,4 +221,183 @@ func TestTryMatch_PartyPreserved(t *testing.T) {
 func TestErrConflictIsDistinct(t *testing.T) {
 	assert.True(t, errors.Is(db.ErrConflict, db.ErrConflict))
 	assert.False(t, errors.Is(db.ErrConflict, ErrTicketNotFound))
+}
+
+// TestTryMatch_MarkMatchedLandedDespiteError は、MarkMatched がエラーを返したが書き込みは通っていた場合に、
+// 片付けをせず、読み直した MATCHED を本人に返すことを確認する。
+func TestTryMatch_MarkMatchedLandedDespiteError(t *testing.T) {
+	store := newFakeStore()
+	for i, id := range []string{"t1", "t2", "t3", "t4"} {
+		store.put(makeWaiting(id, "p"+id, "", int64(1000+i)))
+	}
+	store.markMatchedErr = errors.New("timeout") // 応答は失敗に見えた
+	store.onMarkMatched = func() {
+		// MarkMatched は実は通っていた: 4 枚とも MATCHED で version も進んでいる
+		for _, tk := range store.tickets {
+			tk.Status = protocol.StatusMatched
+			tk.Version++
+		}
+	}
+	sessions := newFakeSessionProvider()
+
+	m := newMatcherFor(store, sessions, 1500)
+	got, err := m.TryMatch(context.Background(), "t1")
+	require.NoError(t, err)
+
+	assert.Equal(t, protocol.StatusMatched, got.Status, "書き込みは通っていたので MATCHED")
+	assert.Empty(t, sessions.endedIDs, "MATCHED のセッションは終わらせない")
+	require.Len(t, store.sessions, 1)
+	for _, s := range store.sessions {
+		assert.Equal(t, protocol.SessionActive, s.Status, "片付けていないので ACTIVE のまま")
+	}
+}
+
+// TestTryMatch_MarkMatchedAfterRescue は、MarkMatched の前に救済でグループが FAILED にされていた場合に、
+// 片付けを救済した側に任せ、読み直した FAILED を本人に返すことを確認する。
+func TestTryMatch_MarkMatchedAfterRescue(t *testing.T) {
+	store := newFakeStore()
+	for i, id := range []string{"t1", "t2", "t3", "t4"} {
+		store.put(makeWaiting(id, "p"+id, "", int64(1000+i)))
+	}
+	store.markMatchedErr = db.ErrConflict
+	store.onMarkMatched = func() {
+		// 救済が先に走った: 4 枚とも FAILED で version も進んでいる
+		for _, tk := range store.tickets {
+			tk.Status = protocol.StatusFailed
+			tk.Version++
+		}
+	}
+	sessions := newFakeSessionProvider()
+
+	m := newMatcherFor(store, sessions, 1500)
+	got, err := m.TryMatch(context.Background(), "t1")
+	require.NoError(t, err)
+
+	assert.Equal(t, protocol.StatusFailed, got.Status, "救済で FAILED になっていた")
+	assert.Empty(t, sessions.endedIDs, "片付けは救済した側が担当する")
+	require.Len(t, store.sessions, 1)
+	for _, s := range store.sessions {
+		assert.Equal(t, protocol.SessionActive, s.Status, "この経路では片付けないので ACTIVE のまま")
+	}
+}
+
+// TestTryMatch_CleanupErrorsStillFail は、MarkFailed が通った後の片付け（EndGameSession / FailSession）が
+// 失敗しても、エラーを返さず本人に FAILED を返すことを確認する。
+func TestTryMatch_CleanupErrorsStillFail(t *testing.T) {
+	store := newFakeStore()
+	for i, id := range []string{"t1", "t2", "t3", "t4"} {
+		store.put(makeWaiting(id, "p"+id, "", int64(1000+i)))
+	}
+	store.markMatchedErr = db.ErrTransactionConflict
+	store.failSessionErr = errors.New("dynamodb unavailable")
+	sessions := newFakeSessionProvider()
+	sessions.endErr = errors.New("gamelift unavailable")
+
+	m := newMatcherFor(store, sessions, 1500)
+	got, err := m.TryMatch(context.Background(), "t1")
+	require.NoError(t, err, "片付けの失敗はログに残すだけ")
+
+	assert.Equal(t, protocol.StatusFailed, got.Status)
+	assert.Equal(t, []string{got.IdempotencyToken}, sessions.endedIDs, "終わらせようとはした")
+	require.Len(t, store.sessions, 1)
+	for _, s := range store.sessions {
+		assert.Equal(t, protocol.SessionActive, s.Status, "FailSession が失敗したので ACTIVE のまま")
+	}
+}
+
+// TestTryMatch_MarkFailedUnknownError は、MarkFailed が条件不一致以外のエラーになった場合に、
+// 状態が分からないので片付けず、エラーを返す（次のポーリングに任せる）ことを確認する。
+func TestTryMatch_MarkFailedUnknownError(t *testing.T) {
+	store := newFakeStore()
+	for i, id := range []string{"t1", "t2", "t3", "t4"} {
+		store.put(makeWaiting(id, "p"+id, "", int64(1000+i)))
+	}
+	store.markMatchedErr = db.ErrTransactionConflict
+	store.markFailedErr = errors.New("network error")
+	sessions := newFakeSessionProvider()
+
+	m := newMatcherFor(store, sessions, 1500)
+	_, err := m.TryMatch(context.Background(), "t1")
+	require.Error(t, err)
+
+	assert.Empty(t, sessions.endedIDs, "状態が分からないので片付けない")
+	require.Len(t, store.sessions, 1)
+	for _, s := range store.sessions {
+		assert.Equal(t, protocol.SessionActive, s.Status)
+	}
+}
+
+// makeStuckMatching は、トークン token で確保されたまま止まった MATCHING チケットを返す（テストアレンジ用）。
+func makeStuckMatching(id, player, token string, matchingAt int64) *protocol.Ticket {
+	t := makeWaiting(id, player, "", 1000)
+	t.Status = protocol.StatusMatching
+	t.Version = 1 // 確保で 0 → 1 になった後
+	t.MatchingAt = matchingAt
+	t.IdempotencyToken = token
+	return t
+}
+
+// putStuckGroup は、同じトークンで止まった 4 人のグループと、書かれていた Sessions の行を置く。
+func putStuckGroup(store *fakeStore, token string, matchingAt int64) {
+	for _, id := range []string{"t1", "t2", "t3", "t4"} {
+		store.put(makeStuckMatching(id, "p"+id, token, matchingAt))
+	}
+	// PutSession と MarkMatched の間で止まった想定（Sessions の行はある）
+	store.sessions[token] = &protocol.Session{SessionID: token, Status: protocol.SessionActive}
+}
+
+// TestTryMatch_RescuesStuckMatching は、MATCHING のまま matchingLeaseMs を過ぎたチケットをポーリングすると、
+// グループ全員を FAILED にし、トークンでゲームセッションと Sessions の行を片付けることを確認する。
+func TestTryMatch_RescuesStuckMatching(t *testing.T) {
+	store := newFakeStore()
+	putStuckGroup(store, "tok-stuck", 1000)
+	sessions := newFakeSessionProvider()
+
+	m := newMatcherFor(store, sessions, 1000+matchingLeaseMs) // ちょうど 40 秒後
+	got, err := m.TryMatch(context.Background(), "t1")
+	require.NoError(t, err)
+
+	assert.Equal(t, protocol.StatusFailed, got.Status)
+	for _, id := range []string{"t1", "t2", "t3", "t4"} {
+		stored, _ := store.GetTicket(context.Background(), id)
+		assert.Equal(t, protocol.StatusFailed, stored.Status, id)
+	}
+	assert.Equal(t, []string{"tok-stuck"}, sessions.endedIDs, "片付けの ID はトークン")
+	assert.Equal(t, protocol.SessionFailed, store.sessions["tok-stuck"].Status)
+}
+
+// TestTryMatch_StuckMatchingBeforeLease は、matchingLeaseMs に 1 ミリ秒届かないうちは救済せず、
+// MATCHING のまま返すことを確認する（確定の処理がまだ走っているかもしれないため）。
+func TestTryMatch_StuckMatchingBeforeLease(t *testing.T) {
+	store := newFakeStore()
+	putStuckGroup(store, "tok-stuck", 1000)
+	sessions := newFakeSessionProvider()
+
+	m := newMatcherFor(store, sessions, 1000+matchingLeaseMs-1)
+	got, err := m.TryMatch(context.Background(), "t1")
+	require.NoError(t, err)
+
+	assert.Equal(t, protocol.StatusMatching, got.Status)
+	for _, id := range []string{"t1", "t2", "t3", "t4"} {
+		stored, _ := store.GetTicket(context.Background(), id)
+		assert.Equal(t, protocol.StatusMatching, stored.Status, id)
+	}
+	assert.Empty(t, sessions.endedIDs)
+	assert.Equal(t, protocol.SessionActive, store.sessions["tok-stuck"].Status)
+}
+
+// TestTryMatch_RescueLosesRace は、救済の MarkFailed が条件不一致（ほかのポーリングが先に救済した）の場合に、
+// エラーにせず、片付けもしないことを確認する。
+func TestTryMatch_RescueLosesRace(t *testing.T) {
+	store := newFakeStore()
+	putStuckGroup(store, "tok-stuck", 1000)
+	store.markFailedErr = db.ErrConflict
+	sessions := newFakeSessionProvider()
+
+	m := newMatcherFor(store, sessions, 1000+matchingLeaseMs)
+	_, err := m.TryMatch(context.Background(), "t1")
+	require.NoError(t, err)
+
+	assert.Empty(t, sessions.endedIDs, "片付けは先に救済した側が担当する")
+	assert.Equal(t, protocol.SessionActive, store.sessions["tok-stuck"].Status)
 }

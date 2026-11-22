@@ -1,5 +1,7 @@
 // client はローカル E2E を端から端まで駆動する CLI。本番 Unity クライアントの代役として
-// 「ログイン → マッチ要求 → ステータス待ち → UDP プレイ → 結果報告 → 履歴確認」を 1 本で通す。
+// 「ログイン → マッチ要求 → ステータス待ち → UDP プレイ → 履歴確認」を 1 本で通す。
+// 結果の報告（/session/end）はゲームサーバーの報告係が行う。クライアントは送信をやめた後、
+// サーバー側で離脱扱い → 全員抜けたとしてセッションが終わり、履歴が書かれるのを待つ。
 // 各処理は段階的に実装していく（まずは 3-1: ログインまで）。
 //
 // 接続先:
@@ -41,7 +43,6 @@ type config struct {
 	questID     string
 	soloAllowed bool
 	moves       int
-	result      string
 }
 
 func main() {
@@ -77,14 +78,9 @@ func main() {
 		log.Fatalf("client: playSession: %v", err)
 	}
 
-	// 3-5: 結果を報告し、MatchHistory への保存を起こす（server-to-server 経路）。
-	if err := c.reportResult(ctx); err != nil {
-		log.Fatalf("client: reportResult: %v", err)
-	}
-
-	// 3-6: 履歴を取得し、いま書いたエントリが返ることを確認して E2E を締める。
-	if err := c.fetchHistory(ctx); err != nil {
-		log.Fatalf("client: fetchHistory: %v", err)
+	// 3-5: ゲームサーバーが結果を報告し、今回のセッションが履歴に現れるのを待って E2E を締める。
+	if err := c.waitHistory(ctx); err != nil {
+		log.Fatalf("client: waitHistory: %v", err)
 	}
 	log.Printf("client: E2E completed")
 }
@@ -99,7 +95,6 @@ func parseFlags() config {
 	flag.StringVar(&cfg.questID, "quest", "quest-rathalos", "quest id to matchmake for")
 	flag.BoolVar(&cfg.soloAllowed, "solo", true, "allow immediate solo match (single-client E2E)")
 	flag.IntVar(&cfg.moves, "moves", 10, "number of PLAYER_MOVE packets to send during play")
-	flag.StringVar(&cfg.result, "result", "CLEAR", "match result to report (CLEAR/FAILED/ABANDONED)")
 	flag.Parse()
 	return cfg
 }
@@ -114,7 +109,6 @@ type client struct {
 	ticketID  string                  // match/request で得たマッチ待ちチケット
 	sessionID string                  // マッチ成立で確定したゲームセッション ID
 	conn      protocol.ConnectionInfo // UDP 接続先（ゲームサーバ）
-	matchedAt time.Time               // マッチ成立時刻（所要秒の起点）
 
 	// ticketAPI は match/status・match/cancel の送り先。マルチリージョンでは
 	// チケットが region-local なので、match/request が返したリージョン固定 URL に
@@ -304,12 +298,13 @@ func (c *client) pollMatch(ctx context.Context) error {
 			}
 			c.sessionID = out.SessionID
 			c.conn = *out.ConnectionInfo
-			c.matchedAt = time.Now()
 			return nil
 		case protocol.StatusWaiting, protocol.StatusMatching:
 			log.Printf("client: status=%s waited=%ds…", out.Status, out.WaitedSec)
 		case protocol.StatusTimeout, protocol.StatusCancelled:
 			return fmt.Errorf("match not formed: status=%s", out.Status)
+		case protocol.StatusFailed:
+			return fmt.Errorf("match failed: status=%s", out.Status)
 		default:
 			return fmt.Errorf("unexpected status: %s", out.Status)
 		}
@@ -450,64 +445,54 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 	}
 }
 
-// reportResult は POST /session/{sessionId}/end で結果を報告する。本番ではゲームサーバ
-// （GameLift プロセス）が呼ぶ server-to-server 経路のため、プレイヤー JWT は載せない。
-// DurationSec はマッチ成立からの経過秒。これにより MatchHistory への保存が走る。
-//
-// 送り先は ticketAPI ではなく cfg.apiURL でよい。Sessions / MatchHistory は
-// Global Tables でどのリージョンからでも同じデータを読み書きできるため、
-// リージョン固定が不要な API（docs/qa-log.md §13）。
-func (c *client) reportResult(ctx context.Context) error {
-	in := protocol.SessionEndInput{
-		Result:      protocol.MatchResult(c.cfg.result),
-		DurationSec: int(time.Since(c.matchedAt).Seconds()),
+// historyWait は、今回のセッションが履歴に現れるまで待つ上限。
+// 送信をやめてから離脱扱いになるまでの 10 秒（PlayerIdleTimeoutMs）と、報告係の送り直しを見込む。
+const historyWait = 30 * time.Second
+
+// waitHistory は GET /player/{playerId}/history を 1 秒ごとに叩き、ゲームサーバーが報告した
+// 今回のセッションの履歴が現れるまで待つ。上限を過ぎたらエラーを返す。
+func (c *client) waitHistory(ctx context.Context) error {
+	deadline := time.Now().Add(historyWait)
+	for {
+		entry, err := c.findHistory(ctx)
+		if err != nil {
+			return err
+		}
+		if entry != nil {
+			log.Printf("client: history found session=%s quest=%s result=%s duration=%ds",
+				entry.SessionID, entry.QuestID, entry.Result, entry.DurationSec)
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("session %s not found in history after %s", c.sessionID, historyWait)
+		}
+		log.Printf("client: waiting for session end report…")
+		if !sleepCtx(ctx, time.Second) {
+			return ctx.Err()
+		}
 	}
-	url := c.cfg.apiURL + "/session/" + c.sessionID + "/end"
-	status, raw, err := c.postJSON(ctx, url, "", in)
-	if err != nil {
-		return err
-	}
-	if status != http.StatusOK {
-		return fmt.Errorf("unexpected status %d: %s", status, raw)
-	}
-	var out protocol.SessionEndOutput
-	if err := json.Unmarshal(raw, &out); err != nil {
-		return fmt.Errorf("decode response: %w", err)
-	}
-	log.Printf("client: result reported status=%s playersSaved=%d result=%s",
-		out.Status, out.PlayersSaved, c.cfg.result)
-	return nil
 }
 
-// fetchHistory は GET /player/{playerId}/history を叩き、いま報告した結果が
-// 履歴に反映されているか確認する。直近エントリが今回の sessionId と一致すれば成功。
-func (c *client) fetchHistory(ctx context.Context) error {
+// findHistory は履歴を 1 回取得し、今回のセッションのエントリを返す。まだ無ければ nil。
+func (c *client) findHistory(ctx context.Context) (*protocol.MatchHistoryEntry, error) {
 	url := c.cfg.apiURL + "/player/" + c.playerID + "/history"
 	status, raw, err := c.getJSON(ctx, url, c.idToken)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if status != http.StatusOK {
-		return fmt.Errorf("unexpected status %d: %s", status, raw)
+		return nil, fmt.Errorf("unexpected status %d: %s", status, raw)
 	}
 	var out protocol.MatchHistoryOutput
 	if err := json.Unmarshal(raw, &out); err != nil {
-		return fmt.Errorf("decode response: %w", err)
+		return nil, fmt.Errorf("decode response: %w", err)
 	}
-
-	log.Printf("client: history entries=%d", len(out.Entries))
-	for i, e := range out.Entries {
-		log.Printf("client:   [%d] session=%s quest=%s result=%s duration=%ds",
-			i, e.SessionID, e.QuestID, e.Result, e.DurationSec)
-	}
-
-	// 今回のセッションが履歴に含まれることを E2E 成立の確証とする。
 	for _, e := range out.Entries {
 		if e.SessionID == c.sessionID {
-			return nil
+			return &e, nil
 		}
 	}
-	return fmt.Errorf("reported session %s not found in history", c.sessionID)
+	return nil, nil
 }
 
 // matchStatus は GET /match/status/{ticketId} を 1 回叩いて結果をデコードする。

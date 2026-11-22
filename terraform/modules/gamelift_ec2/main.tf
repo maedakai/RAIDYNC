@@ -146,6 +146,9 @@ resource "aws_gamelift_fleet" "this" {
       # start.sh が環境変数を export してから gameserver を exec する。
       # Build zip のルートが /local/game に展開される。
       launch_path = "/local/game/start.sh"
+      # start.sh の第 1 引数。ゲームサーバーがセッション終了時に /session/end を呼ぶ API のベース URL。
+      # runtime configuration は環境変数を渡せないため、引数で渡して start.sh が SESSION_API_URL に入れる。
+      parameters = var.session_api_url
       # gameserver は固定ポート(7777)を listen するため、1 インスタンス 1 プロセス。
       concurrent_executions = 1
     }

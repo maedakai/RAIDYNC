@@ -282,6 +282,31 @@ A. 作ろうとしない。`ClaimTickets` でグループ全員のチケット�
 ### Q. ③（セッション生成）より先に④を置かないのはなぜ?
 A. **チケットの確保（MATCHING 確定）を先に済ませてからセッションを生成する**順序にしている。先にセッションだけ作って確保に失敗すると、**使われない幽霊セッション**が残ってしまう。確保成功を確認してから外部リソース（GameLift セッション）を作ることで、整合性を保ち無駄を防ぐ。
 
+### Q. セッションを確立するコードはどこにある?
+A. 専用の session-create Lambda は無く、**`GET /match/status` のポーリング契機**で成立させる。
+- 起点: `handlers/match_status.go` → `matchmaking.Matcher.TryMatch`（`matchmaking/matcher.go`）
+- 成立処理の本体: `Matcher.finalize`。`SessionProvider.CreateGameSession` → Sessions に `PutSession` → グループ全員のチケットを `MarkMatched`（共通接続先＋本人の playerSessionId）
+- `SessionProvider` の実装は 2 つ: 本番 `matchmaking/gamelift_provider.go`（GameLift `CreateGameSession` + `CreatePlayerSessions`）、ローカル E2E `cmd/localapi/gameserver.go` の `hubSessionProvider`
+- ゲームサーバー側の受け口: `gameserver/gamelift.go` の `onStartGameSession`（roster を Hub に登録して `ActivateGameSession`）
+
+### Q. セッション確立時、ユーザー（チケット）がどういう状態だとエラーになる?
+A. 状態の食い違いは大半が**エラーにならない**よう設計されている。
+- 自チケットが WAITING 以外 → 現状をそのまま 200 で返す（パススルー）
+- Query 後〜確保前に仲間がキャンセル／他 matcher が先に確保 → `ClaimTickets` の条件（`status=WAITING AND version=cur`）が落ちて `ErrConflict` → `nil` 扱いで次のポーリングで再試行
+- 60 秒経過で人数不足 → TIMEOUT（競合なら最新状態を返す）
+
+エラーになるのは次のケース。
+- **404**: チケットが無い。ticketId 誤り、TTL（90s）で削除済み、発行元と別リージョンにポーリング（アフィニティ崩れ）
+- **500（ユーザー起因）**: 同一プレイヤーが WAITING チケットを 2 枚持ち同じグループに入った場合。`match/request` の重複チェック（`FindWaitingByPlayer`→`PutTicket`）は非原子的かつ GSI は結果整合なので、連打で 2 枚できうる。roster に同じ playerId が 2 回入り、psid map が重複を潰して `psid 数が不足` で失敗する
+- **500（ユーザー非起因）**: GameLift／DynamoDB の失敗（フリート容量不足、IP 未確定など）
+
+**注意点**: `ClaimTickets` 成功後に `finalize` が失敗すると補償処理が無く、グループ全員のチケットが **MATCHING のまま残る**。以降のポーリングはパススルーで MATCHING を返し続け、TTL 削除後は 404 になる。GameLift 側にセッションが作られていれば孤児になる。
+
+### Q. グループ候補の一人が既に MATCHED だったらどうなる?
+A. 「チケット」が MATCHED か「プレイヤー」が MATCHED かで結果が違う。
+- **候補チケット自体が MATCHED（GSI の古い読み取り）**: `QueryWaitingByQuest` は GSI（結果整合）なので、確保済みのチケットが WAITING として混ざりうる。`ClaimTickets` はトランザクションで各チケットの `status=WAITING AND version=cur` を条件にするため、1 枚でも落ちれば**全員分がキャンセル**（誰も MATCHING にならない）→ `ErrConflict` → 次のポーリングで再試行。エラーにも二重割り当てにもならない。条件付き書き込みが GSI の結果整合を吸収している。
+- **同じプレイヤーの別チケットが MATCHED（二重チケット）**: 条件はチケット単位でプレイヤー単位ではないので、WAITING 側のチケットは普通に確保・成立する。エラーにならず、**1 人が 2 セッションに割り当てられる**。クライアントは片方のチケットしか追わないため、もう片方のセッションには来ない人の席が残り、他の 3 人はその人を待つことになる。根本原因は `match/request` の重複防止が非原子的なこと。
+
 ---
 
 ## 5. JWT 認証
@@ -1015,6 +1040,20 @@ client sendUDP: 受け取った psid を毎パケットの GameMessage.PlayerSes
 - **課金の心配**: 有料プラン切替＝即課金ではない。AWS は従量課金なので未使用なら $0。予算アラート $200/月 も別途。
 - **判定**: `aws gamelift list-locations --region ap-northeast-1` が `SubscriptionRequiredException` を返さなくなれば有効化完了→ステップ1（create-location）へ。
 
+### Q. `server/cmd/lambda/*/main.go` はローカルでは使っていないのか
+**使っていない（2026-10-27 時点）。** `main.go` が実行されるのは、`scripts/build-lambdas.sh` でビルドして Terraform（`modules/lambda`）で AWS にデプロイした Lambda の中だけ。
+
+| | ローカル | AWS |
+|---|---|---|
+| 入口 | `cmd/localapi`（net/http） | `cmd/lambda/*/main.go`（`telemetry.StartLambda` → `lambda.Start`） |
+| ハンドラ本体 | `internal/handlers` | `internal/handlers`（同じもの） |
+| 認証 | `localapi` の `withAuth`（`internal/auth.Verifier` を直接呼ぶ） | `cmd/lambda/authorizer` |
+| OTel | `telemetry.Init` | `telemetry.StartLambda` |
+
+- `main.go` は「依存を組み立てて `Handle` を Lambda ランタイムに渡す」だけの薄い殻にしてあり、ロジックは `internal/handlers` に寄せてある。そのため、ローカルで動かしていない部分は配線（環境変数の読み取り・クライアント生成・`selectSessionProvider` など）だけになる。
+- `docker-compose.yml` の LocalStack は `SERVICES` に `lambda,apigateway` を含むが、init スクリプトは Lambda を登録しない。LocalStack に実デプロイする案（案 C）は採らず、案 A（`localapi`）を選んだ（§11 の比較表）。
+- **代償**: `main.go` の配線ミスや `authorizer` の Lambda としての挙動（TOKEN 型の入出力、`StartLambda` の Flush）は、ローカルでは検出できない。`go build ./...` と `go vet ./...` を通すことと、AWS dev での E2E で確認する。
+
 ---
 
 ## 12. Phase 4：AWS dev E2E（本番同等環境）
@@ -1103,7 +1142,7 @@ dev/検証フェーズはそれでよい（`source_code_hash` があるので ap
 
 ### Q. 初回 apply が全リソース `AccessDenied`。どう対処した?（デプロイ用 IAM 権限）
 
-`raidync-cli` は Anywhere 検証・読み取り中心で先行作成したユーザーで、フル構成をプロビジョニングする権限が無かった。`AdministratorAccess` は使わず、**使う 8 サービスに絞った最小権限ポリシー**（`terraform/bootstrap/raidync-cli-deploy-policy.json`）を作成してアタッチした。
+`raidync-cli` は Anywhere 検証・読み取り中心で先行作成したユーザーで、フル構成をプロビジョニングする権限が無かった。`AdministratorAccess` は使わず、**使うサービスに絞った最小権限ポリシー**（`terraform/bootstrap/raidync-cli-deploy-policy.json`）を作成してアタッチした。
 - 許可: `dynamodb/cognito-idp/apigateway/lambda/gamelift/logs`（フルアクション・Resource `*`）、`s3`（Build バケット限定）、`iam`（`raidync-dev-*` ロール限定＋`PassRole`）、`sts:GetCallerIdentity`。
 - **CREATE 権限は plan では検証できない**（plan は作成 API を呼ばない）。事前検証は **IAM Policy Simulator**（`simulate-principal-policy`。副作用なし）を使う。
 - Administrator より大幅に狭く「EC2/RDS/課金/他ユーザーに触れない」ことを担保。ポートフォリオ上「デプロイ identity を最小権限設計した」証跡になる。
@@ -1927,3 +1966,1399 @@ fields @timestamp, msg, status, requestId, err | filter level = "ERROR" | sort @
 デプロイを `-target=module.lambda` に絞った結果、**`module.lambda_secondary`（us-east-1）に古いバイナリが残った**。`terraform plan`（`-target` なし）に `6 to change` として現れて発覚。
 
 マルチリージョン構成で片肺だけ古いコードが動く状態は、本番なら事故のもと。Terraform が毎回 `Resource targeting is in effect` と警告するのはこのため。**`-target` を使ったら、必ず素の `plan` で `No changes` まで戻す。**
+
+---
+
+## 15. Phase 6：監視・アラート
+
+> Phase 6 は 6-2（ERROR ログのアラート化）から着手した。ロードマップ順では 6-1（ダッシュボード）が先だが、
+> ダッシュボードに何を並べるかは「何を異常とみなすか」が決まってからのほうが決めやすいため。
+
+### Q. CloudWatch Logs メトリクスフィルタと EMF は何が違う? どちらを採るべきか
+
+**どちらも最終的に作るものは同じ「CloudWatch カスタムメトリクス」。違いは変換ルールをどこに置くか。**
+
+| | メトリクスフィルタ | EMF（Embedded Metric Format） |
+|---|---|---|
+| 変換ルールの置き場所 | CloudWatch 側（Terraform） | アプリ側（Go のコード） |
+| アプリの変更 | **不要**（今の slog JSON にそのまま当たる） | **必要**（`_aws` ブロックを含む専用スキーマを出す） |
+| 定義の単位 | **ロググループごと** | コード 1 箇所 |
+| 関数追加時 | フィルタを足す作業が発生（**足し忘れると永久に無検知**） | 自動で乗る |
+| ディメンション | 付けられるが、付けると「マッチ時のみ publish」になる | アプリの持つ情報から自由に付けられる |
+| コスト | カスタムメトリクス $0.30/メトリクス/月（フィルタ定義自体は無料） | 同左（ディメンションの組み合わせ数だけ増える） |
+
+**よくある誤解**: 「ログが JSON だから EMF が要る」は誤り。逆に、メトリクスフィルタのパターン構文は JSON に対応していて `{ $.level = "ERROR" }` がそのまま使える。一方 EMF は「JSON なら何でもよい」のではなく `_aws` ブロックを含む決まったスキーマを要求するので、**現状の slog JSON は EMF ではない**。
+
+**RAIDYNC の判断: EMF を採用**（2026-09-05）。決め手は**人的ミスの排除**。
+
+このプロジェクトは Lambda 6 関数 × 2 リージョン = **12 ロググループ**。メトリクスフィルタはロググループ単位のリソースなので 12 個の定義が要り、関数を増やすたびに Terraform を追随させる必要がある。**足し忘れた関数のエラーは永久に検知されない**——これはアラートの設計として致命的で、「忘れずにアラートが機能すること」という目的そのものを人間の注意力に依存させてしまう。EMF なら `internal/apigw/respond.go` の 1 箇所が全関数を覆う。
+
+**トレードオフ**: 監視の責務がインフラからアプリに移る。EMF の出力を壊さない責任がコード側にあり、壊れても Terraform の plan には出ない。
+
+### Q. EMF で出すメトリクスをどう設計した?
+
+**確定した設計**（2026-09-05）:
+
+| 項目 | 値 |
+|---|---|
+| Namespace | `RAIDYNC/Handlers` |
+| MetricName | `HandlerError` |
+| Dimensions | `[["FunctionName"], ["FunctionName", "ErrorKind"]]` |
+| 値 | エラー 1 件につき `1`（Unit: `Count`）。CloudWatch 側で `Sum` を取る |
+
+**MetricName は「測る量の種類」の数だけ作る。** CloudWatch のメトリクスは `Namespace + MetricName + Dimensions の組み合わせ` 1 つで 1 メトリクス（課金もアラームもこの単位）。切り分けはディメンションの仕事なので、`MatchRequestError` / `MatchStatusError` … と関数ごとに名前を分けるのは誤り。それをやるとアラームもダッシュボードも関数ごとに手書きになり、EMF を選んだ動機（1 箇所で全関数を覆う）が消える。
+
+**`HandlerError` という冗長な名前を選んだ理由**: namespace と "Handler" が重複するが、グラフの凡例・アラーム画面・SNS 通知本文には**メトリクス名だけが出る**場面が多く、`Error` では何のエラーか読めない。単体で意味が通る名前にする。
+
+**リージョンをディメンションにしない理由**: **CloudWatch メトリクスはリージョナル**。us-east-1 の Lambda が出した EMF は us-east-1 の CloudWatch にしか入らないので、リージョンは所属先として自明で、常に同じ値が入る死んだ次元になる。アラームもリージョナルなため「両リージョン合計」のアラームはそもそも作れず、どのみち同じアラームを 2 セット作る。
+
+**ディメンションセットを 2 段階にした理由**: EMF の `Dimensions` は配列の配列で、**宣言したセットの粒度でしかメトリクスが存在しない**。`[["FunctionName","ErrorKind"]]` だけだと「この関数のエラー合計」というメトリクスが存在しない。そして **CloudWatch アラームは `SEARCH()` 式にアラームを張れない**（`SEARCH` はダッシュボード限定）ため、合算での代用は行き止まりになる。粗いセットを併記して、**粗い方＝アラーム用／細かい方＝原因切り分け用**と役割を分けた。
+
+**コスト**: エラーメッセージは各ハンドラに固有なので `(FunctionName, ErrorKind)` の組み合わせは掛け算にならず、上限は 9 通り。細 9 + 粗 6 = 15 メトリクス/リージョン、2 リージョンで 30 = **月 $9.00 が最悪ケース**。カスタムメトリクスは**データポイントが届いたものだけ課金**されるので、エラーが出ていない期間はほぼ $0。
+
+**避けるべき設計**: `ErrorKind` に `err.Error()` を使うこと。DynamoDB のエラー文字列にはリクエスト ID が混ざるため値が毎回変わり（高カーディナリティ）、メトリクスが際限なく生成されて課金が青天井になる。
+
+### Q. EMF をコードのどこで、どう出すか
+
+**`internal/apigw/respond.go` の `Error` 関数から、既存の `slog.ErrorContext` に混ぜて 1 行で出す。**
+
+| 論点 | 決定 | 理由 |
+|---|---|---|
+| ログ行を分けるか | **混ぜる**（1 エラー = 1 行） | EMF は未知フィールドを無視するので `time`/`level`/`msg`/`requestId`/`err` と同居できる。行が分かれると値がずれる余地が生まれる |
+| 発火条件 | `err != nil && status >= 500` | 現状 `err` を渡す 9 箇所はすべて 500 系だが、それは**偶然の一致**。将来 `Error(ctx, 400, ..., err)` が書かれるとクライアント起因の 400 でアラームが鳴る |
+| `ErrorKind` の作り方 | message を機械的に正規化（`"ticket lookup failed"` → `ticket_lookup_failed`） | 引数を増やさないので全 9 箇所に即適用でき、今後の追加でも付け忘れが起きない |
+| `FunctionName` の取得元 | 環境変数 `AWS_LAMBDA_FUNCTION_NAME`（Lambda ランタイムが自動設定） | `handlers.go` の `AWS_REGION` と同じ流儀。Terraform で渡す必要がない |
+| ローカルで空のとき | 固定値を入れて EMF 行は常に出す | ローカルの stdout は CloudWatch Logs に入らないので**メトリクスは作られない**。実害はログが読みにくい程度で、分岐を増やす価値がない |
+
+**`ErrorKind` を機械変換にしたトレードオフ（承知の上で採用）**: 「人間向けの表示文字列」と「メトリクスの識別子」が同一になる。誰かが `"ticket lookup failed"` を書き直すと**ディメンション値が変わり、CloudWatch 上は別メトリクスになる**。過去データは繋がらず、そのメトリクスに張ったアラームは反応しなくなる。しかも Terraform の plan には何も出ない。
+
+**`FunctionName` を RequestId から取ろうとしてはいけない**: `lambdacontext` の `AwsRequestID` は呼び出しごとのランダム UUID で、関数名の情報を含まない。ディメンションにすれば呼び出しのたびに新しいメトリクスが生成され、コストが青天井になる。
+
+**唯一の落とし穴**: `_aws.Timestamp` は**エポックミリ秒の数値**（`time.Now().UnixMilli()`）。slog が出す `time` は RFC3339 文字列で別物。**忘れてもログは正常に出力され、メトリクスだけが静かに作られない。**
+
+### Q. EMF の実装は実際にメトリクスになった? 何を確認したか
+
+**なった（2026-09-20、AWS dev で実測）。** `aws cloudwatch list-metrics --namespace "RAIDYNC/Handlers"` の結果:
+
+```
+HandlerError { FunctionName: raidync-dev-match_request }
+HandlerError { FunctionName: raidync-dev-match_request, ErrorKind: ticket_lookup_failed }
+```
+
+**1 回のエラーで 2 メトリクスが同時に生成された**ことが、ディメンションセットを 2 段階で宣言した設計（粗い方＝アラーム用／細かい方＝切り分け用）の実証になった。エラーは IAM 破壊演習と同じ手（`modules/iam` から `/index/*` を外す）で起こした。
+
+**「CloudWatch を先に作る」作業は存在しない。** ロググループは `modules/lambda` で作成済み、メトリクスは Terraform のリソースではなく **CloudWatch Logs が EMF を取り込んだ瞬間に生成される**。そのため `cloudwatch:PutMetricData` 権限も不要（変換はサービス側の仕事）。実際 IAM を一切変更せずにメトリクスが出た。
+
+**ただし CLI から読むには `cloudwatch:*` が必要だった。** `raidync-cli-deploy` ポリシーは `logs:*` を持っていたが `cloudwatch:*` が無く、`list-metrics` が AccessDenied。**CloudWatch Logs（`logs:`）と CloudWatch Metrics/Alarms（`cloudwatch:`）は IAM 上は別サービス**である点に注意。Phase 6 でアラーム・ダッシュボード・SNS を作るため、`cloudwatch:*` と `sns:*` をまとめて追加した。
+
+### Q. authorizer を EMF 対応させるとき、何が論点になったか
+
+**「JWT の検証失敗」の大半は異常ではない**ことが論点。期限切れ・署名不正・形式不正はクライアント起因で、サーバーは正しく拒否している＝正常動作。これを `HandlerError` に計上すると**期限切れトークンが届くたびにアラームが鳴る**。
+
+一方、**JWKS の取得失敗や設定ミス**（issuer / client_id 不一致で全リクエストが拒否される）は重大障害。しかし `jwt.Parse` は両者を**同じ `error` にまとめて返す**。
+
+**採用した分類**: `golang-jwt/jwt/v5` のセンチネル（`ErrTokenExpired` / `ErrTokenMalformed` / `ErrTokenSignatureInvalid` / `ErrTokenInvalidIssuer`）に `errors.Is` で一致すればクライアント起因。**一致しない未知のエラーはサーバー起因に倒す**（見逃さない方を優先）。
+
+**責務の分担**:
+
+| パッケージ | 責務 |
+|---|---|
+| `internal/auth` | **分類**。クライアント起因なら `ErrInvalidToken` を `%w` で巻き込んで返す。サーバー起因は原因だけ包む |
+| `internal/apigw` | **出力**。`emitError` が EMF を組み立てる。`Error`（5xx 判定あり）と `JWTError`（authorizer 用）が共有 |
+| `cmd/lambda/authorizer` | **判断**。`errors.Is(err, auth.ErrInvalidToken)` が偽のときだけ `apigw.JWTError` を呼ぶ |
+
+**`auth` に監視を持ち込まない理由**: `auth` から `apigw` を import すると依存が逆向きになり、`Verify` が `ctx` を持たないため `slog.ErrorContext(nil, ...)` になる。分岐を authorizer（`ctx` を持つ）に置けば自然に解決する。
+
+**`authorizer` には `slog.SetDefault` も必要**だった（他 5 関数は Phase 5 で移行済み、ここだけ `log.Printf` のまま＝Phase 6 backlog 3）。JSON でなければ EMF は解釈されない。
+
+### Q. 実装中に何が壊れ、何が検知したか
+
+**すべてテストか `go vet` が捕まえた。** EMF は壊れても Terraform の plan に出ないという弱点があるため、この事実自体が「テストを先に書いた」判断の裏付けになる。
+
+| 壊れたもの | 検知したもの |
+|---|---|
+| `emitError` 切り出し時に発火条件（`err != nil && status >= 500`）が消え、**400 でも EMF が出る**状態になった | `TestErrorEMF`（400 / err==nil のケース） |
+| `fmt.Errorf` の戻り値を捨てていた（4 箇所） | `go vet`（result of fmt.Errorf call not used） |
+| センチネル導入時にエラーの原因文字列が消えた | 既存の `verifier_test.go` 4 件 |
+| ディメンション値に `each.key`（短縮名）を使った | — **レビューでのみ発見**。動くが存在しないメトリクスを監視し、永久に `INSUFFICIENT_DATA` になる |
+
+400 で EMF が出る状態は、**気づかずに本番へ上がればクライアントの不正リクエストでアラームが鳴り続けていた**。
+
+### Q. アラームと SNS はどう構成した? 通知の確認で何が要るか
+
+**`modules/monitoring` を新設し、両リージョンで 2 回インスタンス化**（`providers = { aws = aws.secondary }`）。
+
+| 設定 | 値 | 理由 |
+|---|---|---|
+| 対象メトリクス | 粗い方（`FunctionName` のみ） | 新しい `ErrorKind` が増えてもアラームを足す必要がない。細かい方に張ると「足し忘れた種別は無検知」になり、EMF を選んだ動機と矛盾する |
+| 統計 / 期間 / しきい値 | `Sum` / 300 秒 / 1 件以上 | 正常時の `HandlerError` は 0 件なので 1 件で十分異常。期間を 1 時間にすると**検知が最大 1 時間遅れる**（セッション 20 分 × 3 回分） |
+| `treat_missing_data` | `notBreaching` | EMF はエラー時しかデータを出さないため、既定の `missing` だと**一度鳴ると OK に戻らない**。`breaching` なら常時 ALARM |
+| アラームの生成 | `for_each = module.lambda.function_names` | 関数を追加したらアラームも自動で増える。真実の情報源を lambda モジュールの output 1 つに寄せる |
+
+**名前の分離は不要だった**。GameLift モジュールを 2 回インスタンス化したときは S3 バケット名・IAM ロール名が**グローバル一意**で分離が必要だったが、`aws_sns_topic` / `aws_cloudwatch_metric_alarm` は**アカウント × リージョン**で一意なので、両リージョンに同名で作れる。
+
+**通知先のメールは tfvars に書かない**。`dev.tfvars` は Git 管理下で Phase 7 に公開するため、環境変数 `TF_VAR_notification_email` で渡す。`default = ""` + `count` で「空なら購読を作らない」ようにし、監視と無関係な apply が止まらないようにした。`sensitive = true` は plan 出力を伏せるだけで、**state には平文で入る**（state は `.gitignore` 済み）。
+
+**購読は人間の確認が要る（二重オプトイン）**。他人のアドレスを勝手に登録できてしまうのを防ぐ仕組み。確認するまで `SubscriptionArn` は文字列 `"PendingConfirmation"` のままで、**アラームが鳴ってもメールは届かず、未達分は保存されないので後から遡っても届かない**。`terraform apply` の成功は通知到達を何も保証しない。
+
+**実際に Gmail の迷惑メールに入っていた**（2026-09-23）。確認リンクを踏んだ後、`SubscriptionArn` が UUID 付きの ARN に変われば有効。**迷惑メール判定は解除しておくこと**——しないと以後のアラートも同じ扱いになり、監視が「届いているのに気づかない」状態になる。
+
+**通知経路の検証は `set-alarm-state` で行う**（エラーを起こす必要がない）:
+
+```bash
+aws cloudwatch set-alarm-state --alarm-name "raidync-dev-match_request-errors" \
+  --state-value ALARM --state-reason "notification path test" --region ap-northeast-1
+```
+
+2026-09-23 に実施し、`alarm_description` が本文に載った状態でメール到達を確認。**6-2 の完了基準（テストアラートの通知確認）を満たした。** `notBreaching` により、次の評価タイミングで自動的に OK へ戻る。
+
+### Q. 負荷テスト（6-6）の合格基準をどう決めたか
+
+**「毎回必ず不合格になる基準」は判定として機能しない**——これを軸に 5 項目を決めた（2026-09-27）。
+
+| 項目 | 基準 | 決めた理由 |
+|---|---|---|
+| API レイテンシ | API Gateway `Latency` の **p99 < 1,000ms** | 平常時の実測（東京 0.13 秒）の約 8 倍まで許容。**最大値を門にすると 1 件の外れ値で不合格**になるため p99。最初に挙げた 30,000ms は **API Gateway の統合タイムアウト上限 29 秒**により到達不能で、門として機能しなかった |
+| エラー率 | `HandlerError` **0 件**（出たら調査対象、テスト自体の不合格にはしない） | `HandlerError` はリトライ後も失敗した 5xx しか計上しないため、一時エラーは混ざらない。正常時 0 件なので 1 件で異常 |
+| 詰まり | Lambda `Throttles` / DynamoDB `ThrottledRequests` **0 件** | DynamoDB は `PAY_PER_REQUEST`（自動スケール）なので、出るならスケーリングが追いつかなかった証拠。Lambda は**アカウント同時実行クォータ既定 1,000** に当たる可能性が現実的 |
+| TIMEOUT | 投入人数から計算した**期待値ちょうど** | `MinMatchSize = 2` のため、余りが 2〜3 人なら見切り発車で成立し TIMEOUT にならない。**余りが 1 のときだけ 1 件**出る |
+| パーティ人数 | 成立セッションが**すべて 4 人** | ↓ |
+
+**CPU 使用率では測れない。** Lambda / API Gateway / DynamoDB はいずれも CPU メトリクスを公開せず、GameLift Managed EC2 のインスタンスは AWS 側アカウントで動くため `CPUUtilization` も見えない。サーバーレス構成では「サーバーの健康状態」ではなく**流量（Invocations / Count）と詰まり（Throttles）と処理時間（Duration / Latency）**で測る。
+
+**パーティ人数を基準に入れた理由（TIMEOUT 数だけでは見えない失敗モード）**: 負荷でマッチングが遅れても、60 秒時点で 2〜3 人集まれば**セッションは成立し TIMEOUT は 0 件**になる。つまり「1,000 セッションのほとんどが 2 人パーティで開始」でも TIMEOUT 基準では合格してしまう。4 人協力プレイのゲームとして明確な失敗なので、**プレイヤーが潤沢な負荷テストでは全セッションが 4 人であるべき**という二値の基準を足した。恣意的なしきい値が要らず、待ち時間の劣化を間接的に検出できる。
+
+**API Gateway の詳細メトリクス（メソッド別）は当面無効のまま**。有効にすると 6 エンドポイント × 5 メトリクス × 2 リージョン ≒ 月 $18。ステージ集計でも p99 の合否判定はでき、**どの関数が遅いかは Lambda `Duration`（関数ごと・無料）で分かる**ため。ただし**メトリクスは遡って生成されない**ので、「異常が出てから有効化」ではテストのやり直しが必要になる。**6-6 の直前に opt-in で有効化し、終了後に戻す**（カスタムメトリクスは時間按分課金なので数時間なら数セント）。GameLift と同じ opt-in パターン。
+
+### Q. EMF の出力を internal/metrics に切り出した理由
+
+**マッチング計装を足す段になって、`matchmaking → apigw` という依存が必要になったため**（2026-09-27）。これは authorizer で `auth → apigw` を却下したのと同じ構図で、`apigw` は「API Gateway プロキシ統合向けヘルパー」なので、その下の層が依存してはならない。
+
+```
+internal/metrics     ← 何にも依存しない最下層（EMF の組み立てと slog 出力だけ）
+   ↑         ↑
+apigw    matchmaking
+```
+
+**`slog.ErrorContext` → `slog.Log` に変えた**のは、レベルを引数で受け取る必要があったから。`ErrorContext` はレベル固定の糖衣で、`Log` が本体。エラー系は ERROR、マッチ成立は **INFO** で出す。**マッチ成立を ERROR で出すと、1,000 セッションの負荷テストで ERROR が数千行出て本物の障害が埋もれる**（`level=ERROR` をサーバー異常の印として使う運用が崩れる）。
+
+**共通関数 `emit` の責務**: `Timestamp` の生成・`_aws` 属性の付与・指定レベルでの出力。可変長引数 `attrs ...any` は**キーと値が交互に並んだリスト**なので、添字で取り出さず `append([]any{"_aws", metadata}, attrs...)` でそのまま流す（キー名を `emit` が知っていると汎用にならない）。
+
+**確定した計装**（namespace は `RAIDYNC/Handlers` と分離）:
+
+| メトリクス | 単位 | ディメンション | 出力箇所 |
+|---|---|---|---|
+| `MatchFormed` + `MatchWaitTime` | Count / Milliseconds | `[["PartySize"], ["QuestID","PartySize"]]` | `matcher.go` の `finalize`（全成立経路の合流点） |
+| `MatchTimeout` | Count | `[["QuestID"]]` | `handleExpired` の `TimeoutTicket` **成功後** |
+
+`PartySize = 1`（ソロ）も普通に出す。負荷テストは `soloAllowed=false` で回すので集計を汚さず、逆にローカルで計装の動作確認ができる。待ち時間は `m.nowMs() - self.CreatedAt` で「**最後に到着した本人**の待ち時間」に近い値（他メンバーはより長く待っている）。
+
+### Q. EMF で追加のメトリクスを足すときに踏む落とし穴
+
+**① ディメンション値は文字列でなければならない。** `"PartySize": 4` と数値で出すと CloudWatch はメトリクス候補と解釈し、ディメンションとして機能しない。`strconv.Itoa` で `"4"` にする。`HandlerError` のディメンション（`FunctionName` / `ErrorKind`）は元々文字列だったので、この問題に当たっていなかった。
+
+**② `Dimensions` はディレクティブ単位の設定。** 同じディレクティブに入れたメトリクスは全て同じディメンションセットを共有する。異なるセットを持たせたいなら `CloudWatchMetrics` 配列に複数のディレクティブを入れる（配列である理由がこれ）。RAIDYNC では `MatchFormed` と `MatchWaitTime` を 1 ディレクティブに統一した（「2 人で始まったセッションは待ち時間も長かった」という相関を同じディメンションで見られる）。
+
+**③ ログレベルのフィルタがメトリクスの存在に直結する。** EMF はログに乗って運ばれるため、`slog.SetDefault` に `&slog.HandlerOptions{Level: slog.LevelWarn}` を入れると **INFO の行自体が出力されず、マッチング系メトリクスが静かに消える**（エラー系だけ残る）。ログ量を絞るならレベルではなく出力箇所を減らす。この注意は `internal/metrics` のパッケージコメントに具体的なコード付きで残した。
+
+**実装中に壊れたもの（すべてテストか目視が検知）**:
+
+| 壊れたもの | 症状 | 検知 |
+|---|---|---|
+| `MatchTimeout` を `TimeoutTicket` の **err != nil ブロック内**に置いた | タイムアウト成功時に出ず、書き込み失敗時に出る（期待値と一致しなくなる） | レビュー |
+| `emit` が `attrs` を**添字で値として**取り出した | `"ErrorKind":"err"` のようにキー文字列が値の位置に入る | `TestEmitError` |
+| `emit` が `level` 引数を無視し `ErrorContext` 固定 | INFO で出せない | レビュー |
+| `msg` にクエスト ID を渡した | `msg` が可変値になり Logs Insights で絞れない | レビュー |
+
+**ローカル E2E での実測（2026-09-27）**: `localapi` + `cmd/client` で `MatchFormed`（`PartySize:"1"`、`MatchWaitTime:269`）と、`-solo=false` で 60 秒待って `MatchTimeout`（**1 件のみ**＝二重カウントなし）を確認。テストは固定値を渡すため、**待ち時間の計算式が機能することはここで初めて確認できた**。
+
+### Q. ダッシュボードに映った「外部からの探索アクセス」とは何か
+
+**人ではなく自動化されたプログラムが、公開エンドポイントを片端から叩いて回る背景ノイズ**（偵察 / スキャン）。2026-09-28、6-1 のダッシュボードを apply した直後に us-east-1 側だけトラフィックが映り、心当たりが無かったため調査した。
+
+**実測（us-east-1、直近 6 時間）**:
+
+| 指標 | 値 |
+|---|---|
+| `Count` | 1 / 15 / 1（計 17 件） |
+| `4XXError` | 1 / 15 / 1 ← **`Count` と完全一致** |
+| `5XXError` | 0 |
+| `raidync-dev-authorizer` の `Invocations`（24h） | **データなし＝1 度も起動していない** |
+
+**全件 4xx かつ Lambda 未到達**。`/health` は MOCK 統合で 200 を返すので正規の疎通ではなく、`enable_health_checks` も既定の `false` なので Route 53 ヘルスチェッカーでもない。定義の無いパスを叩かれ、**API Gateway がルーティング段階で弾いている**状態で、コードは 1 行も動いていない。
+
+**なぜ us-east-1 に偏るか**: `api.raidync.com` はレイテンシールーティングで両リージョンに振られており、探索元は北米に多いため DNS が us-east-1 を返す。東京も 0 ではなく、24 時間で見ると 2 件あった（ダッシュボードの表示範囲が 3 時間だったので画面から外れていただけ）。
+
+**発見経路として最も可能性が高いのは Certificate Transparency ログ**（確認ではなく推定。断定にはアクセスログが要る）。HTTPS 証明書は公開ログへの記録が必須で、ACM 証明書を発行した時点で `api.raidync.com` / `apne1.*` / `use1.*` が世界中から検索可能になる。CT ログを監視して新規ホスト名を即座に叩くスキャナは多数あり、発行から数分〜数時間で最初のアクセスが来る。ほかに IPv4 全域の総当たり（約 43 億個＝数時間〜数日で舐められる。AWS は `ip-ranges.json` で自社レンジを公開しているのでリージョン単位の狙い撃ちも可能）がある。**「まだ誰にも URL を教えていない」は防御にならない。**
+
+**監視設計への帰結**:
+
+- **`4XXError` にアラームを張ってはいけない**ことが実データで裏付けられた。探索は常時来るので毎日誤報になる。6-2 で `HandlerError`（自前計装・5xx 起因のみ）をアラーム対象に選んだのは結果的に正しかった
+- 負荷テストの `Count` / `Latency` の分母にノイズが乗るが、17 件/3 時間は 1,000 VU に対して誤差。`HandlerError` は 5xx 起因なので 4xx は混ざらず、6-6 の合否には影響しない
+- **観測の穴**: `modules/api_gateway` に `access_log_settings` が無く、送信元 IP・パス・User-Agent が一切分からない。「4xx だった」以上のことが言えないため、**6-4 の WAF ルールを設計する前にアクセスログを出す**必要がある
+- **6-4 の位置づけ**: 実害は現状ゼロ（Lambda 未起動・5xx ゼロ・課金は API Gateway のリクエスト料金 $3.50/100 万件のみ）。一方 WAF は月 $5〜（Web ACL $5 + ルール $1 + リクエスト $0.60/100 万）かかる。**守るためというより Phase 6 の学習項目**であり、ポートフォリオでもそう書く
+
+### Q. ダッシュボード（6-1）はどう設計した?
+
+**負荷テスト（6-6）の合否を 1 画面で判定するためのもの**として作った（2026-10-04、`modules/monitoring_dashboard`）。y=0 の行が**合否そのもの**（「負荷テストの合格基準」の 5 項目に対応）、y=4 以降が**基準を割ったときの原因切り分け**。
+
+| 段 | ウィジェット | 対応する基準 / 役割 |
+|---|---|---|
+| y=0 | Handler Errors / Lambda Throttles / DynamoDB Throttles（singleValue） | 基準①③。全関数・全テーブル × 両リージョンを `SUM(METRICS())` で 1 つの数字に畳む |
+| y=0 | MatchTimeout（singleValue、リージョン別 2 値） | 基準④。SEARCH はリージョンをまたげないので式をリージョンごとに分けた |
+| y=4 | MatchFormed（東京 / us-east-1） | 基準⑤。PartySize ごとに線が立つ |
+| y=8 | MatchWaitTime（東京 / us-east-1） | ⑤が崩れたときの原因側。p95 と Maximum |
+| y=12 | API Latency / Count（東京 / us-east-1） | 基準②。p99 目標 1,000ms を水平線で引く。Count は負荷が掛かっていた時間帯の確認用 |
+| y=16 | Lambda Duration p99 / Invocations（全関数、両リージョン 2 本ずつ） | 「Lambda 側が遅いのか」の切り分けと、`--` を 0 件と読む根拠 |
+
+**ダッシュボードは 1 つで両リージョンを並べた。** アラームはリージョンをまたげないので `modules/monitoring` は 2 セット作ったが、ダッシュボードのウィジェットはメトリクスごとに `region` を指定できる。
+
+**設計中に避けた誤り**:
+
+- **パーセンタイルは合算できない。** 関数ごとの `Duration` p99 を `SUM(METRICS())` で畳むと「6 関数の p99 の足し算」という無意味な値になる（`Invocations` の合計は正しいので、同じやり方が使えると思いやすい）。全関数の真の p99 は、**ディメンションを一切指定しない `AWS/Lambda` の集計メトリクス**（コンソールの "Across All Functions"）で取る。母集団は「このアカウント・このリージョンの全 Lambda」なので、**RAIDYNC 以外の関数が増えると意味が静かに変わる**（コメントで明記）。両リージョンとも RAIDYNC の 6 関数しか無いことは `aws lambda list-functions` で確認済み
+- **関数別に並べなかった。** 6 関数 × 2 リージョン = 12 本ではダッシュボードで合否が読めない。**ダッシュボードは合否判定用の合計、原因の切り分けはメトリクスコンソールで関数別 `Duration`** という役割分担にした（関数別メトリクスは常に存在する）。「API Gateway の詳細メトリクスを有効にしない代わりに Lambda `Duration` で分かる」という前の判断とはこれで整合する
+- **`MAX(SEARCH(..., 'p95'))` は全体の p95 ではない**（PartySize ごとの p95 の最大値）。EMF が PartySize を含まない集計セットを持たないため、これが唯一の手段。負荷テストは `soloAllowed=false` なので PartySize=4 だけになり、実質一致する
+- **HCL のコメントは `dashboard_body` の差分にならない。** `jsonencode` の外にあるため、コメントを大量に足しても plan には出ない
+
+### Q. ダッシュボードが正しく機能するかをどう確かめたか
+
+**AWS dev に実データを流し、12 枚すべての描画を確認した**（2026-10-04）。apply 直後は画面がほぼ空で、「空なのか壊れているのか」が区別できなかった。6-1 の完了基準は「主要メトリクスが 1 画面で**確認できる**」なので、空のまま締めると基準を満たさないうえ、6-6 本番で計器の故障に気づく羽目になる。
+
+**手順**（`scripts/call-api.sh`、GameLift フリートは起動せず `GameLiftStub` にフォールバック＝時間課金なし）:
+
+1. player1〜4 が同じクエストに `match/request` → player1 で `match/status` をポーリング → `MATCHED`（PartySize=4）
+2. 別クエスト `quest-timeout` に 1 人だけ `match/request` → 60 秒後に `match/status` → `TIMEOUT`
+3. 1・2 を `TARGET=secondary`（us-east-1）でも実行
+
+**結果**:
+
+| 確認対象 | 結果 |
+|---|---|
+| ①②③ のクロスリージョン `SUM(METRICS())` | ✅ 合算される。プローブ（`AWS/ApiGateway Count` を両リージョン分 SUM）が 33 を表示し、CLI で取った**東京 14 + us-east-1 19** と一致 |
+| Lambda Duration p99（ディメンション無し） | ✅ 値が出る。パーセンタイルが取れる |
+| MatchFormed / MatchWaitTime / MatchTimeout | ✅ 5 枚とも値が出る。SEARCH 式の namespace・ディメンションセットが実データと一致 |
+| Handler Errors / DynamoDB Throttles | `--` のまま。**これが正常**（後述） |
+
+**クロスリージョン合算は当初「できない可能性が高い」と見ていたが、誤りだった。** `GetMetricData` API は `MetricDataQuery` に Region を持たないため、数式はリージョン単位でしか評価できないと推論したが、**コンソールのダッシュボードはリージョンをまたぐ数式も評価する**。推論ではなく実測で決着させた。判定には**両リージョンとも非ゼロ**のメトリクスが要る（Lambda Throttles は両方 0 なので、合算されていてもいなくても 0 になり判別できない）。
+
+**`--` の 2 枚が正常な理由**:
+
+- Handler Errors … 実走で 5xx が 1 件も出なかった。エラーが無ければデータポイント自体が生まれない
+- DynamoDB Throttles … DynamoDB はスロットル未発生時に **0 を publish しない**ので、平常時は原理的に `--` にしかならない
+
+CloudWatch のメトリクス数式には「系列が 1 本も無い状態から 0 の系列を作る」手段が無い（`FILL` は既存系列の欠損を埋めるもの）ので、`--` と `0` は画面上で区別できない。そこで **Invocations を同じ画面に置いた**。Invocations に値が出ていれば「テストは確かに流れた」と言えるので、`--` を 0 件と読める。出ていなければ判定不能。今回はこの読み分けが実際に機能した。
+
+### Q. 実走の途中で何に詰まったか
+
+**① `match/status` は `POST` ではなく `GET /match/status/{ticketId}` だった。** `call-api.sh` は `POST` 固定で、冒頭の使用例（`match/status '{"ticketId":"..."}'`）も**最初から誤っていた**。存在しないルートに `Authorization` ヘッダ付きで投げると、API Gateway は SigV4 として解釈しようとして `Invalid key=value pair (missing equal-sign) in Authorization header` の 403 を返す。オーソライザーには到達しない（探索アクセスの 4xx と同じ仕組み）。ルートの正は `modules/api_gateway` の `locals.endpoints`。
+
+**② マッチングの判定は `match/status` の中でしか動かない。** `matchmaking.Matcher` を使うのは `match_status` ハンドラだけで（`TryMatch` のコメントに「GET /match/status 契機で呼ばれ」とある）、定期実行のワーカーも DynamoDB Streams のコンシューマも無い。つまり `match/request` を投げただけでは成立も TIMEOUT も起こらず、チケットは TTL で静かに消える。`MatchFormed` / `MatchWaitTime` / `MatchTimeout` もポーリングしなければ永久に出ない。**6-5 / 6-6 の k6 シナリオも request → status のポーリングまで含める必要がある。**
+
+**③ `call-api.sh` に足した切り替え。**
+
+| 変数 | 値 | 設計上の注意 |
+|---|---|---|
+| `TARGET` | `primary` / `secondary` | **output 名を直接受け取らない。** 受け取ると任意の terraform output を URL 位置に流し込め、`cognito_test_user_password` を渡すと `echo` で画面に出てしまう。`case` で 2 択に絞る |
+| `METHOD` | `POST` / `GET` / `DELETE` | ボディは POST のときだけ付ける |
+| `AUTH_REGION` | 常に `ap-northeast-1` | 旧名 `REGION` は「API のリージョン」と誤読される。**Cognito は東京の 1 プールを両リージョンで共用**しているので、ここを us-east-1 にすると認証そのものが失敗する |
+
+不正値は**黙ってフォールバックさせずに `exit 1`** する。タイポで東京にフォールバックすると「us-east-1 を叩いたつもりで東京を叩く」事故になり、「us-east-1 のウィジェットが空だ」と悩むことになる。また `match/request` と `match/status` は**同じ `TARGET`** で投げる必要がある（MatchmakingTickets が region-local のため）。正しい接続先はレスポンスの `endpoint` に入っている。
+
+### Q. WAF（6-4）は何を守るために入れるのか? 入れるべきか
+
+**「余計な所からのアクセスを防ぐ」は、この構成では WAF の主目的にならない。** 実測された探索アクセスは全件 4xx・Lambda 未到達で、**存在しないルートは API Gateway がルーティング段階ですでに弾いている**。WAF を入れても「4xx で弾かれていたものが WAF で弾かれる」だけで、守れるものは増えない。
+
+この構成で WAF が本当に守るのは**「正しい入口に対する、多すぎるアクセス」**:
+
+| 機能 | 防ぐもの | RAIDYNC での意味 |
+|---|---|---|
+| レートベースルール | 1 IP から 5 分あたり N 件超を遮断 | 正しいルートを大量に叩かれると Lambda / DynamoDB が動いて課金され、**アカウントの同時実行上限 1,000 を食い潰して正規プレイヤーが Throttle される**。ロードマップ 6-4 の完了基準（レートリミット動作確認）はこれ |
+| マネージドルール | SQLi 等の既知パターン、悪評 IP | 汎用的な防御 |
+| 地域ブロック | 国単位の遮断 | グローバル構成なので不向き |
+
+しきい値の設計に要るのは探索者のログではなく**「正規プレイヤー 1 人が 5 分間に何回叩くか」**（ポーリング間隔 `PollIntervalSec = 2` と k6 シナリオから決まる）。そのため「WAF の材料集めとしてアクセスログを先に有効化する」案も、価値は当初の見立てより低いと判断した。
+
+**判断（2026-10-05）: WAF は作らない。問題点は認識として残す。** 実害は現状ゼロで、WAF は月 $5〜の固定費がかかる。以下を既知のリスクとして記録する。
+
+- **大量アクセスへの防御が無い**: 正規ルートへのフラッドは Lambda 同時実行と DynamoDB の課金に直結する。API Gateway のステージ既定スロットリング（アカウントあたり 10,000 rps / バースト 5,000）が唯一の上限
+- **`POST /session/{sessionId}/end` は認証なしで Lambda まで到達できる唯一の入口**。ゲームサーバーが呼ぶ server-to-server 経路でプレイヤー JWT を持たないため authorizer を外している。GameLift インスタンスの IP は固定されないので WAF の IP 許可リストでは守りにくく、本来は IAM 認証（SigV4）などで塞ぐべき箇所
+- **アクセスログが無い**: 探索アクセスの正体（送信元 IP・パス・User-Agent）は推定のまま
+
+
+### Q. 負荷テストの結果を Sessions から集めるには、Query と Scan のどちらを使う? FilterExpression で絞れば安くなる?
+
+**Sessions には questId の索引（GSI）が無いため、Scan しか使えない。FilterExpression を付けても読み取りコストは下がらない。**
+
+| 操作 | 動き | C# で例えると |
+|---|---|---|
+| GetItem / Query | キー（PK または GSI のキー）で該当行だけを直接取りに行く | `dict[key]` |
+| Scan | テーブルの全行を端から読む | `foreach` で全件をなめる |
+
+- **FilterExpression は「読んだ後」に間引くだけ**。全行を読む分の課金と時間はかかり、変わるのは返ってくる量だけ（LINQ の `.Where` を何段重ねても、元のコレクションを全部読むのと同じ）。条件を 2 段に分けても、コスト面の意味は無い
+- **検証に不要な条件は入れない**。status まで条件に入れると、`ENDED` になったセッションが漏れて「セッション数が足りない」という誤検知につながる。また、Sessions の status は `ACTIVE` で、`MATCHED` は MatchmakingTickets 側の状態
+- **ページング**: Scan は 1 回の呼び出しで最大 1MB しか読まない。レスポンスの `LastEvaluatedKey` が空でなければ続きがあり、次の呼び出しでそれを `ExclusiveStartKey` に渡して続きから読む。**フィルタで 0 件になったページでも `LastEvaluatedKey` は返る**ので、「0 件だったから終わり」と判断すると取りこぼす（CLI の `NextToken` は、この仕組みを包んで見せている名前）
+- **使い分けの線引き**: テスト後に 1 回だけ実行する検証スクリプトなら、Scan のコストは許容できる。本番 API のホットパスで Scan するのは NG で、その場合は GSI を設計する
+
+### Q. 負荷テスト後のセッション検証スクリプト（`server/cmd/sessions`）はどう作り、どう確かめたか
+
+k6 の `matched` 100% は「各 VU が MATCHED を受け取った」ことしか保証しない。**全体として正しく組めたか**（二重マッチが無いか）は、Sessions を直接読んで確かめる。
+
+- **判定する 3 条件**: ①セッション数 = 人数 ÷ 4、②各 `playerIds` がちょうど 4 人、③プレイヤーの重複なし。③は `map[string]string`（playerId → 最初に見た sessionId）を**全セッションで 1 つ共有**して見る。同一セッション内だけを見ても、楽観ロックが壊れたときの本当の症状（1 人が 2 つのセッションに入る）は捕まらない
+- **役割分担**: Scan とページングは `internal/db.ScanByQuest`（DynamoDB に触れるのは db パッケージだけ、という既存の約束どおり）。判定は `cmd/sessions`。接続先は `db.NewClient` の環境変数（`DYNAMODB_ENDPOINT` / `AWS_REGION`）に任せるので、AWS 両リージョンでも同じスクリプトを使える
+- **止め方の使い分け**: 検証できない（入力不正、DB 接続失敗）は `log.Fatalf` で即終了。検証結果の NG は全部出してから `os.Exit(1)`。「セッション数が 1 つ多い」と「誰かが重複」が同時に見えれば、同じバグ（二重マッチ）と分かる
+- **入力チェック**: 人数が 4 の倍数でなければ止める。`10/4 = 2` の切り捨てで、余った 2 人を見ないまま合格するのを防ぐ
+- **実装中のバグ**: ①`flag.Parse()` 忘れで questId が空のまま 0 件 Scan、②ページの Unmarshal 先と集計先を同じ変数にして結果が倍化、③Scan エラー後に続行して nil 参照。①と②は「検証対象は正しいのに検証側が NG を出す」種類で、入力チェックやエラーの戻し方で早く気づけるようにした
+- **確かめ方**: 正常系（k6 8 人 → `OK: 2 sessions / 8 players`、終了コード 0）に加え、**わざと壊したデータ**（3 人のセッション、2 セッションにまたがる重複）を LocalStack に直接 put して、3 種類の NG が全部出て終了コード 1 になることを確認した。検証スクリプト自体の検証が要る
+
+### Q. クエスト中（Sessions が ACTIVE）のプレイヤーが、次のマッチを申し込めるのはなぜか? 弾くべきか
+
+**今の実装では申し込める。** match-request の二重申し込み防止は、MatchmakingTickets の `WAITING` チケットを `playerId-status-index` で引くだけ（`handlers/match_request.go`）で、Sessions は見ていない。1 回目のチケットは `MATCHED` になっているので、新しいチケットが普通に作られる。
+
+**判断（2026-10-13）: サーバーでは弾かず、クライアント制御とする。** 弾くには Sessions を playerId で引く GSI（と IAM 権限・Terraform）が要り、ホットパスの読み取りが 1 回増える。トレードオフとして、正規の JWT で API を直接叩く改造クライアントがいると、次のことが起きる。
+
+- 1 人が 2 つのセッションに同時に入る。新しいセッションの残り 3 人は、UDP で来ない 1 人を待つか 3 人で遊ぶことになり、元のセッションも 1 人欠ける
+- 使われない枠に GameLift のゲームセッション（＝費用）が割り当てられる
+
+負荷テストでは、この性質のおかげで同じプレイヤーでループを回せる。
+
+### Q. セッションが 20 分に達したら、Sessions テーブルは ENDED になるのか
+
+**ならない。** 20 分に達すると、ゲームサーバー（`game/sync.go` の `Hub.Tick`）は UDP で `SESSION_END`（`timeout`）を送ってメモリから消すだけで、DynamoDB には書かない。Sessions を `ENDED` にし MatchHistory を書くのは `POST /session/{sessionId}/end` だけで、今それを呼んでいるのはテスト用の `cmd/client`（ゲームサーバーの代役）のみ。
+
+| 時点 | ゲームサーバー（メモリ） | Sessions テーブル |
+|---|---|---|
+| マッチ成立 | セッション登録 | `ACTIVE` で作成 |
+| 20 分到達 / 全員離脱 | `SESSION_END` を送って削除 | `ACTIVE` のまま |
+| `/session/end` 呼び出し | — | `ENDED` + MatchHistory 書き込み |
+
+**既知の抜け**: 本番でもゲームサーバー自身が `/session/end` を呼ばないかぎり、Sessions は ACTIVE のまま溜まり続け、MatchHistory も書かれない。タイムアウト・全員離脱時にゲームサーバーから結果を報告する経路が要る（Phase 6 の宿題）。
+
+### Q. ループの負荷テストで、成功回数が 4 の倍数にならなかった（2023 回）のはなぜか
+
+**60 秒待った後の見切り発車（`MinMatchSize = 2`）で、3 人のセッションができたため。バグではなく仕様どおり。** 40 人・3 分のループで 506 セッションができ、内訳は 4 人 × 505 と 3 人 × 1（終わり際に余った 3 人が、前のセッションの約 59 秒後に成立）。k6 の `iteration_duration` の `max=1m3s` もこの 3 人の待ち時間。
+
+1 回だけのテストでは全員が同時に申し込むので必ず 4 人ずつ揃い、この仕様は表に出なかった。検証スクリプトの前提（「全セッション 4 人」「成功回数は 4 の倍数」）が仕様と合っていなかったことが、ループにして初めて分かった。
+
+**検証の直し方**: 「セッション数 = 成功回数 ÷ 4」ではなく、**枠の合計（全セッションの参加人数の和）= 成功回数**で比べる。マッチ成功 1 回は必ず 1 枠に対応するので、人数がまちまちでも足し算で比べられ、二重マッチ（1 回の成功で 2 枠）は枠の合計が多くなることで見つかる。
+
+### Q. 60 秒待った後の見切り発車で、1 人のセッションにならないのはなぜか
+
+`handleExpired`（`matchmaking/matcher.go`）は `tryForm(ctx, t, MinMatchSize)` を呼び、`tryForm` は `len(group) < minSize` ならグループを作らない。自分しかいなければ成立せず、**TIMEOUT** になる。
+
+| 60 秒後に待っている人数 | 結果 |
+|---|---|
+| 自分 + 3 人 | 4 人で成立 |
+| 自分 + 1〜2 人 | 2〜3 人で見切り発車 |
+| 自分だけ | TIMEOUT |
+
+ソロで遊ぶかはプレイヤーが選ぶもの（`SoloAllowed`）で、マッチングが勝手に決めない、という線引き。そのため、ソロ指定をしない負荷テストで 1 人のセッションが見つかればバグ（`MinMatchSize` の判定か `SoloAllowed` の扱いが壊れている）。検証スクリプトの人数の範囲は、仕様全体で許される 1〜4 ではなく、**このテストで起きるはずの `MinMatchSize`〜`MaxPartySize`（2〜4）**にする。
+
+### Q. ループの負荷テストで、k6 のしきい値 `matched: rate==1` をどう扱うか
+
+**判断（2026-10-14）: `rate==1` のまま残す。** ループの終わり際に 1 人だけ余ると、その人は 60 秒後に TIMEOUT になる（見切り発車は 2 人以上が必要）。マッチングは正しく動いていても k6 は不合格になる。
+
+- `rate>0.99` のように緩めると、本当のバグで 1% 失敗しても見逃す
+- そこで厳しいまま残し、不合格になった回は TIMEOUT の数と時刻を見て「終わり際の余り（最大 1 人）か」を人が判断する
+- マッチングの全体の正しさは、k6 のしきい値ではなく検証スクリプト（`cmd/sessions`、枠の合計 = 成功回数）が保証する。TIMEOUT はセッションを作らないので、検証スクリプトの結果には影響しない
+
+### Q. X-Ray（6-3）は何をするもので、RAIDYNC に必要か
+
+**X-Ray は「1 リクエストが、どこで何ミリ秒使ったか」を時系列で見せる分散トレーシング。** メトリクス（全体の集計）やログ（各部品の自己申告）では見えない、**1 リクエストの内訳**が見える。RAIDYNC の 1 リクエストは API Gateway → authorizer → Lambda → DynamoDB（複数回）→ GameLift と多段なので、遅延やエラーの原因がどの段かを切り分けるのに効く。
+
+- **効く場面**: 6-6（1,000 人）で p95 が悪化したとき、コールドスタート・DynamoDB の競合・GameLift API のどれが原因か切り分けられる
+- **効かない場面**: 「40 人でマッチ成立までの時間が伸びた」はほぼ説明できない。その大半は 2 秒ごとのポーリングの何回目で 4 人揃うかという**呼び出しの間の待ち時間**で、X-Ray は 1 回の呼び出しの中身しか見ない
+- **費用**: 無料枠は月 10 万トレース。既定のサンプリング（毎秒 1 件 + 5%）なら、6-6 の約 500 req/s を 30 分回して約 5 万トレースで、無料枠に収まる見込み
+- **作業量**: API Gateway・Lambda のトレース有効化と IAM は Terraform だけで済む。DynamoDB の呼び出しを個別に見るには Go コードで SDK を計測する必要がある
+- **注意**: Go 用 X-Ray SDK は 2026-02-25 にメンテナンスモード入り、2027-02-25 にサポート終了。新規に入れるなら OpenTelemetry（ADOT）が推奨
+- **検証場所**: LocalStack 無料版は X-Ray 非対応なので AWS dev
+
+| 案 | やること | 見えるもの |
+|---|---|---|
+| A. フル実装 | Terraform + OpenTelemetry | API GW → Lambda → DynamoDB の各呼び出し |
+| B. Terraform だけ | API GW・Lambda のトレース有効化 | 各段の時間とコールドスタート。DynamoDB は Lambda 内の 1 塊 |
+| C. やらない | 判断理由を記録して見送る | なし |
+
+**判断（2026-10-18）: A（OpenTelemetry でフル実装）を採る。** 見積もりは 3〜4 日（概念 半日〜1 日、コード 1〜2 日、AWS 検証 1 日）で、ロードマップの 1 日を超える。それでも採る理由:
+
+- X-Ray SDK はサポート終了が決まっており、新規に入れる理由が無い。OTel は Datadog・Grafana などでも使える業界標準で、知識が使い回せる
+- 送り先を選べるので、ローカルでは Jaeger、AWS では X-Ray に送れる。**ローカルファーストの方針のままトレースを見られ**、AWS へのデプロイ回数を減らせる
+- コードはすでに全部 `ctx` を引き回しているので、OTel で一番面倒な Context の受け渡しが済んでいる。DynamoDB の計測は `db.NewClient` に `otelaws` を足すだけで全呼び出しに効く
+- 一番読めないのは AWS 側（Collector レイヤーか OTLP 直送か、Lambda 凍結前の flush）。ローカルで先に仕組みを固めてから AWS に出す
+
+### Q. localapi を OTel で計測したのに、Jaeger の Service に出てこなかったのはなぜか
+
+**`otlptracegrpc` は既定で TLS で接続するが、ローカルの Jaeger の `:4317` は平文で待ち受けているため。** 接続の最初（TLS ハンドシェイク）で失敗し、Span は捨てられる。`Init` は送信失敗では失敗しない作りなので、localapi は動き続け、気づきにくい。
+
+- **直し方**: 標準の環境変数 `OTEL_EXPORTER_OTLP_INSECURE=true` をローカルだけで設定する。コードに `WithInsecure()` を書くと AWS でも常に平文になるため、送り先（`OTEL_EXPORTER_OTLP_ENDPOINT`）と同じく外から切り替える
+- **確かめ方**: Jaeger 側のログで OTLP の受け口が起動していること、Jaeger の API（`/api/v3/services`）に自分のサービス名が無いことを見て、「作っているが届いていない」と切り分けた
+
+### Q. ローカルのトレース（6-3 ステップ 4）で何が見えたか
+
+40 人ループを短く回した 500 トレースで、**全トレースの親が HTTP の Span 1 つで、DynamoDB の呼び出しがその子にぶら下がる**形になった（`adapter.go` がハンドラーに `r.Context()` を渡し、それが `db.Client` → `otelaws` へ引き継がれるため）。トレースは次の 4 種類に分かれた。
+
+| 件数 | 親 Span | 子 Span | 意味 |
+|---|---|---|---|
+| 192 | `POST /match/request` | Query, PutItem | 既存 WAITING の確認 → チケット作成 |
+| 167 | `GET /match/status/{ticketId}` | GetItem | 既に MATCHED 等で、見るだけ |
+| 93 | `GET /match/status/{ticketId}` | GetItem, Query, TransactWriteItems | グループを組んで確保を試み、**楽観ロックの競合で負けた** |
+| 48 | `GET /match/status/{ticketId}` | GetItem, Query, TransactWriteItems, PutItem, UpdateItem × 4 | マッチ成立 |
+
+- **競合の多さ**: 成立 48 回に対し、確保の競合負けが 93 回。同じ 4 枚を複数の status ポーリングが同時に確保しにいき、1 つだけが勝つ。メトリクスやログには出ていなかった事実で、トレースで初めて数えられた
+- **成立時の内訳**: 合計 418ms のうち、`finalize` で各チケットを MATCHED にする `UpdateItem` が**4 回直列**で約 220ms。LocalStack は 1 呼び出し約 50ms と遅いので、AWS での実際の比率は 6-6 で確かめる
+
+### Q. Jaeger ではどのように確認したのか
+
+1. **計測**: localapi はルートごとに `otelhttp.NewHandler(handler, pattern)` で包む（親 Span、名前はルートのパターン）。DynamoDB / GameLift の SDK 呼び出しは `otelaws.AppendMiddlewares` で子 Span になる。`adapter.go` が `r.Context()` をハンドラーに渡すので親子がつながる。サービス名は `telemetry.Init(ctx, "localapi")` の `localapi`
+2. **受け手**: docker-compose の `jaegertracing/jaeger:2.22.0`。`4317` が OTLP gRPC（Exporter の既定の送り先）、`16686` が UI と API
+3. **起動**: runbook の環境変数に `OTEL_EXPORTER_OTLP_INSECURE=true` を足して localapi を起動。最初はこれが無く Service に出なかった（前の Q）。`/api/v3/services` に `localapi` があるかで届いたことを確かめる
+4. **観察**: 40 人ループの k6 を短く回し、`localapi` のトレース 500 件を、親 Span 名と子 Span の並びで 4 種類に分類（前の Q の表）。成立のトレースはタイムラインで開き、`finalize` の `UpdateItem` × 4 が直列で約 220ms であることを読んだ
+
+- **記録漏れ**: 500 件を数え上げた具体的なコマンドはリポジトリに残っていない。やり直すなら Jaeger の API（`/api/v3/traces`、service=`localapi`）で JSON を取り、Span 名の並びで集計する
+
+### Q. Jaeger で確認したのは何か（何が確かめられ、何が確かめられていないか）
+
+**確かめたのは「localapi の計測が正しく組めているか」と、それを使って見えたアプリの挙動。**
+
+| 確かめたこと | 根拠 |
+|---|---|
+| Span が送り先に届く | `localapi` が Service に出る（`OTEL_EXPORTER_OTLP_INSECURE=true` が効いている） |
+| 親子がつながる | DynamoDB の Span が HTTP の Span の子になる（`r.Context()` → `handlers` → `db.Client` → `otelaws` と context が切れていない） |
+| Span 名がルートのパターン | `GET /match/status/{ticketId}` のように ID を含まない名前で集計できる |
+| アプリの挙動 | 確保の競合負け 93 回 / 成立 48 回、成立時の `UpdateItem` × 4 が直列で約 220ms |
+
+- **確かめていないこと**: Lambda の経路（`StartLambda`）、API Gateway → authorizer → 本体のつながり、GameLift の Span（ローカルは Stub）、AWS での時間の比率（LocalStack は 1 呼び出し約 50ms と遅い）
+
+### Q. `StartLambda` はもう確認したのか
+
+**していない（2026-10-27 時点）。** 確かめたのは `go build` / `go vet` が通ることだけ。Jaeger で見たのは localapi の `Init` の経路で、`StartLambda` は一度も実行していない。
+
+- **未確認 1: 起動するか**: `otellambda.InstrumentHandler` はハンドラーの形を実行時に検査する。Lambda の中で初めて分かる
+- **未確認 2: 送り先が無いと遅くならないか**: AWS には `localhost:4317` の受け手がまだ無い。`WithFlusher` は呼び出しのたびに `ForceFlush` するが、`otlptracegrpc` は既定で送信失敗をリトライするので、毎回の応答がその分待たされる可能性がある。「送信失敗で捨てられ、Lambda 本体は動く」（前の Q）は推測で、検証していない
+- **未確認 3: Span が届くか**: authorizer と本体 Lambda の Span が出るか、`ForceFlush` で凍結前に送り切れているか
+- **確かめ方の候補**: (a) Lambda Runtime Interface Emulator（RIE）で `bootstrap` をローカル起動し、送り先を Jaeger にする（ローカルファースト）、(b) AWS dev にデプロイし、CloudWatch の Duration とログを見る
+
+### Q. 確保の競合が多いのは問題か。マッチ成立時の UpdateItem × 4 は並列にしてよいか
+
+**競合で増えるのは API の回数ではなく、1 回あたりの無駄な仕事。** ポーリングは競合の有無に関係なく 2 秒ごとに 1 回で、負けた回も Query と TransactWriteItems をやり切ってから失敗する（**失敗したトランザクションも書き込み料金がかかる**）。自分のチケットが勝ったグループに入っていなければ、成立も次のポーリングまで遅れる。
+
+- **構造的な原因**: `selectGroup` は残りの席を `createdAt` の古い順（FIFO）で埋めるため、待っている全員が**同じ古い数枚を奪い合う**。人数が増えるほど競合の割合が上がると考えられ、「人数が増えるとマッチ成立までの時間が伸びる」原因の有力な仮説。6-6 の実測で確かめる
+
+**UpdateItem × 4（`MarkMatched`）を並列にしても、別のセッションに同じチケットを取られるリスクは増えない。** 奪い合いを防ぐのは前段の `ClaimTickets`（WAITING → MATCHING を 4 枚まとめて原子的に、条件は `status = WAITING` かつ `version` 一致）の仕事で、他のマッチングは WAITING しか候補に取らない。`MarkMatched` は確保済み（MATCHING）の自分のチケットに書くだけ。
+
+| 方法 | 往復 | 途中で失敗したとき |
+|---|---|---|
+| 今（直列） | 5 回（PutSession + MarkMatched × 4） | 一部だけ MATCHED、残りが MATCHING のまま残る |
+| 並列 | 実質 1 回分 | 同じく中途半端になりうる |
+| 1 トランザクションにまとめる | 1 回 | 全部成功か全部失敗 |
+
+`CreateGameSession`（GameLift）は DynamoDB のトランザクションに入れられないので、確保とセッション作成の間はどの方法でも別になる。
+
+### Q. Lambda から X-Ray へ Span を届けるとき、Collector のレイヤーを挟むのと、OTLP エンドポイントへ直接送るのは何が違うか
+
+**違いは「届ける作業を誰がやるか」。** A は Lambda の中に Collector（拡張機能＝別プロセス）を同居させ、アプリは `localhost:4317` に投げるだけ。B はアプリ自身が `https://xray.<region>.amazonaws.com/v1/traces` に署名付きで送る。
+
+| 観点 | A. Collector のレイヤー | B. OTLP エンドポイントへ直接 |
+|---|---|---|
+| Go のコード | ほぼ不要（今の `localhost:4317` gRPC のまま。ローカルの Jaeger と同じ形） | 必要。エンドポイントは **HTTP のみ（gRPC 非対応）**で **SigV4 署名**が要る。OTel Go SDK は署名を標準で持たないので自分で足す |
+| AWS 側の準備 | レイヤー ARN と Collector 設定、IAM | **CloudWatch Transaction Search の有効化が前提**、IAM |
+| データの行き先 | 従来の X-Ray | Span は CloudWatch Logs の `aws/spans` に全件入り、一部が X-Ray のトレースとして索引される |
+| 性能 | 別プロセスが動くのでコールドスタートが伸び、メモリも使う | 余分なプロセス無し |
+| 費用 | X-Ray 通常料金（月 10 万トレース無料） | Transaction Search の料金（取り込み量と索引の割合）。新規は 3 か月の無料枠 |
+| 将来性 | AWS は Collector 無しで送る方向を推しており、旧来の方式になりつつある | AWS が今推している方式 |
+
+- **RAIDYNC での論点**: A は 6-6 で測るレイテンシー（p95）に Collector のコールドスタートが混ざる（計測の仕組みが測りたい数字を悪化させる）。一方 A はローカルと AWS で送り方が揃い、B は Exporter をローカルと AWS で切り替える必要がある
+
+### Q. OTLP の Span とは何か
+
+**Span と OTLP は別の層の言葉。** Span は「1 つの処理の記録」というデータで、OTLP（OpenTelemetry Protocol）はその Span を送り先へ運ぶ通信の約束事。「OTLP の Span」は「OTLP で運ばれる Span」という意味になる。
+
+**Span = 1 つの処理の「名前・開始時刻・終了時刻・結果」の記録。** 主な中身:
+
+| 項目 | 例（RAIDYNC） |
+|---|---|
+| 名前 | `GET /match/status/{ticketId}`、`DynamoDB.Query` |
+| Trace ID | 1 リクエスト全体で共通の ID。同じ ID の Span を集めると 1 本のトレースになる |
+| Span ID / 親 Span ID | 親子関係。DynamoDB の Span は HTTP の Span を親に持つ |
+| 開始・終了時刻 | ここから所要時間が出る（Jaeger の横棒の長さ） |
+| 属性 | テーブル名、HTTP ステータスなどの key-value |
+| ステータス | 成功 / エラー |
+
+- **RAIDYNC での作られ方**: `otelhttp.NewHandler`（`localapi/main.go`）が HTTP 1 回ごとに親 Span を作り、`ctx` 経由で親を受け取った `otelaws`（`db/client.go`）が DynamoDB 呼び出しごとに子 Span を作る。ハンドラーのコードで Span を自分で作っている箇所は無い
+- **OTLP の役割**: できた Span を `otlptracegrpc` の Exporter がまとめて送る。送り先がローカルの Jaeger でも AWS の X-Ray（Collector 経由）でも同じ形式なので、**コードを変えずに送り先だけ環境変数で切り替えられる**。OTLP には gRPC（`:4317`）と HTTP（`:4318`）の 2 種類の運び方がある
+- **C# との対応**: .NET の `System.Diagnostics.Activity` が Span にあたる（`ActivitySource.StartActivity` ≒ `tracer.Start`）。.NET の OpenTelemetry は Activity を Span として OTLP で送る
+
+### Q. Collector とは何か
+
+**Collector（OpenTelemetry Collector）は、アプリと送り先の間に置く「Span の中継所」となる別プログラム。** アプリは Collector に OTLP で投げるだけで、受け取った Collector が加工して、最終的な送り先（X-Ray、Jaeger、Datadog など）の形式に変えて送る。
+
+```
+Collector 無し: アプリ ──OTLP──→ 送り先
+Collector 有り: アプリ ──OTLP──→ Collector ──(送り先の形式)──→ 送り先
+```
+
+中は 3 段の組み合わせで、設定ファイル（YAML）で組む:
+
+| 段 | 役割 | 例 |
+|---|---|---|
+| Receiver | 受け取る | OTLP の gRPC `:4317` / HTTP `:4318` |
+| Processor | 加工する | まとめて送る（batch）、間引く（sampling）、属性の追加・削除 |
+| Exporter | 送り出す | AWS X-Ray（SigV4 署名つき）、Jaeger、ファイル |
+
+- **置く理由**: 送り先ごとの事情（署名・形式・リトライ・間引き）を**アプリから追い出せる**。アプリは常に「`localhost:4317` に OTLP で送る」だけで済み、送り先の変更は Collector の設定で済む
+- **RAIDYNC のローカル**: Jaeger は自分で OTLP を受け取れるので Collector は挟んでいない（`localapi` → Jaeger に直送）
+- **RAIDYNC の AWS（6-3 の論点）**: X-Ray へは SigV4 署名が要る。Lambda レイヤーの Collector（ADOT）を同居させると署名は Collector がやってくれるが、別プロセスなのでコールドスタートとメモリが増える。Collector を使わずにアプリから直接送る案との比較は上の Q を参照
+- **似た構成**: ログでいえば、アプリはローカルのエージェント（Fluentd など）に書くだけで、転送先の切り替えはエージェント側の設定で済ませる構成と同じ考え方
+
+### Q. Collector のレイヤー（A）だと Lambda は `localhost:4317` に送る。AWS を動かすときに自分の PC で何か起動しておく必要があるのか
+
+**無い。** `localhost` は「そのプログラムが動いているマシン自身」を指す名前で、指す先は動いている場所で変わる。
+
+| 動いている場所 | `localhost:4317` の先 |
+|---|---|
+| 自分の PC（localapi） | PC 上の Jaeger（Docker） |
+| AWS の Lambda | 同じ Lambda 実行環境の中の Collector（レイヤーとして Lambda と一緒に AWS が起動する） |
+
+AWS の Lambda から開発者の PC の `localhost` には届きようがない。「A ならローカルと揃う」は、**コードが同じ**（どちらも `localhost:4317` に gRPC）で、受け取る相手が場所によって自然に入れ替わる、という意味。
+
+### Q. 現状、X-Ray は何に使っているか
+
+**まだ何にも使っていない（2026-10-27 時点）。** `terraform/` にも `server/` にも X-Ray の設定は無い（API Gateway のトレース有効化、Lambda の `tracing_config`、IAM 権限のどれも無し）。「CloudWatch + X-Ray」は計画で、6-3 がその実装。
+
+| 動かす場所 | トレースの行き先 |
+|---|---|
+| ローカル（localapi） | Jaeger。今トレースを見られるのはここだけ |
+| AWS（Lambda） | どこにも行かない。`localhost:4317` の受け手（Collector）がまだ無く、送信失敗で捨てられる（Lambda 本体は動く） |
+
+X-Ray は「Jaeger の AWS 版」の位置付け。AWS で見たいのは、6-6 の p95 悪化の切り分けと、ローカルでは見えない部分（API Gateway → authorizer → 本体 Lambda のつながり、GameLift `CreateGameSession` の時間。ローカルは Stub なので Jaeger に出ない）。
+
+**判断（2026-10-27）: B（X-Ray の OTLP エンドポイントへ直接送る）を採る。** 6-6 で測る p95 に Collector のコールドスタートを混ぜないためと、AWS が今推している方式で組むため。代わりに、Exporter をローカル（Jaeger・平文 gRPC）と AWS（X-Ray・SigV4 署名付き HTTP）で切り替える実装と、Transaction Search の有効化が必要になる。
+
+### Q. Exporter を呼び出し口で決め打ちする（3 案）と、`telemetry.go` にローカル用と AWS 用の処理が同居する。それでよいのか。環境変数で切り替える（1 案）でも同居するのでは
+
+**同居してよい。むしろ同居させるのが `telemetry` パッケージの役目。** 1 案でも 3 案でも同居は避けられず、違うのは「どちらを使うかを**誰が決めるか**」だけ。
+
+| | 同居 | どちらを使うかを決めるもの |
+|---|---|---|
+| 1. 環境変数 | する | 実行時の設定（`TRACE_EXPORTER`） |
+| 3. 決め打ち | する | 呼び出し口（`Init` か `StartLambda` か） |
+
+- 呼び出し側（`main.go`）が「どこへどう送るか」を知らずに済むよう、違いをこのパッケージに閉じ込めている。同居させず `main.go` 側に書くと、Lambda 6 関数に同じ Exporter 作成のコードが散らばる
+- このプロジェクトには前例がある。Lambda の `main.go` の `selectSessionProvider` は、本物の GameLift と `GameLiftStub` を同居させ、環境変数で選んでいる（1 案と同じ形）
+- C# でいえば、`Program.cs` で `if (env.IsDevelopment())` によって登録するサービスを変えるのと同じ。開発用と本番用のコードが 1 つのアセンブリに入っているのは普通のこと
+- 気になるのは同居そのものより**見通し**。肥大化したら同じパッケージのままファイルを分ける（例: `exporter_local.go` / `exporter_xray.go`）。Go では同じパッケージなら別ファイルでも分け方の制約は無い
+- 副作用は、Lambda のバイナリに使わない gRPC Exporter も入ること。サイズの差は小さく、気にする段階ではない
+
+### Q. 環境変数で選ぶ前例（`selectSessionProvider`）があるなら、Exporter も 1 案（環境変数）のほうがきれいではないか
+
+**どちらでも成り立つ。揃えるなら 1 案でよい。** 「同じ問題は同じ形で解く」は読み手にとって大きな利点。
+
+ただし、前例と完全に同じ形ではない点に注意する。
+
+| | `selectSessionProvider` | `TRACE_EXPORTER`（1 案） |
+|---|---|---|
+| 環境変数の中身 | フリート ID（どのみち必要な値） | 切り替えだけのためのスイッチ |
+| 未設定のとき | Stub になり、ログに出る | ローカル用 gRPC になり、AWS では Span が静かに消える |
+
+1 案で進める場合、前例から次の 2 点を受け継ぐ。
+
+- **どちらを選んだかを起動時にログへ出す**（前例の `log.Printf("GameLiftStub を使用…")` と同じ）。渡し忘れても CloudWatch Logs を見れば気づける
+- **Terraform の Lambda の環境変数に必ず入れる**（6-d で `GAMELIFT_FLEET_ID` と並べて書く）
+
+**判断（2026-10-27）: 1 案（環境変数）で進める。** 前例との一貫性を優先した。
+
+### Q. X-Ray の OTLP エンドポイントへ送るのに何が要るか（Transaction Search と IAM の調査、2026-10-30）
+
+**前提: Transaction Search の有効化が必須。** 無効のまま送ると 400（`The OTLP API is supported with CloudWatch Logs as a Trace Segment Destination`）。有効化すると Span は CloudWatch Logs の `aws/spans` ロググループに構造化ログとして入り、既定で 1% が無料で索引付けされる。**設定はリージョン単位**なので、Lambda を置く 2 リージョン（ap-northeast-1 / us-east-1）の両方で要る。
+
+API での有効化は 3 段:
+
+1. CloudWatch Logs のリソースポリシー: `xray.amazonaws.com` に `aws/spans` と `/aws/application-signals/data` への `logs:PutLogEvents` を許可（`aws:SourceArn` / `aws:SourceAccount` 条件付き）
+2. `UpdateTraceSegmentDestination`（送り先を CloudWatchLogs に）
+3. `UpdateIndexingRule`（索引付けの割合）
+
+**Terraform**: classic の `aws` provider には該当リソースが見当たらない。`awscc_xray_transaction_search_config`（CloudFormation `AWS::XRay::TransactionSearchConfig`）が 2 と 3 を担う（`indexing_percentage`）。1 は `aws_cloudwatch_log_resource_policy` で書ける。dev には awscc provider（primary / secondary）が既にある。
+
+**Lambda に要る IAM アクション**: `xray:PutSpans`（「OpenTelemetry の Span を X-Ray にアップロードする」権限、Resource は `*`）。既存の managed policy（`AWSXRayDaemonWriteAccess` など）は旧来の `PutTraceSegments` のみで `PutSpans` を含まないため、インラインで付ける。permission-only の `xray:PutSpansForIndexing` も存在するが要否は資料で確定できず、ステップ 7 の挙動で判断する。
+
+### Q. X-Ray を使うには CloudWatch の Transaction Search を有効にする必要があり、それを Terraform で構築しようとしている、という認識でよいか
+
+**よい。ただし 2 点補足。**
+
+- 必須なのは「**OTLP エンドポイントで送る場合**」。X-Ray そのものは Transaction Search なしでも使える（旧来の X-Ray SDK / デーモンが使う `PutTraceSegments` 経路）。6-3 は B 案（OTLP 直送）を選んだので、その帰結として必須になった
+- Transaction Search は CloudWatch の機能（コンソールでは Application Signals の配下）。CloudWatch Logs そのものの設定ではないが、有効にすると Span の保存先が CloudWatch Logs の `aws/spans` になる。そのため「X-Ray がそのロググループに書いてよい」というリソースポリシーも一緒に要る
+
+Terraform にするのは CLAUDE.md の「すべての AWS リソースは Terraform で定義、コンソールでの手動変更は禁止」に従うため。
+
+### Q. 6-c の plan で、触っていないアラーム 12 個に in-place の差分が出たのはなぜか
+
+**改行コードの違い。** monitoring の `alarm_description` はヒアドキュメント（`<<-EOT`）で、ファイルの改行がそのまま説明文に入る。このリポジトリは `core.autocrlf=true` で作業ツリーが CRLF のため、デプロイ済みの説明文は CRLF だった。編集時に `main.tf` を LF で保存したので、見た目は同じでも説明文が変わったと判定された。ファイルを CRLF に戻すと差分は消えた（7 to add, 0 to change）。
+
+あわせて出た「SNS の購読 2 個が destroy」は、plan を実行したシェルに `TF_VAR_notification_email` が無かったため（通知先のメールは tfvars に書かず環境変数で渡す設計）。apply するときは、環境変数を設定したターミナルで plan し直して、destroy が出ないことを確認する。
+
+### Q. 「トレースが 2 本に分かれる」とは、どう分かれるのか
+
+**ID の付け方が 2 系統あり、互いを知らないため。**
+
+| 系統 | 誰が作るか | ID の渡し方 | 見えるもの |
+|---|---|---|---|
+| X-Ray ネイティブ | API Gateway（トレース有効時）、Lambda 基盤（`tracing_config = Active` 時） | `X-Amzn-Trace-Id` ヘッダー / 環境変数 `_X_AMZN_TRACE_ID` | API Gateway の滞在時間、authorizer の呼び出し、コールドスタート（Init）、Lambda 基盤のオーバーヘッド |
+| OTel（自前） | `otellambda` とその下の `otelaws` | W3C `traceparent`（`propagation.TraceContext`） | ハンドラー本体、DynamoDB / GameLift 呼び出し |
+
+`otellambda` は既定で親を探さない（`EventToCarrier` の既定値は空のキャリアを返し、「呼び出しごとに新しいトレースになる」と contrib のコメントに明記）。Lambda 基盤が渡す `_X_AMZN_TRACE_ID` も読まない。そのため、1 回のリクエストが次のように別々のトレースになる。
+
+- X-Ray ネイティブの 1 本: API Gateway → authorizer Lambda / 本体 Lambda（中身は空）
+- OTel の 1 本: authorizer のハンドラー
+- OTel のもう 1 本: 本体のハンドラー → DynamoDB …
+
+（API Gateway と Lambda のトレースを有効にしない今の状態でも、OTel 側は authorizer と本体で別トレースに分かれる。）
+
+**つなぐ方法の候補**: OTel に X-Ray 形式の propagator と ID 生成器を入れ、`_X_AMZN_TRACE_ID` から親を読むよう `otellambda` を設定する（contrib に Lambda 向けの X-Ray 設定一式がある）。そうすると OTel の Span が Lambda 基盤の Span の子になり、API Gateway からの 1 本にまとまる。
+
+### Q. match_request の API で使っているトレースとは何か
+
+**OpenTelemetry（OTel）の分散トレース。** 1 回のリクエストの処理を Span（開始・終了時刻を持つ区間）の木として記録する。X-Ray SDK は使っていない。
+
+| 層 | どこで | 何の Span |
+|---|---|---|
+| ルート | `cmd/lambda/match_request/main.go` の `telemetry.StartLambda` → `otellambda.InstrumentHandler` | Lambda 呼び出し 1 回分（`service.name=match_request`） |
+| 子 | `db.NewClient` の `otelaws.AppendMiddlewares` | DynamoDB 呼び出し（`FindWaitingByPlayer` の Query、`PutTicket` の PutItem） |
+
+- 親子がつながるのは、ハンドラーが受け取った `ctx` をそのまま `db` に渡しているから（Span は Context に乗って運ばれる）
+- Lambda は応答後に凍結されるため、`WithFlusher` で呼び出しのたびに `ForceFlush` して送り切る
+- 送り先は `TRACE_EXPORTER` で切り替え: `xray` なら X-Ray の OTLP エンドポイント（HTTP + SigV4 署名）、それ以外は OTLP gRPC（ローカルの Jaeger）
+- 伝播形式は W3C `traceparent`。X-Ray ネイティブ（`X-Amzn-Trace-Id`）とは別系統なので、API Gateway や authorizer のトレースとはつながらない（前の Q「トレースが 2 本に分かれる」）
+
+**注意（2026-11-05 時点）**: Terraform の Lambda モジュールにはまだ `TRACE_EXPORTER=xray` が無い。受け側（Transaction Search・`xray:PutSpans`）は 6-c で整ったが、このまま AWS で動かすと gRPC の localhost へ送ろうとして Span は捨てられる。
+
+### Q. API Gateway と authorizer のトレースが、match_request のトレースと別になるのはなぜか
+
+**親になれるのが API Gateway だけなのに、その API Gateway が OTel の ID を渡していないため。**
+
+- **authorizer と match_request は親子ではなく兄弟。** API Gateway がまず authorizer を呼び、許可が出たら別に match_request を呼ぶ。authorizer が match_request を呼ぶわけではないので、authorizer から match_request へ `traceparent` が渡る経路がそもそも無い
+- **共通の親の API Gateway は ID を渡せる立場だが、形式が違う。** トレースを有効にした API Gateway は X-Ray 形式の `X-Amzn-Trace-Id` を付け、Lambda 基盤はそれを `_X_AMZN_TRACE_ID` で渡す。こちらの OTel は W3C `traceparent` を前提にしており、`otellambda` も既定では親を探さない（`EventToCarrier` は空を返す）。そのため、どちらの Lambda も呼ばれるたびに新しいトレースのルートになる
+- **今の dev では API Gateway のトレース自体が無い。** `api_gateway` モジュールで `xray_tracing_enabled` を設定しておらず、Lambda の `tracing_config` も無い。API Gateway の滞在時間はどのトレースにも出ない
+
+つなぐには、両方の Lambda の OTel が `_X_AMZN_TRACE_ID` を親として読むようにし（X-Ray 形式の propagator と ID 生成器）、API Gateway のトレースを有効にして共通の親を作る必要がある。
+
+### Q. OpenTelemetry（OTel）の基礎
+
+**OTel は「計測データの取り方と運び方」の業界標準。** 仕様・API・SDK・送信プロトコル（OTLP）をまとめて定めており、送り先（Jaeger、X-Ray、Datadog など）を選ばない。扱う信号はトレース・メトリクス・ログの 3 つで、RAIDYNC はトレースだけを使う（メトリクスとログは CloudWatch）。
+
+**用語**
+
+| 用語 | 意味 | RAIDYNC では |
+|---|---|---|
+| Trace | 1 リクエストの処理全体。TraceID（16 バイト）で識別 | match_request の 1 回の呼び出し |
+| Span | 処理の 1 区間。名前・開始/終了時刻・SpanID・親の SpanID・属性・状態を持つ。親子をたどると木になる | Lambda 呼び出し（ルート）、DynamoDB の Query / PutItem（子） |
+| Context | 「今どの Span の中にいるか」を運ぶ入れ物 | Go の `context.Context`（`ctx` の引き回し） |
+| Propagator | Context をプロセスの外へ運ぶための、ヘッダーへの書き出しと読み取り | `propagation.TraceContext{}`（W3C `traceparent`） |
+| Resource | どのサービスが出したかを示す属性 | `service.name=match_request` |
+| Exporter | Span を送り先へ送る部品。プロトコルは OTLP（gRPC / HTTP） | gRPC → Jaeger、HTTP + SigV4 → X-Ray |
+
+**API と SDK を分けている理由**: ライブラリは API（`otel.Tracer(...).Start(...)` などのインターフェース）だけに依存し、実体（SDK）はアプリの `main` が 1 回だけ設定する。SDK を設定しなければ API は何もしない実装になるので、ライブラリは計測コードを常に埋めておける。C# の `ILogger` と logging provider の関係に近い。.NET では `ActivitySource` / `Activity` が OTel の API に相当し、`Activity` が Span にあたる。
+
+**データの流れ（`telemetry.newProvider`）**
+
+```
+Tracer.Start → Span → SpanProcessor（WithBatcher：まとめて非同期に送る）→ Exporter → Jaeger / X-Ray
+                           ↑ TracerProvider が束ねる（otel.SetTracerProvider でグローバル登録）
+```
+
+**計測の付け方は 2 通り**: (1) 計測ライブラリを使う（`otellambda` が Lambda 呼び出し、`otelaws` が AWS SDK 呼び出しの Span を自動で作る）。(2) 自分で `tracer.Start(ctx, "name")` と `span.End()` を書く。RAIDYNC は今のところ (1) だけ。
+
+**`traceparent` の中身**: `00-<TraceID 32 桁>-<親 SpanID 16 桁>-<flags>`。受け取った側は同じ TraceID を使い、親 SpanID の下に子 Span をつなげる。X-Ray の `X-Amzn-Trace-Id` は同じ役割を持つ別の形式。
+
+### Q. 現状は、API Gateway と Lambda のトレースをつなぐ ID の形式が互いに対応していない、ということか
+
+**おおむねそう。ただし、つながらない理由は形式の違いだけではなく 3 つ重なっている。**
+
+| # | 理由 | どこを直すか |
+|---|---|---|
+| 1 | 形式が違う。API Gateway / Lambda 基盤は X-Ray 形式（`X-Amzn-Trace-Id` / `_X_AMZN_TRACE_ID`）、こちらの OTel は W3C `traceparent` しか読み書きしない | OTel に X-Ray 形式の propagator を入れる |
+| 2 | 形式が合っていても読みに行かない。`otellambda` は既定で親を探さず、呼び出しごとに新しいトレースを始める | `otellambda` に「`_X_AMZN_TRACE_ID` から親を読む」設定を渡す |
+| 3 | 親になる Span がそもそも記録されていない。dev は API Gateway の `xray_tracing_enabled` も Lambda の `tracing_config` も未設定 | Terraform でトレースを有効にする |
+
+1 だけ直しても 2 が残るとつながらない。1 と 2 を直せば OTel の Span は Lambda 基盤のトレースにぶら下がるが、3 が無いと API Gateway の区間は見えない。contrib には 1 と 2 をまとめた Lambda 向けの X-Ray 設定一式がある（どこまで要るかは実装時に確認する）。
+
+### Q. W3C 形式（`traceparent`）は、コードの具体的にどこで決まっているのか
+
+**`server/internal/telemetry/telemetry.go:42` の 1 行だけ。** `otel.SetTextMapPropagator(propagation.TraceContext{})` でグローバルの propagator を W3C Trace Context にしている。計測ライブラリは propagator を自分で持たず、既定でこのグローバルを `otel.GetTextMapPropagator()` で取りに来るため、この 1 行で全体の形式が決まる。
+
+| 使う側 | 向き | 何をするか | 実際の効果 |
+|---|---|---|---|
+| `otellambda`（Lambda 本体） | 読む（Extract） | イベントから作った carrier を読む | 既定の `EventToCarrier` は空の carrier を返すので、読んでも何も無い → 毎回新しいトレース |
+| `otelaws`（DynamoDB / GameLift） | 書く（Inject） | AWS SDK の HTTP リクエストのヘッダーに `traceparent` を付ける（otelaws `aws.go:94`） | AWS 側はこのヘッダーを使わないので、何も起きない |
+| `otelhttp`（localapi の各ハンドラー） | 読む（Extract） | 受け取った HTTP リクエストの `traceparent` を読む | k6 は `traceparent` を送らないので、毎回新しいトレース |
+
+**現状、W3C 形式でプロセスをまたいでつながっている箇所は無い。** 親子がつながっているのはプロセス内の `ctx` の引き回し（Lambda → DynamoDB）だけで、こちらは propagator を使わない。X-Ray とつなぐなら、この 1 行に X-Ray 形式の propagator を加える（または置き換える）ことになる。
+
+### Q. トレースをつなぐ理由は何か
+
+**まだ「つなぐ」と決めたわけではない（候補として挙げた段階）。つなぐ場合の理由は次の 3 つ。**
+
+1. **ロードマップの完了基準。** 6-3 の完了基準は「API→Lambda→DynamoDB のトレース確認」（docs/roadmap.md）。今の OTel だけでは Lambda→DynamoDB までしか見えず、API の区間が抜ける
+2. **クライアントが待つ時間の内訳が分かる。** クライアントの待ち時間は「API Gateway の滞在 + authorizer + Lambda のコールドスタート + ハンドラー」。OTel が見ているのはハンドラーだけ。6-5 で 8 人→40 人のとき `iteration_duration` の最大が 6.6s→11s に伸びたが、それがハンドラーの中（DynamoDB の競合など）なのか外なのかは、つながったトレースでないと切り分けられない。6-6 の 1,000 接続でも同じ問いが出る
+3. **1 リクエストを最後まで追える。** 401 や 5xx が出たとき、authorizer で落ちたのか本体で落ちたのかを同じ TraceID でたどれる。別々だと時刻やリクエスト ID で突き合わせることになる
+
+**つながない選択肢**: API Gateway の区間は CloudWatch のメトリクス（`Latency` − `IntegrationLatency`）でも大まかに分かる。つなぐ手間（propagator・`EventToCarrier` の設定・Terraform のトレース有効化）と、得られる情報を比べて決める。
+
+**判断（2026-11-05）: つなぐ。** 6-3 の完了基準を満たすことと、6-6 で遅延の内訳（ハンドラーの中か外か）を切り分けたいことが決め手。
+
+### Q. propagator を X-Ray 形式に置き換えるのと、W3C と併用するのとで、メリット・デメリットは何か
+
+前提: グローバルの propagator（`telemetry.go:42`）は Lambda と localapi で共通。使う側は `otellambda`（読む）、`otelaws`（AWS SDK のリクエストに書く。AWS 側は使わない）、`otelhttp`（localapi で読む）。Lambda が親を受け取るのは HTTP ヘッダーではなく環境変数 `_X_AMZN_TRACE_ID` なので、`EventToCarrier` でそれを carrier に詰め、propagator がその文字列を解釈する。
+
+| 案 | 書き方 | メリット | デメリット |
+|---|---|---|---|
+| 置き換え | `xray.Propagator{}` だけ | 1 形式で単純。AWS 側の形式と揃う | localapi も X-Ray 形式になる。今は k6 がどちらも送らないので実害は無いが、将来 Unity クライアントや別サービスが `traceparent` を送ってきても読めない。「ローカルは業界標準、AWS は X-Ray」という OTel を選んだ理由（送り先を選ばない）が薄れる |
+| 併用 | `propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, xray.Propagator{})` | どちらの形式でも読める。環境で分岐しない。将来 W3C の呼び出し元が来ても対応できる | 書くときは両方のヘッダーを付ける（無駄だが軽い）。読むときに両方あると後ろの propagator が勝つ、という順序の決まりを知っておく必要がある。なぜ 2 つあるのかをコメントで残す必要がある |
+| （第 3 案）Lambda だけ X-Ray | グローバルは W3C のまま、`StartLambda` で `otellambda.WithPropagator(xray.Propagator{})` を渡す | localapi は一切変わらない。Lambda 固有の事情が `StartLambda` に閉じる | propagator の指定が 2 か所に分かれる。Lambda 内の `otelaws` はグローバル（W3C）を使うので、同じプロセスで形式が混在する（今は実害なし） |
+
+**判断（2026-11-06）: 併用（Composite）。** 並べる順序は今のところ結果に影響しない（Lambda の carrier に入るのは `X-Amzn-Trace-Id` だけ、localapi に届くのは `traceparent` だけで、両方そろう場面が無い）。
+
+### Q. Lambda で親のトレース ID を読む設定（EventToCarrier）はどこに置き、どの部品を使うか
+
+**置き場所は `StartLambda` しかない。** `EventToCarrier` は `otellambda.Option` で、渡し先の `otellambda.InstrumentHandler` を呼ぶのが `StartLambda` だけだから。論点は「どの部品を使うか」になる。
+
+`otellambda/xrayconfig`（v0.72.0）の中身は小さい: `_X_AMZN_TRACE_ID` を `X-Amzn-Trace-Id` として carrier に詰める 3 行の関数、それと propagator（X-Ray のみ）を otellambda に渡す Option、それらに `WithTracerProvider`・`WithFlusher` を足した `WithRecommendedOptions(tp)`。`NewTracerProvider` は Exporter が gRPC・平文固定なので、X-Ray の OTLP エンドポイント（HTTP + SigV4）には使えない。
+
+| 案 | 内容 |
+|---|---|
+| ① 一式 | `xrayconfig.WithRecommendedOptions(tp)` |
+| ② 一部 | `xrayconfig.WithEventToCarrier()` ＋ 既存の `WithFlusher(tp)` |
+| ③ 自作 | 3 行の関数を自分で書いて `otellambda.WithEventToCarrier` に渡す |
+
+**判断（2026-11-06）: ①。** 帰結として、otellambda はグローバルの Composite ではなく `xrayconfig` の X-Ray 専用 propagator を使う。グローバルの X-Ray 部分が Lambda で効くのは `otelaws` の書き出し（AWS 側は使わない）だけになる。
+
+**判断（2026-11-07）: グローバルの Composite は W3C（`TraceContext{}`）だけに戻す。** ①を採ると otellambda は `xrayconfig` の X-Ray 専用 propagator を使うため、グローバルに入れた X-Ray 部分は Lambda でも localapi でも何にも効かない（`otelaws` が AWS SDK のヘッダーに書くだけで、AWS 側は使わない）。使われない部品を説明付きで残す理由が弱く、X-Ray 形式の扱いは `StartLambda` に閉じる方が読みやすい。論点 1 の「併用」は、論点 2 の選択によって不要になった。
+
+### Q. API Gateway が `Sampled=0`（記録しない）を付けたリクエストで、OTel の Span はどうなるか
+
+**記録されない（Span は作られるが、記録も送信もされない）。ハンドラー配下の DynamoDB の Span も同じく消える。**
+
+1. Lambda 基盤が `_X_AMZN_TRACE_ID`（例: `Root=1-…;Parent=…;Sampled=0`）を渡す
+2. `xrayconfig` の `EventToCarrier` と X-Ray propagator がそれを読み、親の SpanContext にする。`Sampled=1` 以外（`0` や項目なし）は「記録しない」フラグになる（`xray/propagator.go` の `parseTraceFlag`）
+3. 既定のサンプラーは `ParentBased(AlwaysSample())`（SDK `provider.go`）。親がプロセスの外から来て記録しない場合は `remoteParentNotSampled: NeverSample()` に当たり、otellambda のルート Span は記録されない
+4. 子の Span（`otelaws` の DynamoDB 呼び出し）は「ローカルの親が記録しない」なので、これも記録されない
+
+**変化**: 今まで（親を読まない）は全呼び出しが新しいルートとして `AlwaysSample` で 100% 記録されていた。つないだ後は、記録する割合を **API Gateway の X-Ray サンプリングルール**が決める。既定ルールは「毎秒最初の 1 件 + それ以降の 5%」なので、負荷テスト中はほとんどのトレースが残らない。
+
+**選択肢**
+
+| 案 | 内容 | メリット | デメリット |
+|---|---|---|---|
+| A. 従う | 既定ルールのまま | 一般的な本番の形。Span の量（= 費用）が抑えられる | 6-6 で遅いリクエストを探しても、そのトレースが残っていないことが多い |
+| B. ルールを変える | Terraform（`aws_xray_sampling_rule`）で API Gateway の割合を上げる（例: 負荷テスト中だけ 100%） | つながった 1 本のトレースのまま、全件を見られる。割合を IaC で切り替えられる | Span の量に比例して費用が増える。テスト後に戻すのを忘れない運用が要る |
+| C. 親の判断を無視 | OTel のサンプラーを `ParentBased(..., WithRemoteParentNotSampled(AlwaysSample()))` などにする | API Gateway の判断に関係なく Lambda 以降は全件残る | `Sampled=0` のときは API Gateway・Lambda 基盤側の Span が無いので、親が欠けた（つながらない）トレースになる。つなぐ目的と矛盾する |
+
+**未確認（ステップ 7 で見る）**: API Gateway のトレースを有効にする前（Lambda が `PassThrough`）に `_X_AMZN_TRACE_ID` に何が入るか。`Sampled=0` 付きの ID が入るなら、Terraform を当てる前の今の状態でも Span が記録されなくなる。
+
+**判断（2026-11-07）: 普段は A（既定ルールに従う）、負荷テストのときだけ B（サンプリングルールで割合を上げる）。** C は親が欠けたトレースになり、つなぐ目的と矛盾するため採らない。B の切り替え方（Terraform の変数で割合を変えるか、ルールを足し引きするか）は 6-d で決める。サンプリングルールはリージョンごとの設定なので、primary / secondary の両方に要る。
+
+### Q. X-Ray 形式の ID 生成器（`xray.NewIDGenerator()`）は何のために使うつもりだったのか
+
+**自分がルートになるトレースの TraceID を、X-Ray が受け付ける形式にするため。ただし、今回の構成では要らない可能性が高い。**
+
+- X-Ray の旧来の TraceID は「先頭 8 桁（16 進）= 生成時刻の UNIX 秒、残り 24 桁 = 乱数」。OTel の既定は 32 桁すべて乱数（W3C 形式）で、昔の X-Ray は先頭が時刻として不自然な ID を受け付けなかった。生成器はこの差を埋める部品
+- 効くのはルートになるときだけ。API Gateway から親を受け取れば TraceID は親のものを引き継ぐ。Lambda でルートになるのは親が無い・読めないときくらい
+- 論点として挙げたきっかけは、`xrayconfig.NewTracerProvider` の中で使われていたこと。RAIDYNC の設計上、具体的に困る場面があったわけではない
+- AWS は 2023-10 に「X-Ray が W3C 形式の TraceID を受け付けるようになった」と発表している（条件として CloudWatch エージェント / ADOT Collector のバージョンが挙がっている）。RAIDYNC は OTLP エンドポイントへ直送するので、その経路でも受け付けると考えられるが、資料での確認はできていない
+
+**判断（2026-11-09）: 今は入れない。** ステップ 7 で、6-d 適用前（Lambda が PassThrough）に親の無い Span が X-Ray に届くかを確認し、拒否されていたら入れる（次の Q のとおり、6-d 適用後の通常経路ではルートにならない）。
+
+### Q. Lambda で「親が無い・読めない」ためルートになる場面は、実際にあるのか
+
+**6-d（API Gateway のトレース有効化・Lambda の `Active`）を当てた後の通常経路では無い。** `aws-lambda-go` v1.55.1 の `lambda/invoke_loop.go:66-70` は、呼び出しごとに Lambda 基盤の `Lambda-Runtime-Trace-Id` ヘッダーを `_X_AMZN_TRACE_ID` に入れ、`xrayconfig` はそれを読む。
+
+| ケース | ルートになるか |
+|---|---|
+| API Gateway 経由・6-d 適用後 | ならない（`Sampled=0` でも親の ID は届く） |
+| API Gateway 経由・6-d 適用前（PassThrough） | 未確認。`Parent=` が無ければ親として無効になりルートになる（ステップ 7 で確認） |
+| API Gateway 以外（`aws lambda invoke`・コンソールのテスト実行） | Terraform が許可している呼び出し元は `apigateway.amazonaws.com` だけなので手作業のときのみ。`Active` なら基盤が親を作るのでならない |
+| 1 つの実行環境で同時に複数呼び出しを処理する構成（`AWS_LAMBDA_MAX_CONCURRENCY` > 1） | なる。上のコードは `MaxConcurrency() == 1` のときだけ環境変数をセットする。RAIDYNC は通常の Lambda なので該当しない |
+| localapi | 毎回ルートだが送り先は Jaeger なので無関係 |
+
+ID 生成器が効くのは 6-d 適用前と手作業の呼び出しくらいで、本番の経路には無い。「入れない」判断は変わらない。
+
+### Q. 6-d で API Gateway と Lambda のトレースをどう有効にするか
+
+- **API Gateway**: `aws_api_gateway_stage` に `xray_tracing_enabled = true` を足すだけ。ステージの設定なので再デプロイは要らず、IAM も要らない。`aws_lambda_permission`（`execution_arn`）は「API Gateway が Lambda を呼んでよいか」という呼び出しの許可で、トレースとは別物（既に設定済み）。**判断（2026-11-09）: 変数にせず常に `true`。** 普段は既定のサンプリングで量が少なく、切り替える理由が今は無い（Transaction Search と同じ扱い）
+- **Lambda の `tracing_config.mode`**: `PassThrough` は上流の ID を中継するだけ、`Active` は Lambda 基盤が自分の区間（コールドスタートの Init、呼び出しのオーバーヘッド）も記録する。**判断（2026-11-09）: `Active`。** 6-3 の目的にコールドスタートなどハンドラー外の時間の確認が入っているため。代わりに Lambda の実行ロールに旧来の `xray:PutTraceSegments` 等の権限が要る（6-d の 4）
+- **`TRACE_EXPORTER`**: 6 関数すべてに同じ値が要るので、`locals` の `common_env` に置き、`functions_resolved` で `merge(local.common_env, cfg.env)` する（後ろの関数ごとの値が勝つ）。**判断（2026-11-09）: 変数にせず `"xray"` を直接書く。** Lambda は AWS でしか動かないので値が変わらない。変数にして既定値を空にすると、空文字を落とす `functions_resolved` によって環境変数ごと消え、`validate` は通るのに Span が届かない状態になる（実際に一度そうなりかけ、`plan` で確認して気づける類の誤り）
+
+### Q. 6-c / 6-d の apply が `AccessDenied` で途中まで失敗したのはなぜか
+
+**apply する側（`raidync-cli`）の権限不足。Lambda の実行ロールの権限とは別の話。** `raidync-cli` の権限は `terraform/bootstrap/raidync-cli-deploy-policy.json`（管理ポリシー `raidync-cli-deploy`）で、使うサービスだけに絞っている。
+
+| 失敗したリソース | 足りなかった権限 | 理由 |
+|---|---|---|
+| `aws_iam_policy.xray` と attachment 2 つ | `iam:CreatePolicy` など | これまで IAM で許可していたのはロール（`role/raidync-dev-*`）だけ。自前の管理ポリシーを作るのは 6-c が初めて |
+| `awscc_xray_transaction_search_config` ×2 | `xray:GetTraceSegmentDestination` など | デプロイポリシーに `xray` が無かった |
+
+ステージ・Lambda・ロググループのリソースポリシーは適用済みになり、残りは `Plan: 5 to add`。この間も API は動くが、Lambda の Span 送信は 403 で捨てられる。
+
+**追加した権限（2026-11-09）**: `xray:*`（使うサービスは丸ごと許可する既存の方針に合わせた。6-d の 5 のサンプリングルールもこれで作れる）、`policy/raidync-dev-*` に限定した管理ポリシーの操作、Transaction Search の有効化に要る `application-signals:StartDiscovery`・Application Signals のサービスリンクロール（作成と `GetRole`）・`cloudtrail:CreateServiceLinkedChannel`。根拠は AWS ドキュメント「Enable transaction search」の Prerequisites と、CloudFormation `AWS::XRay::TransactionSearchConfig` の create ハンドラーの必要権限。
+
+**気づけなかった理由**: `plan` は読み取りしかしないので、作成の権限が足りなくても通る。`validate` も同じ。作成系の権限は apply するまで（または IAM Policy Simulator で試すまで）分からない。
+
+### Q. つないだ結果、AWS dev で 1 本のトレースになったか（6-3 ステップ 7）
+
+**なった。** `POST /match/request` を 1 回送り、Logs Insights で `aws/spans` を引いた（2026-11-09）。18 行すべてが同じ TraceID（`6af1dbeb…`）で、親子は次のとおり（ms は所要時間。`LambdaService` などが 2 行ずつ出るのは、処理中の途中経過と完了後の 2 回記録されるため）。
+
+```
+raidync-dev-api  POST /match                              1621 ms  ← API Gateway（ルート）
+├ raidync-dev-authorizer/LambdaService                     509 ms  ← Lambda 基盤（Active）
+│  └ LambdaExecutionEnvironment                             77 ms
+│     ├ Init                                               212 ms  ← コールドスタート
+│     ├ authorizer（OTel / otellambda）                     2.4 ms
+│     └ Overhead                                           0.2 ms
+└ awslambda.Invoke                                        1000 ms  ← API Gateway → 本体
+   └ raidync-dev-match_request/LambdaService              1062 ms
+      └ LambdaExecutionEnvironment                         715 ms
+         ├ Init                                            139 ms  ← コールドスタート
+         ├ match_request（OTel / otellambda）               634 ms
+         │  ├ DynamoDB.Query（otelaws）                     626 ms
+         │  └ DynamoDB.PutItem（otelaws）                     7 ms
+         └ Overhead                                        0.3 ms
+```
+
+- **つながったことの確認**: OTel の Span（`authorizer`・`match_request`）の親が、Lambda 基盤の `LambdaExecutionEnvironment` になっている。`xrayconfig` が `_X_AMZN_TRACE_ID` から親を読めている
+- **見えるようになったもの**: API Gateway の全体 1.6 秒のうち、コールドスタート（Init）が authorizer 212 ms・本体 139 ms。ハンドラー内では最初の DynamoDB Query が 626 ms と突出し、次の PutItem は 7 ms。初回の接続確立（TLS など）がハンドラーの中に乗っていると読める（要検証）。OTel だけでは Init と API Gateway の区間は見えなかった
+- **`get-trace-summaries` は空だった**: Transaction Search の索引付け（indexing）を 1% にしているため、トレースの一覧（X-Ray のトレース画面）に載るのは一部だけ。Span そのものは `aws/spans` に全部入るので、確認は Logs Insights（Transaction Search の画面）で行う
+- **ID 生成器**: 親の無い Span は API Gateway のルートだけで、Lambda の Span はすべて親を持っていた。入れなかった判断で問題なかった
+
+### Q. AWS コンソールでトレースを確認できるか
+
+**できる。`raidync-admin` でログインし、CloudWatch の画面から見る**（`raidync-cli` はコンソールにログインできない）。リージョンは東京（ap-northeast-1）。
+
+| 見たいもの | 場所 |
+|---|---|
+| 1 本のトレースのウォーターフォール | CloudWatch → 「X-Ray traces」→「Traces」で TraceID を検索。X-Ray 形式の ID は `1-<先頭 8 桁>-<残り 24 桁>`（例: `1-6af1dbeb-0a595cde1e00781b3f48e0b5`） |
+| Span を条件で探す | CloudWatch → 「Application Signals」→「Transaction search」。`aws/spans` を画面上で検索する機能 |
+| Span の生データ | CloudWatch → 「Logs Insights」でロググループ `aws/spans` を選んで問い合わせる |
+| サービス間のつながりの図 | CloudWatch → 「X-Ray traces」→「Trace map」 |
+
+- 索引付けを 1% にしているので、「Traces」の一覧に出てくるのは一部だけ。一覧に無いトレースは、TraceID を直接指定するか Transaction search で探す（**確認結果**: 索引の無いトレースは「Traces」の詳細画面でも開けない。`aws xray batch-get-traces` で `6af1dbeb…` を指定すると、`Traces` も `UnprocessedTraceIds` も空で返った。コンソールの詳細画面は同じ API を使うので、表示されない。Span は `aws/spans` に入っているので、Transaction search と Logs Insights では見られる）
+- TraceID の先頭 8 桁は生成時刻の UNIX 秒（`6af1dbeb` = 1794235371 = 2026-11-09 14:42:51 UTC）。API Gateway が X-Ray 形式で作り、Lambda の OTel がそれを引き継いでいる
+
+### Q. 6-6 前にやる「負荷テスト用のサンプリングルール」は何をするのか
+
+**「どのリクエストを記録するか」の割合を、負荷テストのときだけ上げる。** 記録するかどうかは入口の API Gateway が X-Ray のサンプリングルールで決め、`Sampled=1/0` として下流（Lambda 基盤 → OTel）に伝わる。`Sampled=0` なら Lambda も DynamoDB も Span を残さない（論点 3）。
+
+- **既定ルール**: 「毎秒最初の 1 件（reservoir）＋ それ以降の 5%（fixed rate）」。1 リクエストずつ手で送るとほぼ毎回記録されるが、6-6（1,000 セッション）では毎秒数百〜千件規模になり、記録されるのは 5% 強。遅かったリクエストを後から探しても、残っていないことが多い
+- **やること**: Terraform の `aws_xray_sampling_rule` で、既定より優先されるルールを足す（`priority` が小さいほど優先、`fixed_rate = 1.0` で全件など）。サンプリングルールはリージョンごとなので primary / secondary の両方に要る。負荷テストが終わったら戻す（論点 3 の B）
+
+**似ているが別物: 索引付け（indexing）**
+
+| 段階 | 決めるもの | 設定 | 影響 |
+|---|---|---|---|
+| サンプリング | Span を記録するか | X-Ray サンプリングルール（API Gateway が適用） | 記録しなければ `aws/spans` に何も残らない |
+| 索引付け | 記録した Span のうち、どれをトレースの一覧・詳細（ウォーターフォール）に載せるか | Transaction Search の `indexing_percentage`（今 1%） | 載らなくても Span は `aws/spans` にあり、Transaction search / Logs Insights で見られる |
+
+費用はどちらも量に比例する（Span は CloudWatch Logs への取り込み量、索引は索引付けした Span の量）。6-6 で決めるのは、テスト中の割合（サンプリングを何%にするか、索引付けも上げるか）と、それをどう切り替えるか（変数で上書きするか、ルールを足し引きするか）。
+
+**判断（2026-11-10）: 負荷テスト中はサンプリングを全件（`fixed_rate = 1.0`）にし、切り替えは Terraform の変数を上書きして行う。** 索引付けの割合は保留。
+
+### Q. 索引付け（indexing）の割合を上げると何が変わるか
+
+**ウォーターフォールで見られるトレースが増える。代わりに 1% を超えた分は X-Ray の料金がかかる。** 索引付けは「`aws/spans` に入った Span のうち、何%を X-Ray のトレースサマリーにするか」（0〜100%）で、1% までは無料。
+
+| | 索引付け 1%（今） | 割合を上げる |
+|---|---|---|
+| `aws/spans` の Span（Transaction search / Logs Insights） | サンプリングされた分は全件ある | 変わらない |
+| X-Ray の Traces 一覧・詳細（ウォーターフォール）、トレースの絞り込み | 100 本に 1 本程度 | 割合に比例して増える |
+| 費用 | 追加なし | 1% を超えた分が X-Ray の料金 |
+
+- 索引付けは確率で選ばれるので、10% にしても「この遅かったリクエスト」が選ばれる保証は無い。特定のトレースを必ずウォーターフォールで見たいなら 100% が要る
+- 選ばれなくても、Transaction search で所要時間などから Span を探し、同じ TraceID の Span を並べれば中身は分かる（今回の確認と同じやり方）。失うのは見やすさ
+
+### Q. 索引付けを 100% にすると費用はどれくらいか
+
+**普段の dev（手で数本送る程度）ではほぼ 0。費用が出るのは負荷テストのときで、100 万リクエストあたり索引付け約 $11 ＋ サンプリング全件による Span 取り込み約 $11 が目安。**
+
+**実測（2026-11-10、`aws/spans` を Logs Insights で集計）**: コールドスタートの 1 リクエストで 18 レコード、1 レコード平均 約 1 KB。ウォーム時は Init が無くなり 15 前後と見込む（authorizer は `authorizer_result_ttl_in_seconds = 0` なので毎回呼ばれる）。`aws/spans` の保持期間は 30 日。
+
+**単価（要確認。索引付けは第三者の記事の値、取り込みは東京の CloudWatch Logs 標準の値として計算）**
+
+| 項目 | 単価 | 100 万リクエストあたり（15 Span・15 GB） |
+|---|---|---|
+| Span の取り込み（サンプリングした分すべて） | 約 $0.76 / GB | 約 $11 |
+| 索引付け（1% を超えた分） | $0.75 / 100 万 Span | 100% なら約 $11（1% なら $0） |
+| 保存（30 日） | 約 $0.033 / GB・月 | 約 $0.5 |
+
+**6-6 の規模感**: 4,000 VU が 2 秒ごとにポーリングすると最大 約 2,000 リクエスト/秒。30 分続けると約 360 万リクエストで、取り込み 約 $40 ＋ 索引付け 100% 約 $40。月 $200 の予算に対して小さくない。GameLift フリートの費用も別に乗る。
+
+- サンプリング全件の取り込み費用は、索引付けとほぼ同じ規模でかかる（索引付けだけの問題ではない）
+- 普段のトラフィックはごくわずかなので、索引付けを常時 100% にしても普段の費用はほぼ変わらない。効いてくるのは負荷テストの間だけ
+
+### Q. 費用を抑えるため、負荷テストでも全件サンプリングは実際には使わず「変数で切り替えれば確認できる」状態にとどめてよいか
+
+**よい。** 理由は 3 つ。
+
+1. **6-6 の完了基準にトレースは含まれない。** 6-6 は「レイテンシー・エラー率の計測結果取得」で、k6 と CloudWatch のメトリクスで取れる。6-3 の完了基準（トレース確認）は達成済み
+2. **既定の 5% でも遅いリクエストの傾向はつかめる。** 約 2,000 リクエスト/秒で 30 分（約 360 万リクエスト）なら、p99 より遅い上位 1%（約 36,000）の 5% で約 1,800 本の遅いトレースが `aws/spans` に残る。Transaction search で所要時間から探せば、どの区間が遅いか（コールドスタート・DynamoDB・authorizer など）は分かる。全件が要るのは「この 1 本」を必ず追いたいときだけ
+3. **費用はほぼかからない。** 索引付け 1% は無料、取り込みは全件の 5% で約 $2（CloudWatch Logs の無料枠 月 5 GB にも一部収まる）
+
+**条件: 切り替えは一度だけ小さく動かして確かめる。** 適用したことの無い設定は、`priority` の誤りで既定ルールが勝つ、条件（サービス名・URL）が当たらない、などで肝心なときに動かないことがある。手順は、変数で全件にして apply → 2 秒以内に 2〜3 本送る（既定なら 2 本目以降はほぼ記録されない状況）→ 全 TraceID が `aws/spans` にあるか確認 → 変数を戻して apply。サンプリングルール自体は無料で、数本分の取り込みは無視できる。
+
+**判断（2026-11-10）**: 6-6 は既定のサンプリング（毎秒 1 件 + 5%）と索引付け 1% で行う。全件サンプリングは Terraform の変数で切り替えられるように用意し、上の手順で動作確認だけ行う。索引付けの割合は 1% のまま変えない。ポートフォリオでは「必要なら変数 1 つで全件に切り替えられ、動作も確認済み。普段は費用を理由に既定のまま運用」と説明できる形にする。
+
+### Q. 全件サンプリングに切り替えるためのルールはどう作ったか
+
+`modules/monitoring` に `aws_xray_sampling_rule`（`raidync-dev-sampling-rule`）を**常に置き**、割合（`fixed_rate`）だけを変数 `sampling_fixed_rate` で変える。dev の root で受け取り、primary・secondary の両方のモジュールに渡す（サンプリングルールはリージョンごとのリソース）。
+
+- **priority 9999**: 既定ルール（10000）より小さい＝優先されるので、割合は常にこのルールで決まる。既定ルールに負けて切り替えが効かない、を防ぐ
+- **条件はすべて `"*"`**: API の ID はリージョンごとに違うため、`resource_arn` などで絞ると primary と secondary で別の値が要る。トレースを送るのはこの API だけなので絞る必要が無い
+- **`attributes` は付けない**: これも一致条件で、付けるとその属性を持つリクエストにしか当たらない（ドキュメントの例 `Hello = "Tris"` をそのまま残すと、どのリクエストにも当たらない）
+- **既定値 0.05・reservoir 1**: 既定ルールと同じ動き。ルールを置いても普段の記録数・費用は変わらない。0.0 にすると「毎秒 1 件のみ」に減ってしまう
+- **validation で 0〜1 に制限**: `100`（%のつもり）などの書き間違いを plan で止める
+
+### Q. サンプリングルールを変えると、API Gateway の判定は本当に変わるか（2026-11-10 の検証）
+
+**変わる。ただし反映は遅く、数十分かかる。** `POST /match/request` を 50 本ずつ送り（トークンは 1 回だけ取り、並列で送信）、レスポンスの `X-Amzn-Trace-Id` を aws/spans と照合した。
+
+| 送信時刻 | ルール（fixed_rate / reservoir） | aws/spans にあった本数 |
+|---|---|---|
+| 22:51 | 0.05 / 1 | 3 本中 3、50 本中 50 |
+| 23:00（更新の 1 分後） | 0 / 0 | 50 本中 43 |
+| 23:09（更新の 10 分後） | 0 / 0 | 50 本中 16 |
+| 23:28（更新の 30 分後） | 0 / 0 | 50 本中 12 |
+
+- 記録されたトレースには、どれも API Gateway の Span（`AWS::ApiGateway::Stage`）があった。判定しているのは入口の API Gateway
+- **小さい負荷では 0.05 でも全件が記録される。** 「毎秒 1 件」の枠は API Gateway の判定サーバー 1 台ごとにあり（X-Ray から割り当てを受けるまでは、各サーバーが毎秒 1 件を自分で記録できる＝借用）、リクエストが別々のサーバーに届けばほぼ全件が 1 件目になる、と考えられる（推測）。0.05 と 1.0 の違いが見えるのは、毎秒数百本を超える規模から
+- **変更は時間をかけて反映される。** 判定サーバーがそれぞれのタイミングで新しいルールを読み込むためと考えられる。30 分たっても 0 本にはならなかったので、完全に反映されるまでの時間は分からない
+- `get-sampling-statistic-summaries` の判定件数（RequestCount）は 0 のままだった。API Gateway の判定はこの統計に出ない（ように見える）ので、効いているかの確認には使えない
+
+**判断（2026-11-10）**: 「API Gateway がルールに従う」ことは確認できたので、ルールは 0.05 / 1 に戻し、1.0 の確認は省略する。全件にしたいときは、**計測を始める 30 分以上前に apply する**。始めの数十分は全件にならず、その間の記録は信用しない。
+
+### Q. 50 本を並列で送ったら 500 が返ったのはなぜか
+
+**Lambda のアカウント同時実行の上限が 10 しかなかったため。** 上限は全関数の合計で、1 回の API 呼び出しでは authorizer と match_request の 2 本が動く。並列 50 本で上限を超え、authorizer が Throttle された（23:28 に Throttles 10 件。500 になった 10 本と一致）。authorizer が呼べないと API Gateway は 500 を返す。
+
+- `aws lambda get-account-settings` の `ConcurrentExecutions` は、ap-northeast-1・us-east-1 とも **10**
+- AWS の文書では既定は 1,000 だが、「新しいアカウントは同時実行とメモリの上限が下げられていて、使い方に応じて AWS が自動で引き上げる」とある。このアカウントはまだ引き上げられていない
+- **6-6 の前提が崩れる**: これまでの計画（6-6 の見積もり、6-4 の WAF の検討）は上限 1,000 を前提にしていた。10 のままでは 4,000 VU の負荷テストはほぼすべて Throttle され、計測にならない
+
+### Q. 同時実行の上限はどう引き上げるか。費用はかかるか
+
+**手順**（リージョンごとに申請する。東京とバージニア北部の両方が必要）
+
+1. raidync-admin でコンソールにサインインし、Service Quotas を開く（リージョンを選ぶ）
+2. 「AWS のサービス」→「AWS Lambda」→「Concurrent executions」（クォータコード `L-B99A9384`）
+3. 「アカウントレベルでの引き上げをリクエスト」で新しい値を入れて送信（今の値より大きい値でなければならない）
+4. 「リクエスト履歴」で状況を見る。小さい引き上げは自動で承認され、大きいものはサポートの審査に回る（Support から却下・一部承認もありうる。所要時間は文書に書かれていない）
+
+CLI なら `aws service-quotas request-service-quota-increase --service-code lambda --quota-code L-B99A9384 --desired-value 1000 --region <リージョン>`。raidync-cli には servicequotas の権限が無い（参照の `GetServiceQuota` も拒否された）。
+
+**費用は 0。** 上限の引き上げや申請そのものに料金はかからない。Lambda はリクエスト数と実行時間で課金されるので、上限を上げても使わなければ費用は増えない（費用がかかるのは、常に起動しておく Provisioned Concurrency を使う場合だけで、RAIDYNC では使わない）。
+
+**どの値を申請するか**: AWS の通常の既定値 1,000 が目安。6-6 の最大は約 2,000 リクエスト/秒で、1 回の呼び出しで 2 関数が動き、それぞれ数十 ms かかる。同時実行は「1 秒あたりのリクエスト数 × 実行時間」なので、2,000 × (0.05 + 0.05) 秒 ≒ 200 になる。これにコールドスタートで長引く分を見込んでも、1,000 で足りる。
+
+**IaC との関係**: クォータはリソースではなく「アカウントの上限」なので、コンソールでの申請は IaC 違反にはあたらない（Terraform の `aws_servicequotas_service_quota` でも申請はできるが、申請は一度きりで state に持つ意味が薄い）。
+
+
+### Q. 6-6（AWS での負荷テスト）の規模と範囲をどう決めたか
+
+**判断（2026-11-11）: 人数は段階的に増やし、範囲はマッチ成立までにする。**
+
+- **人数を段階的に増やす**: 目標は文書によって「1,000 接続」（roadmap）と「同時セッション 1,000＝接続 4,000」（CLAUDE.md）に分かれている。いきなり最大の規模で失敗すると、どこが詰まったか切り分けにくい。小さい規模から増やし（例: 100 → 1,000 → 4,000）、段ごとに結果を見てから次に進む
+- **範囲はマッチ成立まで**: GameLift のフリートは起動しない（`enable_gamelift = false`）。`match_status` は `GAMELIFT_FLEET_ID` が空なら `GameLiftStub` を使うので、コードを変えずにマッチ成立と Sessions への書き込みまでが動く。測るのは API Gateway・Lambda・DynamoDB の負荷だけで、GameLift の時間課金と容量計算が要らない
+- 先送りしていたセカンダリの GameLift の実機確認と 6-7（オートスケーリング）は、6-6 とは別の機会に行う
+
+### Q. Terraform の `test_user_count` でユーザーを作り、`call-api.sh` で回せば、実際に API を叩くことになるか
+
+**なる。ただし `call-api.sh` は負荷テストには使えない。**
+
+- `test_user_count` は Cognito にユーザー（`player1@…` からの連番、共通パスワード）を作るだけで、API は叩かない
+- `call-api.sh` は、指定したユーザー（`USER_EMAIL`）でログインし、本物の API Gateway → authorizer → Lambda → DynamoDB に 1 本送る
+- `call-api.sh` は 1 回の呼び出しで `terraform output` を 3 回実行し、Cognito にログインしてから 1 本だけ送る。1 本に数秒かかるので、数百〜数千人が 2 秒ごとにポーリングする負荷は作れない
+
+6-6 での役割分担: ユーザーの用意は Terraform（または別の方法）、ログインと並列のポーリングは k6（6-5 の `load-test-small.js` の宛先を AWS にした形）、`call-api.sh` は動作確認で 1 本叩く道具のまま。
+
+### Q. Cognito のテストユーザーは、メールの確認をしないと使えないのではないか
+
+**管理者用の API で作れば、メールを確認しなくてもログインできる。** Cognito はユーザーごとに 2 つの状態を別々に持つ。
+
+| 状態 | 意味 | ログインに必要か |
+|---|---|---|
+| ユーザーの状態（`UserStatus`: UNCONFIRMED / CONFIRMED など） | アカウントが有効か | 必要（CONFIRMED でないと `InitiateAuth` が失敗する） |
+| メールの確認済みフラグ（属性 `email_verified`） | メールアドレスの持ち主だと確かめたか | 不要（パスワードリセットのメール送信などで使われる） |
+
+メールのコードの入力は、UNCONFIRMED を CONFIRMED にする手段の 1 つにすぎない。
+
+- **`SignUp` → `AdminConfirmSignUp`**: コードなしで CONFIRMED にできる。ただし `SignUp` の時点で確認メールが送られる（`auto_verified_attributes = ["email"]` のため）。宛先が存在しない `example.com` でも送信は行われ、1 日の送信上限にも数えられる
+- **`AdminCreateUser`（`MessageAction = SUPPRESS`、`email_verified = true`）→ `AdminSetUserPassword`（`Permanent = true`）**: メールを一度も送らずに CONFIRMED のユーザーができる
+
+後者は Terraform の `aws_cognito_user.test` と同じ作り方（`message_action = "SUPPRESS"`、`email_verified = true`、`password` の指定）。`player1@example.com` はメールを受け取っていないのにログインでき、API も叩けている。
+
+### Q. 6-6 の k6（`load-test-large.js`）は `k6 run tests/load/load-test-large.js` だけで実行できるか
+
+**できない。先に AWS の認証情報を環境変数に入れる必要がある。** k6 は `~/.aws/credentials` のプロファイルを読まないため、`setup()` で Cognito の管理者用 API（`AdminCreateUser` など）に SigV4 署名するための `__ENV.AWS_ACCESS_KEY_ID` などが空になり、`sign()` が失敗する。
+
+```bash
+# Git Bash
+eval "$(aws configure export-credentials --format env)" && k6 run -q --vus 1 --iterations 1 --no-thresholds tests/load/load-test-large.js
+```
+
+```powershell
+# PowerShell
+aws configure export-credentials --format powershell | Invoke-Expression
+k6 run -q --vus 1 --iterations 1 --no-thresholds tests/load/load-test-large.js
+```
+
+- `aws configure export-credentials` は、AWS CLI が使っている認証情報（raidync-cli）を環境変数を設定する文の形で出す。`eval` / `Invoke-Expression` で実行するので、画面には出ない
+- `--vus 1 --iterations 1` はスクリプトの `scenarios` より優先される。付けないと `options` のとおり 1,000 VU で 3 分回る。`setup()` は回数の指定に関係なく最初に 1 回だけ実行される
+- `--no-thresholds` は、しきい値の判定を行わない（`setup()` だけを試している段階で `matched` の指標がまだ無いため）
+
+### Q. k6 の `setup()` で作ったテストユーザーは、どう後片付けするか
+
+**`teardown()` で消すことを基本にし、`setup()` の途中で失敗した場合はその場で消す。それでも残ったものは別の掃除スクリプトで一掃する（2026-11-15 決定）。**
+
+- `teardown(data)` は負荷の後に 1 回だけ動き、`setup()` の戻り値を受け取る。`setup()` が `runId` と `tokens` を返し、`teardown()` は `tokens.length` 人分の `${runId}+${i}@example.com` を `AdminDeleteUser` で消す
+- 削除の失敗は `throw` せず、ユーザー名をログに出して最後まで続ける（1 人の失敗で残り全員が残るのを防ぐ）。作成側（`setup()`）は失敗したら止める。失敗をどう扱うかは呼び出し側が決め、`callCognito` は署名して送るだけにする
+- k6 は **`setup()` が `throw` で終わると `teardown()` を呼ばない**。そのため、途中で失敗したときは `setup()` の中で、それまでに作ったユーザー（作成済みでログインに失敗した人も含む）を消してから改めて `throw` する（案 A）
+- ネットワーク断や k6 の強制終了など、それでも残るケースのために、`@example.com` のテストユーザーをまとめて消す掃除スクリプトを用意する（案 C）。Terraform 管理の `player1〜4` は対象から外す
+- 退けた案: 失敗時のログに `runId` を出して手で消すだけ（案 B）。数百人規模で途中失敗すると手作業が重い
+- 掃除スクリプトの対象の絞り方: メールアドレスの先頭に**負荷テスト用の固定の文字列**を付け、`list-users --filter 'email ^= "<固定の文字列>"'` で選ぶ。`runId`（作成時刻のミリ秒）の前方一致だけだと、「何回目の実行か」を知る必要があるうえ、短い前方一致（`1794` など）は「その時期に作った」という偶然の一致でしか当たらない。固定の文字列なら、テストユーザーであること自体で選べ、Terraform 管理の `player1〜4@example.com` に当たることもない
+- Cognito の `--filter` は完全一致（`=`）と前方一致（`^=`）だけで、部分一致はできない。そのため固定の文字列は先頭に置く
+- 名前の付け方を変える前に作った 9 人（`1794…@example.com`）は新しい付け方に当てはまらないので、一度だけ別に消す
+
+### Q. Git Bash で AWS CLI の出力をループに渡すと、値がおかしくなるのはなぜか
+
+**Windows の AWS CLI は `--output text` の行末を CRLF（`\r\n`）で出すため。** Bash の `for X in $LIST` は空白・タブ・`\n` で区切るので、`\r` が値の末尾に残る。`--username "xxx@example.com\r"` は Cognito のユーザー名の形式に合わず `InvalidParameterException` になる（`\r` なしなら見つかる。2026-11-15 に確認）。
+
+- 対処: `LIST=$(aws ... --output text | tr -d '\r')` のように、受け取る側で `\r` を消す。パイプ `|` は左の出力を右の入力に渡すので、`aws` の後に `tr` を置く
+- 引用符の違い: `'…'` はそのまま、`"…"` は中の `$変数` を展開、`` `…` `` は中身をコマンドとして実行する（`$( )` の古い形）。`` tr -d `\r` `` と書くと `r` というコマンドを実行しようとする
+- `--filter` に変数を入れるときは外側を `"`、内側を `\"` にする（`"email ^= \"$PREFIX\""`）
+- `.tf` の CRLF（ヒアドキュメントの値が変わり plan に偽の差分）と同じく、Windows 特有の改行の問題
+
+### Q. 6-6 の k6 で、4 人そろっているのにマッチが成立しないことがあるのはなぜか
+
+**`match_status` の競合のバグ。確保（`ClaimTickets`）の後の `MarkMatched` が、負けた側のトランザクションとぶつかって 500 になり、チケットが `MATCHING` のまま止まる（2026-11-15 に AWS dev で発見）。**
+
+- 4 VU がほぼ同時に `match/status` を送ると、複数の Lambda が同時に `TryMatch` を実行する
+- Lambda A が `ClaimTickets`（`TransactWriteItems`）で 4 枚を `WAITING → MATCHING` にした直後、Lambda B も同じ 4 枚に `ClaimTickets` を送る。B は条件不一致で最終的に失敗するが、判定中は「トランザクション進行中」になる
+- その間に A の `MarkMatched`（普通の `UpdateItem`）が届くと `TransactionConflictException: Transaction is ongoing for the item` で失敗し、A は 500 を返す
+- `MarkMatched` は 1 枚ずつ順に処理するので、ぶつかる前の分だけ MATCHED になる（4 人中 1 人だけ成立した回があった）
+- 残りは `MATCHING` のまま誰も進めない。`TryMatch` は `WAITING` 以外をそのまま返すだけで、`TIMEOUT` にもしない。クライアントは 70 秒待って諦め、`PutSession` 済みのセッションも宙に浮く
+- 楽観ロックは「2 人が同じチケットを確保する」ことは防げている。抜けていたのは「確保した後の書き込み」と「失敗したときに止まった状態を戻す・救う手段」
+- ローカル（LocalStack で 1 プロセス）では、ここまで同時に重ならないので出なかった
+- ぶつかるのは**書き込み同士**（A の `UpdateItem` と B の `TransactWriteItems`）。`GetItem` や `Query` の読み取りは、トランザクション中の項目でも `TransactionConflictException` にならない。失敗して止まるのは、先に確保して勝った A の方で、負けた B は `ErrConflict` として正常に WAITING を返す
+- B が確保済みのチケットを確保しに行くのは、読んだ時点で `WAITING` に見えたから。理由は、(1) A の確保より前に読み終えていた、(2) 読み取りが結果整合で古い値を返した、の 2 つ。`GetTicket` の `GetItem` は `ConsistentRead` を指定しておらず、`QueryWaitingByQuest` は GSI（`questId-status-index`）への Query で、**GSI は強い整合性の読み取りを選べない**
+- 4 VU で 3 回中 2 回発生。エラーログは `"msg":"match processing failed","status":500`、`ErrorKind=match_processing_failed`
+
+対応は後回しにし、k6 のスクリプトを先に仕上げる。人数を段階的に増やす前には直す（このままでは `matched: rate==1` が毎回失敗する）。
+
+対応の方針（2026-11-16 決定）:
+
+- **衝突したら自分で送り直す**（最初の 1 回＋送り直し 3 回）。AWS SDK for Go v2（v1.47.1）の自動リトライの対象に `TransactionConflictException` は入っていない（`aws/retry/standard.go` で確認。似た名前の `TransactionInProgressException` は対象だが、冪等性トークンの二重送信の例外で別物）。SDK の設定でリトライ対象に足すとクライアントのすべての操作に効くため、今回の箇所だけで送り直す
+- **MATCHED への書き込みを 1 つのトランザクションにまとめる**。今は 1 枚ずつ `UpdateItem` しているため「一部だけ MATCHED」の状態が生まれ、MATCHED を一度見たクライアントはポーリングをやめるので後から取り消せない。`ClaimTickets` と同じく `TransactWriteItems` にすれば、全員 MATCHED か誰もならないかのどちらかになる
+- **送り直しても失敗したら、グループ全員を `FAILED`（新しい状態）にする**。まとめて書くので、この時点で MATCHED の人はいない
+- 退けた案: 削除（クライアントには 404 にしか見えない）、`TIMEOUT`（「60 秒待っても揃わなかった」と意味が違う）、`WAITING` に戻す（作成済みのセッションと二重になる）
+- 実装の分担（2026-11-17）: `MarkMatched` は `db` 側で送り直す（`TransactionConflict` は DynamoDB の都合なので `db` が扱う）。衝突の見分けは `TransactionCanceledException` の `CancellationReasons` に `TransactionConflict` があるか。`ConditionalCheckFailed`（条件に合わない）は送り直しても通らないので、すぐ返す。4 回とも衝突したら新しい `db.ErrTransactionConflict` を返す（既存の `ErrConflict` は「条件に合わなかった」の意味で使われているので分ける）。待つ時間は 50 → 100 → 200ms の指数バックオフ
+- `FAILED` は `pkg/protocol` の `TicketStatus` に足す。`finalize` が `errors.Is(err, db.ErrTransactionConflict)` を見たら、グループ全員を `MATCHING → FAILED` にする（新しい `db` の関数）。`match/status` は 200 で `status: FAILED` を返し、クライアント（k6 も）は `FAILED` でポーリングをやめて出し直す
+- 宿題にしたもの（2026-11-17）: (1) `FAILED` にしたときの作成済みセッションの片付け（`PutSession` の `ACTIVE` レコードと GameLift のゲームセッション。GameLift の座席は誰も来なければ GameLift が解放する）、(2) `finalize` の途中で Lambda 自身がタイムアウト・クラッシュした場合に `MATCHING` で残るチケットの救済（例: `TryMatch` で `MATCHING` になってから一定時間たったものを `FAILED` にする。`MATCHING` になった時刻の属性が必要）。どちらも「失敗した後に残るものの掃除」なので、まとめて設計する。6-6 で人数を増やすのを止めているのは衝突の方で、こちらではない
+- 修正後の確認（2026-11-17、AWS dev、4 VU で 3 分）: `matched` 89.47%（76 回中 68 回）→ **100%（312 回中 312 回）**、`http_req_failed` 0.38%（2 本）→ **0%（658 本中 0 本）**、回せた回数は 76 → 312 回（成立しなかった回が 70 秒待たされなくなったため）。デプロイ後の `match_status` の呼び出し 330 回で ERROR は 0 件
+- ただし送り直しはログも指標も出していないため、「衝突して送り直しで解消した」のか「衝突が起きなかった」のかは区別できない（修正前の割合なら 78 ラウンドで 8 回前後は衝突したはず）。人数を増やす段階では、送り直しの回数を見える化する
+
+### Q. 送り直しの回数は、CloudWatch の指標にしないと分からないか
+
+**k6 で利用者から見た影響は分かるので、CloudWatch の指標までは作らない（2026-11-17 決定）。**
+
+| 知りたいこと | k6 で分かるか |
+|---|---|
+| 送り直しても解消しなかった衝突の数 | 分かる（`FAILED` が返った数。`matched` とは別に数えれば、`TIMEOUT` と分けられる） |
+| 送り直しで解消した衝突による遅れ | ある程度分かる（1 回あたり 50〜350ms 待つので、`match/status` の p95・最大値が伸びる） |
+| 衝突が何回起き、何回目の送り直しで通ったか | 分からない（解消した衝突は「少し遅い成功」にしか見えない） |
+
+- 負荷テストで確かめたいのは「利用者から見て問題が出るか」で、それは上の 2 行で足りる。3 行目は問題が出たときの原因調べの材料
+- 人数を増やして `FAILED` や遅れが出たら、そのときに `transactWithRetry` へ送り直しのログを 1 行足して Logs Insights で数える
+
+### Q. 6-6 の k6（最大 1,000 人）は、どこから実行するか
+
+**自分の PC から実行する（2026-11-18 決定）。** PC は 24 コア・32 スレッド、メモリ約 32 GB（空き約 16 GB）。
+
+| 項目 | 1,000 人での見積もり |
+|---|---|
+| 送る量 | 1 人が 2 秒ごとにポーリング → 毎秒約 500 リクエスト。k6 には軽い |
+| メモリ | 1 VU あたり 5〜10 MB → 5〜10 GB。署名ライブラリ（`signature.js`）を VU ごとに持つ分の幅がある |
+| 回線 | 1 リクエスト数 KB。家庭の回線で足りる |
+
+- 退けた案: EC2（東京）は Terraform 化と費用が要る。Grafana Cloud k6 は AWS のキーを外部に渡すことになる。PC で限界に達したら EC2 を考える
+- 進め方: 40 人で回している間にタスクマネージャーで k6 のメモリを測り、1 人あたりから 1,000 人の量を見積もってから 400 → 1,000 と進む。限界の目安は CPU の張り付き、メモリ不足、k6 の `dropped_iterations` や遅延の警告
+
+### Q. 6-6 で API Gateway の詳細メトリクス（エンドポイントごと）を有効にするか
+
+**有効にしない（2026-11-18 決定）。** エンドポイントと Lambda が 1 対 1 なので、エンドポイントごとの実行時間・エラー・スロットルは Lambda のメトリクスで分かれて見える。API 全体の件数・遅延・4XX・5XX は標準メトリクス（無料）、1 本の内訳は X-Ray で追える。詳細メトリクスで新しく分かるのは「エンドポイントごとの API Gateway 全体の遅延（authorizer を含む）と 4XX」だけで、6-6 で知りたい「どこが最初に限界に達するか」には要らない。
+
+- 費用の目安: メソッドごとに約 6 メトリクスのカスタムメトリクス（月 $0.30/個、時間割り）。6 エンドポイント × 2 リージョンで約 72 個 → 常時なら月約 $20、テストの数時間だけなら数セント
+
+### Q. 6-6 の負荷テストに、どのくらい費用がかかるか
+
+**1,000 人で 3 分の実行 1 回あたり、Cognito を除いて $1 未満。ただし Cognito の MAU が、実行の仕方次第で大きくなる（2026-11-18 見積もり）。**
+
+| サービス | 量（1 回あたり） | 目安 |
+|---|---|---|
+| API Gateway（REST） | 約 9 万リクエスト（毎秒約 500 × 180 秒） | 約 $0.4 |
+| Lambda | 約 18 万回（authorizer はキャッシュなしで毎回 ＋ 本体） | 約 $0.07（無料枠内の見込み） |
+| DynamoDB（オンデマンド） | 読み取り約 9 万単位 | 約 $0.02 |
+| CloudWatch Logs | 約 180 MB | 約 $0.15 |
+| X-Ray（spans） | 約 8 万 span（毎秒 1 件 + 5%） | 約 $0.06 |
+
+- Cognito（Essentials）は、その月に作成・パスワード変更・サインインなどをしたユーザーを 1 MAU と数える。月 10,000 MAU まで無料（期限なし）、超えると 1 人 $0.015。`AdminDeleteUser` で消しても、その月にサインインしていれば数えられると考えるのが安全（料金ページに削除の扱いの記載がない）
+- 毎回ユーザーを作って消す作りだと、1,000 人の実行 1 回で 1,000 MAU。月 8 回程度で無料枠に届き、20 回なら約 $150（月の予算アラート $200 に近い）
+- **決定: テストユーザーを使い回す（一度だけ作って残し、k6 は毎回ログインだけする）。** 何回実行しても月 1,000 MAU で済み、毎回 1,000 人を作る約 20 分もなくなる
+- 使い回すユーザーは、`scripts/` の作成スクリプトで作る（Terraform の `test_user_count` は使わない）。1,000 人を Terraform に載せると、普段の `terraform plan` のたびに 1 人ずつ状態確認が走って遅くなり、4 に戻すと消えて次のテストで作り直しになるため。テストユーザーはインフラではなくテストデータなので、Terraform の外で作っても IaC の方針に反しない（掃除スクリプトと同じ考え方）。k6 の `setup()` はログインだけにし、`teardown()` と `catch` の削除はやめる
+- 作成スクリプトは、すでにいるユーザーの**作成だけ**を飛ばし、パスワードの設定は毎回やり直す。作成後にパスワードの設定で止まった人は仮のパスワード（`FORCE_CHANGE_PASSWORD`）のまま残るが、次の実行で自然に直る。何回実行しても同じ状態にそろう（冪等）。存在の確認は `admin-get-user` の成功・失敗で行う（`if` の条件にしたコマンドは失敗しても `set -e` で止まらない）
+
+### Q. ユーザーを使い回す形にした k6 で、313 回中 1 回だけ MATCHED にならなかったのはなぜか
+
+**マッチの不具合ではなく、時間で区切るテストの終わり方が原因。** `constant-vus` は `duration` を過ぎると新しい iteration を始めないが、VU ごとに iteration の始まりは少しずつずれる。区切りの直前に 1 人だけ次のチケットを出すと、残りの 3 人はもう出さないので、その 1 人は相手がいないまま TIMEOUT になる（2026-11-18 の 4 VU・3 分の実行で確認）。
+
+- 根拠: matched 312 / 313（312 = 4 × 78 で、余りの 1 人だけが外れた）、matchFailed 0（衝突による FAILED ではない）、`iteration_duration max=1m2s`（待ち時間の上限まで待った）、全体 4m03s（3 分後にその 1 回を待った）
+- 前回の 312 / 312 は、区切りのタイミングがたまたまそろっただけ。人数を増やすと、ほぼ毎回余りが出る
+- **決定: 回数で区切る（`per-vu-iterations`）。** 全員が同じ回数だけ繰り返すので全体のチケット数が 4 の倍数になり、余りが出ない。しきい値は `matched rate==1` のまま厳しく保てる。しきい値をゆるめる案（本物の取りこぼしを見逃す）と、終わり際の TIMEOUT を別に数える案（判定が複雑）は採らない
+- 使い回しの効果: setup はログインだけになり数秒以内に終わった（前は 1 人あたり作成・パスワード設定・ログインの 3 回 Cognito を呼んでいた）
+
+### Q. k6 の実行で `-e ITERATIONS` を付けなくてよいのか
+
+**付けなければ既定値の 20 回になる**（`Number(__ENV.ITERATIONS || 20)`）。`VUS` の既定値 4 と同じ考え方で、普段の確認は付けずに実行し、回数を変えたいときだけ `-e ITERATIONS=50` のように渡す。
+
+- 全体の回数は `VUS × ITERATIONS`（4 VU なら 80、40 VU なら 800）。チケット数は VUS が 4 の倍数なら必ず 4 の倍数になるので、回数は何回でもよい
+- テストの長さはおおよそ `ITERATIONS × 1 回の時間`。1 回は 4 VU で約 2.2 秒だが、人数が増えてマッチや API が遅くなれば延びる
+- `maxDuration: '10m'` を超えると、残りの回数があっても打ち切られる。打ち切りで途中のチケットが余ると matched が 100% にならないので、長く回すときは `ITERATIONS` を減らすか `maxDuration` を延ばす
+
+### Q. 回数で区切ったのに、40 VU では 800 回中 2 回 MATCHED にならなかったのはなぜか
+
+**回数で区切って余りが出ないのは 4 VU のときだけだった。** 4 VU では 1 回のマッチで全員が同時に 1 回進むので、進み具合がそろったまま終わる。40 VU では 4 人組が毎回違う組み合わせでできるため、VU ごとに残りの回数に差が出る。全体のチケット数（800）は 4 の倍数でも、最後には**残りを持つ VU が 4 人より少なく**なり、1 人の VU は同時に 1 枚しかチケットを出せないので、相手がいないまま TIMEOUT を繰り返す（2026-11-18 の 40 VU × 20 回で確認。matchFailed 0、`iteration_duration max=1m1s`、本来 1 分程度のはずが全体 4 分）。
+
+- 終わり際の TIMEOUT は、テストの作りから必ず出る正常な動き。人数を増やしても、区切り方を変えても消えない
+- **決定: `matched` のしきい値を外して記録だけにし、不具合そのものにしきい値を置く。** `matchFailed rate==0`（衝突）、新設の「締め切りまで状態が終わらない」指標 `rate==0`（前回の競合バグは MATCHING のまま止まる形だった）、`http_req_failed rate==0`（5xx）
+- matched の正しさは `server/cmd/sessions` で、セッションの人数の合計が matched と一致するかで確かめる
+- `matched rate>0.99` のようなゆるいしきい値は採らない。1,000 VU で終わり際の TIMEOUT が何件出るか読めないため
+- 回数で区切る形（`per-vu-iterations`）はそのまま使う。全体の回数が決まり、結果を比べやすい
+
+### Q. k6 を 1,000 VU で動かすと、PC のメモリは足りるか
+
+**足りる見込み。** 40 VU で k6 のメモリは約 50 MB だった（タスクマネージャーで測定）。1 VU あたり約 1.25 MB として、1,000 VU で約 1.3 GB。k6 本体の分も 1 VU あたりに含めて計算しているので、多めの見積もり。PC の空きメモリは約 16 GB あり、十分に収まる。
+
+### Q. 400 VU で http_req_failed 0.25%・matchStuck 1 件になったのは、サーバーの問題か
+
+**サーバーの問題ではなく、PC から 400 本の接続を同時に作ったことが原因。** 2026-11-18 の 400 VU × 20 回で、失敗した 53 件はすべて最初の `match/request` だった。setup が終わった 95 秒時点で 400 VU が一斉に送り、約 50 件が k6 の既定のタイムアウト（60 秒）ちょうどの 155 秒で `request timeout`、1 件が `connection was forcibly closed` になった。
+
+- AWS 側は API Gateway の 4XX/5XX が 0、Lambda の Errors/Throttles が 0（同時実行は最大 62）、DynamoDB の throttle なし
+- チケットは 7,947 枚（= 8,000 − 53）。失敗したリクエストは Lambda まで届いておらず、チケットもできていない
+- 2 回目以降は k6 が接続を使い回す（keep-alive）ので、詰まるのは最初の一斉接続だけ
+- 経路のどこで止まったかは未確認。PC のアドレスが 10.45.x.x なので、プロバイダーの NAT（CGNAT）やルーターの、新しい接続の数・作る速さの上限に当たったと推測
+- matchStuck の 1 件は、サーバーでは MATCHED になっていた（MATCHED 7,944 に対し k6 の matched は 7,943）。ポーリングの応答が最大 24.4 秒かかる間に締め切りを過ぎ、k6 が受け取れなかった。二重マッチではない
+- **決定: 各 VU の最初の iteration だけ、VU の番号に応じて開始をずらす。** 本物のプレイヤーも同じ瞬間には押さない。`ramping-vus`（回数での区切りが使えなくなる）や、EC2 から実行する案（PC から実行する方針を変え、費用もかかる）は採らない
+- 結果（2026-11-19、間隔 0.05 秒）: 失敗 0 件、http_req_failed・matchFailed・matchStuck すべて 0%。チケット 8,000 枚（MATCHED 7,999、終わり際の TIMEOUT 1）、2,000 セッションで枠の合計 7,999 が一致（3 人の見切り発車が 1 つ）。`http_req_duration` p(95) は 217 ms → 173 ms に下がった
+
+### Q. 1,000 VU で http_req_failed 0.17%（121 件）・matchStuck 18 件になったのは、サーバーの問題か
+
+**サーバー側に不具合の跡はない（2026-11-19、questId load-test-1795087375429）。** API Gateway の 4XX/5XX・Lambda の Errors/Throttles・Lambda ログの ERROR はすべて 0、Lambda の同時実行は最大 38。4,948 セッションで枠の合計が k6 の matched（19,783）と一致し、止まったままのチケットもない（MATCHED 19,783、TIMEOUT 78）。
+
+- 失敗 121 件は、400 VU と同じくすべて最初の `match/request`。ただし開始を 0.05 秒ずつずらしても出た。`dial tcp ... connectex`（接続が作れない）・`forcibly closed`・`request timeout` が混ざり、時刻から逆算すると 300〜580 本目あたりから出始める。**作る速さではなく、同時に開いておける接続の数**に上限がある疑い（未確認）
+- matchStuck 18 件は、自分の新しいチケットを作っていない（139 人が 19 枚 = POST 失敗 121 + stuck 18）。`match/request` は同じプレイヤーの WAITING チケットがあればそれを返すので、k6 側でタイムアウトした POST がサーバーには届いてチケットができ、次の回にそれが返された可能性がある。ただし、それでもポーリングすればすぐ終わるはずで、70 秒終わらなかった理由は未確認（k6 が stuck の ticketId を記録していないため）
+- k6 の `unique time series` 警告は、ポーリングの URL に ticketId が入り URL ごとに別の指標になるため。人数に比例してメモリが増える
+- **次の手順:** ① k6 を失敗しても記録が残る形にする（`response.json()` の前に失敗を確かめる、stuck 時に ticketId と最後の state をログに出す、ポーリングに `name` タグを付ける）② 1,000 VU を再実行し、`PERIOD=0.1` でも試して「速さ」か「数」かを見分ける
+
+### Q. 1,000 VU の再実行で、matchStuck 21 件が出た。stuck のチケットは何だったのか
+
+**古いチケットが返されたのではなく、k6 の締め切りがサーバーの 60 秒より先に来ていた（2026-11-19、questId load-test-1795097165927）。** stuck のログは 21 件すべて `state=WAITING lastStatus=200` で、`age` は 16〜56 秒（70 秒未満）。チケットは iteration が始まったあとに作られていた。PC とサーバーの時計のずれは 1 秒未満と確認済み。
+
+- k6 の締め切り（70 秒）は POST の前から数えている。一方、サーバーの見切り（60 秒）はチケットができてから数える。新しい接続を作るのに時間がかかると（`http_req_duration` には接続時間が入らない）、その分だけ k6 の残り時間が減り、サーバーではまだ WAITING のまま k6 が諦める
+- 諦めたチケットは、次の回の POST でそのまま返される（同じプレイヤーの WAITING を使い回すため）。そのため、チケットは 19,971 枚 = POST 成功 19,992 − stuck 21。DynamoDB では、stuck のチケットが後から MATCHED や TIMEOUT になっていた
+- サーバーは問題なし: MATCHED 19,815 = k6 の matched、`cmd/sessions` は 4,954 セッションで OK、Lambda の Errors/Throttles は 0
+- POST の失敗は 121 件から 8 件に減った（PERIOD は同じ 0.05）。`unique time series` の警告は `name` タグで消えた
+- **次の手順:** k6 の締め切りを、サーバーが返す `expiresAt`（作成から 60 秒）を基準に数え直す
+
+### Q. 締め切りを POST の成功後から数えるようにして、1,000 VU はどうなったか
+
+**matchStuck は 0 になった（2026-11-19、questId load-test-1795099627591）。** 締め切りを POST が成功してから 70 秒にしたことで、サーバーの見切り（作成から 60 秒）より必ず 10 秒以上あとになる。PC の時計を使わず k6 の中の時刻どうしで比べるため、`expiresAt` を基準にする案より単純で、時計のずれにも左右されない。
+
+- サーバーは問題なし: チケット 19,978 枚 = POST 成功数（使い回しなし）、MATCHED 19,837 = k6 の matched、`cmd/sessions` は 4,960 セッションで OK、Lambda の Errors/Throttles は 0
+- 残る不合格は `http_req_failed` の 22 件（前回 8 件、前々回 121 件）。すべて最初の `match/request` で、時刻から逆算すると開始から 27〜40 秒後、つまり 540〜800 本目あたりの新しい接続で起きている。前々回の「300〜580 本目から」とあわせて、件数は回ごとにばらつく
+- **次の手順:** `PERIOD=0.1`（1 秒に 10 本）で実行し、失敗が始まる接続の本数が変わらなければ「同時に開いておける数」、消えるか遅れれば「作る速さ」の上限と判断する
+
+### Q. 6-6 の負荷テスト（k6、4〜1,000 VU）で出た問題を、一からまとめると
+
+**サーバーの不具合は 1 つ（マッチ確定の書き込みの衝突、a7f376a で修正済み）。それ以外は、k6 の測り方の問題と、PC 側の回線の問題だった。** 1,000 VU（questId load-test-1795099627591）で、サーバーの数字は k6 とすべて一致した。
+
+- **k6 の測り方（すべて修正済み）**
+  - 時間で区切ると、終わり際にあまった人が TIMEOUT になる → 回数で区切る（`per-vu-iterations`）。ただし 40 VU 以上では VU どうしの進み方がずれ、終わり際に 4 人そろわないので、`matched` は記録だけにして、しきい値は不具合そのもの（`http_req_failed` / `matchFailed` / `matchStuck`）にした
+  - 毎回テストユーザーを作ると Cognito の MAU が増える → 一度作って使い回す
+  - 失敗した応答に `response.json()` を呼ぶと例外で iteration が何も記録せずに消える → 先にステータスを確かめる
+  - `matchStuck` の条件が何度か間違っていた → 「終わりの状態（MATCHED / TIMEOUT / FAILED）にならなかった」で判定
+  - ポーリングの URL に ticketId が入り、指標が URL ごとに分かれた → `name` タグで 1 つにまとめる
+  - 締め切りを POST の前から数えていたため、接続が遅いとサーバーの見切り（60 秒）より先に k6 が諦めた → POST の成功後から数える
+- **PC 側の回線（未解決）**
+  - 一斉に接続すると最初の POST がタイムアウトする → 最初の iteration を VU ごとにずらして、400 VU では 0 件になった
+  - 1,000 VU では、ずらしても数百本目からの新しい接続で 8〜121 件失敗する。AWS には届いていない。「同時の数」か「作る速さ」かを `PERIOD=0.1` で見分ける
+
+### Q. PERIOD=0.1 で 1,000 VU を実行すると、POST の失敗はどうなったか
+
+**失敗は 0 件で、しきい値はすべて合格（2026-11-20、questId load-test-1795100680049）。** 接続を作る速さを 1 秒 20 本から 10 本に落としただけで、最終的に 1,000 本を同時に開いていても失敗しなかった。そのため、上限は「同時に開いておける数」ではなく「新しい接続を作る速さ」の側にあると判断した（PC から AWS までの経路のどこかで、1 秒 20 本前後が限界。0.05 秒では 3 回中 3 回失敗、0.1 秒では 1 回で 0 件）。
+
+- サーバーは問題なし: チケット 20,000 枚（MATCHED 19,872、TIMEOUT 128）、MATCHED = k6 の matched、`cmd/sessions` は 4,968 セッションで OK、Lambda の Errors/Throttles は 0、同時実行は最大 47
+- `http_req_duration` の最大も 24〜31 秒から 1.54 秒に下がった。遅いリクエストも、接続が詰まっていたことが原因だった
+- これはマッチメイキング API に 1,000 人が同時に並ぶ負荷（同時に約 250 セッション分）。プロジェクトの目標（同時 1,000 セッション = 4,000 接続）には、まだ 4 倍の開きがある
+
+### Q. 4,000 VU に向けて PERIOD で接続をずらすのは、この PC で動かすための直し方ではないか。本番でも同じように詰まるのではないか
+
+**PC で動かすための直し方で合っている。そして、それで問題ない。ただし「一斉に接続が来る」場面は、まだ測れていない（2026-11-20）。**
+
+- 失敗していたのは、最初の `match/request` が AWS に届かずにタイムアウトしたもの。チケットはできておらず、stuck とは別物（チケット数 = 送信数 − 失敗数、Lambda の Errors/Throttles は 0）
+- 上限は PC から AWS までの経路にある（PC のアドレスが 10.45.x.x なので、CGNAT かルーターが 1 つの送信元からの新しい接続を絞っていると推測）。本番の 4,000 人は 4,000 の家庭から 1 本ずつ接続するので、この上限には当たらない
+- 負荷テストでは、負荷をかける側をボトルネックにしてはいけない。PERIOD は負荷をかける側の制約を外すためのもので、性能をよく見せるためではない
+- **一方、本番でもメンテナンス明け・イベント開始・リージョン障害後の再接続では、数千人がほぼ同時に来る。** そのとき上限になりうるのは AWS 側（API Gateway のスロットリング: リージョンごとに既定 10,000 RPS・バースト 5,000、Lambda の同時実行 1,000、Cognito `InitiateAuth` のクォータ）。1 秒 10 本ずつ増やすテストでは、この場面は試せていない
+- 本番の対策はクライアントのリトライ（指数バックオフ + ジッター）。PERIOD のずらしが本番で担っている役割はこれ（Unity クライアントは未実装）
+- 4,000 VU を PC から出すテストで確かめられるのは「4,000 人が同時に並んだ状態に耐えるか」まで。「一斉に来たときに耐えるか」を確かめるには、負荷をかける側を複数の送信元に分ける必要がある（EC2 を複数台使うなど。以前「費用がかかるので採らない」とした判断の見直しになる）
+- 関連: 4,000 × 0.1 秒 = 400 秒のずらしでは、最初の方の VU が最後の VU が始まる前に 20 回を終えるため、同時 4,000 にならない。executor の選び方を見直す必要がある
+
+### Q. 1,000 VU の結果から 4,000 VU を推定するとき、4 倍では済まないものは何か
+
+**MatchmakingTickets の GSI `questId-status-index` が、4,000 VU では 1 パーティションキーあたりの上限を超える見込み（2026-11-20、1,000 VU の実測値から推定）。** k6 は全員が同じ `questId` で並ぶので、GSI への書き込みが 1 つのパーティションキーに集中する。
+
+- 実測（questId load-test-1795100680049、負荷は 00:08〜00:11 JST の約 4 分。`running (08m38.7s)` は setup のログインを含む）: GSI の `ConsumedWriteCapacityUnits` は最大の 1 分で 32,633 ≈ **544 WCU/秒**。`WriteThrottleEvents` は GSI・本体とも 0
+- 4 倍で約 2,200 WCU/秒。1 パーティションキーの上限 1,000 WCU/秒の約 2 倍
+- 実際はもっと厳しい: 544 は 1 分平均で、秒単位の山は高い。split for heat はソートキーの範囲で分けるが、ソートキー `status` は値が数種類しかないので効きにくい
+- 1 リクエスト最大 8 WCU。`ALL` 射影で項目が数 KB あり、`status`（GSI のソートキー）が変わると GSI では削除 + 追加の 2 回になる
+- GSI が throttle されると本体テーブルの書き込みも throttle される。`PutTicket` / `ClaimTickets` / `MarkMatched` が失敗し、マッチメイキングが止まる
+- 本体テーブルは最大 170,211/分（約 2,800 WCU/秒）と多いが、キーは `ticketId` でばらけるので集中しない（トランザクションは 2 倍で数えられる）
+- 本番でも、全員が同じイベントクエストに並ぶ場面では同じ集中が起こる。k6 だけの問題ではなく設計上の弱点
+- 4 倍でほぼ比例するもの: Lambda の同時実行（1,000 VU で最大 47 → 約 200。上限 1,000）
+- **決定: 6-6 では直さず、4,000 VU の推定に「既知の限界」として書く。** 直し方（パーティションキーの分散など）は宿題に回す（2026-11-20）
+
+### Q. Phase 6 の残りの宿題をどう仕分けたか
+
+**本番の正しさに関わる 3 つだけ直し、ほかは手を加えない（2026-11-20）。**
+
+- **直す**: ゲームサーバーが `/session/end` を呼ばない（Sessions が ACTIVE のまま溜まり MatchHistory も書かれない）／マッチ確定が FAILED になったとき、先に作ったゲームセッションと Sessions レコードが残る／Lambda が `ClaimTickets` の後に止まると、チケットが MATCHING のまま残る
+- **ポートフォリオで補う**: GSI のホットキー、一斉接続（バースト）、GameLift の UDP 負荷。`docs/load-test-results.md` §7 に既知の限界・未検証として書いてある
+- **スキップ**: GameLift のセカンダリ（us-east-1）での実機 E2E。フリートの起動に費用がかかり、同じ構成を ap-northeast-1 で確認済みのため
+- **手を加えない**: 確保の競合と finalize の直列書き込み（1,000 VU で問題なし）、`internal/handlers` のテスト、`build-lambdas.sh` の全再作成、IAM の index 権限の付けすぎ、`gofmt` の残り 1 件
+
+### Q. 止まったままの MATCHING は、止まっているのか正常に処理中なのか判断できないのではないか
+
+**今の情報だけでは判断できない。ただし、Lambda の寿命に上限があることを使えば、時間で判定できる（2026-11-20）。**
+
+- チケットには `status = MATCHING` と `version` しかなく、「別の Lambda が finalize 中」と「担当の Lambda が死んで止まった」は見た目が同じ
+- MATCHING にした Lambda は、finalize が終われば必ず MATCHED か FAILED に進める。そしてその Lambda はタイムアウト（30 秒、`terraform/modules/lambda/variables.tf`）を超えて動けない
+- よって **MATCHING になってから 30 秒 + 余裕を過ぎていれば、担当の Lambda はもういない**と言える。期限付きの担当権（リース）の考え方
+- そのために、`ClaimTickets` で MATCHING にするとき、その時刻も書く必要がある（今は `status` と `version` だけ）
+- 検討点: 余裕の秒数（Lambda 間の時計のずれ、書き込みの遅れ）。救済の後に、もとの Lambda の `MarkMatched` が遅れて届く場合（今の条件は `status = MATCHING` だけで `version` を見ていない）
+
+### Q. マッチ確定が途中で失敗したり、Lambda が途中で止まったりしたとき、残ったものをどう片付けるか
+
+**FAILED で終わったら同じ Lambda で片付け、止まった MATCHING はポーリングで見つけて FAILED にする。ゲームセッションの特定には `IdempotencyToken` を使う（2026-11-20 設計）。**
+
+- `ClaimTickets`: WAITING → MATCHING と同じ書き込みで、MATCHING になった時刻とトークン（UUID）を書く
+- `CreateGameSession`: トークンを `IdempotencyToken` に渡す。ゲームセッションの ID は `arn:aws:gamelift:<location>::gamesession/<fleet ID>/<トークン>` になり、`NormalizeGameSessionID` で取り出す sessionId がトークンそのものになる。同じトークンで送り直しても二重に作られない（トークンは終了後 30 日再利用不可、最大 48 文字）
+- `MarkMatched` / `MarkFailed`: 条件を `status = MATCHING` かつ確保時の version にし、version を上げる。**version は増やす一方**。戻すと A → B → A で条件付き書き込みが変化に気づけない（ABA 問題）
+- **MarkMatched が FAILED に終わった場合**: 誰も接続情報を受け取っていないので、同じ Lambda ですぐ片付ける。GameLift は `TerminateGameSession` の通常の終了（サーバーの `OnProcessTerminate` が動く）。Sessions は消さずに FAILED に書き換える（調査用に残す）
+- **Lambda が止まった場合**: MATCHING になってから 40 秒（Lambda のタイムアウト 30 秒 + 余裕 10 秒）過ぎたら、`match/status` のポーリングで見つけて FAILED にする。WAITING に戻しても `createdAt` から 60 秒を過ぎていてすぐ TIMEOUT になるので意味が薄い。トークンからゲームセッションを終わらせ、Sessions も FAILED にする
+- チケットに sessionId を書き足す案は採らない。書き込みが 1 回増え、既知の限界の GSI ホットキーを悪化させるため
+- `CreateGameSession` の後、何も書く前に止まった分は、ゲームサーバーが「誰も来なければ終える」で塞ぐ（ゲームサーバーが `/session/end` を呼ぶ宿題とまとめる）。その際 `/session/end` は ACTIVE のときだけ ENDED にし、FAILED を上書きしない
+- 影響: `SessionStatus` に FAILED を追加、`cmd/sessions` は FAILED を数えない、Lambda の IAM に `gamelift:TerminateGameSession`、`SessionProvider` に終了の処理（GameLift・スタブ・hub の 3 実装）
+
+### Q. MarkMatched が失敗したとき、片付けるのは誰か。救済と同時に走ったら二重に片付けないか
+
+**`MarkFailed`（条件 `status = MATCHING` かつ確保時の version）が通った 1 者だけが片付ける（2026-11-21 実装）。**
+
+- `MarkFailed` が通った＝その時点でグループの誰も MATCHED になっていない、の証明になる。`Interlocked.CompareExchange` で勝った側だけが処理するのと同じ考え方
+- 条件に合わなかった（`ErrConflict`）なら、別の誰か（遅れて通った自分の `MarkMatched`、または救済）がすでに状態を進めている。片付けずにチケットを読み直して、今の状態を返す
+- そのために `transactWithRetry` は、トランザクションが `ConditionalCheckFailed` で取り消されたときに `ErrConflict` を返すようにした（`TransactionConflict` を送り直しきれなかったときの `ErrTransactionConflict` とは分ける）
+- 片付け（`EndGameSession`・`FailSession`）が失敗しても、ログを残して FAILED を返す。チケットはもう FAILED なので、クライアントにエラーを返すと失敗を二重に伝えることになる
+
+### Q. `FailSession` が「行が無ければ何もしない」ようにしているのはなぜか
+
+**`UpdateItem` は行が無いと新しく作ってしまう（upsert）ため（2026-11-21）。**
+
+- 救済の対象には、`CreateGameSession` の後、Sessions の行を書く前に止まったものも含まれる。その場合、普通に `UpdateItem` すると `status` と `endedAt` だけの中身の無い行ができる
+- `ConditionExpression: attribute_exists(sessionId)` を付け、条件不一致は `nil` に変える。「行が無い」は片付けの目的を果たしている状態なので、エラーにしない
+
+### Q. 救済で、止まったチケットの仲間（同じグループ）をどう見つけるか
+
+**確保時のトークンで探す。`questId-status-index` で MATCHING を引き、`idempotencyToken` で絞る（2026-11-22 実装）。**
+
+- `FilterExpression` は読んだ後に掛かるので、`Limit` を付けると仲間を取りこぼす。`Limit` を付けず、ページを最後まで辿る（`NewQueryPaginator`）
+- 0 件なら、別の誰かがもう進めたということなので、読み直して今の状態を返す
+- GSI は結果整合なので、直前の書き込みが見えないことがある。40 秒のリースがその遅れを吸収する
+
+### Q. `/session/end` で、履歴の追記と ENDED への遷移を 1 つのトランザクションにしたのはなぜか
+
+**状態を読んでから書くまでの間に、救済が行を FAILED にする場合があるため（2026-11-23）。**
+
+- 以前の順番は「状態を読む → 履歴を 1 人ずつ書く → ENDED にする」。最後の書き込みに `status = ACTIVE` の条件を付けても、条件に負けたときには履歴がもう書かれている（遊んでいない試合の履歴が残る）
+- 順番を入れ替える案（先に ENDED → 履歴）は、途中で落ちると ENDED なのに履歴が欠け、再報告も 409 で弾かれて戻せない
+- `TransactWriteItems` で「Sessions の Update（条件 `status = ACTIVE`）＋ MatchHistory の Put × 人数」をまとめると、全部か無しかになる。落ちても何も書かれないので、報告し直せばやり直せる
+- 以前のコメントにあった「再報告で復旧できる」は、実は成り立っていなかった。`timestamp` が毎回 `time.Now()` なので、途中まで書けたプレイヤーの履歴が二重になるため
+- 条件に合わなければ `ErrConflict` → 409。`FailSession` と違って `nil` にしないのは、何も書いていないのに 200 を返すと嘘になるため
+- Sessions と MatchHistory は Global Tables。全部か無しかが保証されるのは書いたリージョンの中だけで、もう片方への複製は項目ごとにずれて届きうる
+
+### Q. ゲームセッションは、どんなときに終わるか
+
+**20 分の時間切れ、誰も来ないまま 40 秒、一度来てから全員が抜けたとき（2026-11-23）。**
+
+- 誰も来ない 40 秒: クライアントは 2 秒ごとのポーリングで MATCHED を受け取ってから UDP で接続するため、その遅れを見込んだ値。サーバーが一方的に見切るだけなので、`protocol` ではなく `game` の中の定数にした
+- 全員抜けた: すぐ終える。離脱の猶予は、`PruneIdle` の 10 秒（`PlayerIdleTimeoutMs`）がすでに持っている
+- 「いま 0 人」だけでは、まだ誰も来ていないのか、全員抜けたのか見分けられない。そこで `Session.everJoined`（一度でも誰かが接続したか。立てたら戻さない）を足した
+- 判定は時間切れから順に行う。誰も来ないまま 20 分も重なりうるが、どちらも ABANDONED で報告するので結果は変わらない
+- ローカルモードの固定セッション（`cmd/gameserver`）も、同じ条件で終わる。本番は「1 プロセス 1 セッション、終わったらプロセスも終わる」ので、ローカルだけ動きを変えるとずれを見落としやすい。試すたびにサーバーを起動し直す
+
+### Q. HTTP を知らない `game` パッケージから、どうやって `/session/end` を呼ぶか
+
+**Hub に `SessionEndObserver` を渡し、HTTP は `gameserver` の報告係が受け持つ（2026-11-23）。**
+
+- `PlayerObserver`（参加・離脱を GameLift Bridge に知らせる）と同じ形。C# の `event` に購読者を登録するイメージ
+- セッションを終える処理は `Hub.endSession` に集まっているので、通知先は Hub に持たせる。`EndMessage` が ok を返した 1 回だけ知らせるので、`Tick` と `End` が重なっても二重に報告しない
+- 通知は `Tick`（50ms ごとに全セッションを処理する）の中から呼ばれる。実装は待たせない、という取り決めにして、報告係はゴルーチンで HTTP を呼ぶ
+- 通知先は複数持てる（報告係と GameLift Bridge）。Bridge は Hub を受け取って後から作られるので、`AddSessionEndObserver` で後から足す。`mu` で守るので、Tick が動いていても足せる
+- マッチ確定の失敗で片付けるときも `Hub.End` → 報告になるが、行はもう FAILED なので 409 で何も書かれない
+
+### Q. 報告に失敗したらどうするか
+
+**5xx とネットワークの失敗だけ、1 → 2 秒あけて最大 3 回まで送り直す（2026-11-23）。**
+
+- 409（ENDED / FAILED）、404、そのほかの 4xx は、送り直しても結果が変わらないので、ログを残して終わる
+- `/session/end` は全部か無しかのトランザクションなので、送り直しても二重には書かれない
+- 1 回の HTTP は 20 秒まで。最悪、報告を待つのに 20 秒 × 3 回 + 3 秒かかる
+- 結果は `completed` だけ CLEAR、時間切れ・誰も来ない・全員抜けたは ABANDONED。ゲームにはまだ `completed` で終わる条件が無いので、今は常に ABANDONED になる
+
+### Q. GameLift で、セッションが終わった後のプロセスはどうなるか
+
+**受信ループを止め、報告を待ってから `ProcessEnding` を呼んで終わる（2026-11-23）。**
+
+- GameLift（SDK 5）は 1 プロセス 1 セッションが基本。プロセスが終わると、GameLift が新しいプロセスを立ち上げて次のセッションを受けられるようにする
+- Bridge の `OnSessionEnd` は `stop` を呼ぶだけ（Tick から呼ばれるので待たせない）
+- main での順番は「報告を待つ（`reporter.Wait`）→ `ProcessEnding` → ソケットを閉じる」。先に `ProcessEnding` を呼ぶと、GameLift がプロセスを片付け始め、送りかけの報告が強制終了で消えうる
+- マッチ確定の失敗で `TerminateGameSession`（`TriggerOnProcessTerminate`）を受けた場合は、以前からある `OnProcessTerminate` → stop の経路で終わる
+
+### Q. 結果の報告を、クライアントではなくゲームサーバーにしたのはなぜか。E2E はどう変わったか
+
+**クライアントの報告は、ゲームサーバーが報告できないあいだの仮の役だった。ゲームサーバーの経路を E2E で通すため、クライアントの報告を消した（2026-11-23）。**
+
+- 両方が報告すると、クライアントが先に CLEAR を報告し、ゲームサーバーの報告は毎回 409 になる。ゲームサーバーの報告係が働く経路を、一度も確かめられない
+- `cmd/client` は報告をやめ、今回のセッションが履歴に現れるまで最大 30 秒待つ。サーバー側で送信が止まって 10 秒 → 全員抜けた → 報告 → 履歴、の順に進む（実測: 送信をやめてから約 11 秒で履歴に ABANDONED が現れた）
+- localapi の同居ゲームサーバーも、自分自身の HTTP の `/session/end` に報告する。報告の受け手が自分なので、HTTP を止める前に送りかけの報告を待つ
+- 本番の改造クライアントが勝手に CLEAR を報告できない、という利点もある（ただし `/session/end` は認証なしのままで、既知のリスクとして残っている）
+
+### Q. AWS dev の実機で、A2/A3・B1 は想定どおりに動いたか
+
+**動いた。途中で、以前からあった不具合（`CreatePlayerSessions` が ACTIVATING で失敗する）が見つかり、送り直しで直した（2026-11-23）。**
+
+- **見つかった不具合**: Lambda は `CreateGameSession` の直後に `CreatePlayerSessions` を呼ぶ。managed EC2 では、その時点でゲームサーバーがまだ `ActivateGameSession` を呼んでおらず、`InvalidGameSessionStatusException: Players can only join ACTIVE game sessions (status=ACTIVATING)` で毎回失敗した。1 秒もかからず ACTIVE になる
+- **直し方**: そのエラーのときだけ、200ms から間隔を倍にして最大 6 回送り直す（`gamelift_provider.go` の `createPlayerSessions`）。`DescribeGameSessions` で ACTIVE を待つ案は IAM 権限が増えるので採らなかった。実機では 200ms 後の 1 回の送り直しで通った
+- **不具合が起きている間に確認できたこと**: 失敗は Sessions の行を書く前に起きる。チケットは MATCHING のまま残り、40 秒後の `match/status` で FAILED になり（A3）、ゲームセッションも TERMINATED になった。Sessions に中身の無い行は作られなかった（`FailSession` の `attribute_exists`）。別のセッションは、誰も接続しないまま 40 秒でゲームサーバーが自分から終わり、`/session/end` に報告した（B1-2・B1-4・B1-5）
+- **直した後の E2E**: マッチ → UDP でプレイ → 送信をやめて約 11 秒でセッションが終わる → ゲームサーバーが報告 → 履歴に ABANDONED。Sessions の行は ENDED、GameLift のゲームセッションも TERMINATED になった
+- **k6（フリートを止め、Lambda はスタブ）**: 40 VU × 5 回で matched 200/200、matchFailed・matchStuck 0、`cmd/sessions` は 50 セッションで一致
+- **apply の 1 回目の失敗**: 作ったばかりのビルド用 IAM ロールを GameLift が引き受けられなかった（IAM の伝播の遅れ）。2 回目の apply で通った
+- **フリートに報告先を渡す方法**: runtime configuration は環境変数を渡せないので、`parameters`（`start.sh` の第 1 引数）でそのリージョンの API の URL を渡す。`module.api_gateway.invoke_url` を使うと Stage → Lambda（`GAMELIFT_FLEET_ID`）→ フリートで参照が循環するため、REST API ID から URL を組み立てる
+
+### Q. 6-7（オートスケーリング）はどうしたか
+
+**費用がかかるため見送った（2026-11-23）。**
+
+- GameLift フリートはこのプロジェクトで唯一の時間課金リソースで、スケーリングを確かめるには、負荷をかけたまま複数台を起動し続ける必要がある
+- スケーリングの設定（spec の最小 1・最大 20）は Terraform に入れていない。k6 の負荷テストは Lambda のスタブで行っていて、GameLift の UDP 側の負荷は測っていない（`docs/load-test-results.md` §7 の既知の限界）

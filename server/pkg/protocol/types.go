@@ -19,7 +19,9 @@ const (
 // ---------------------------------------------------------------------------
 
 // TicketStatus はマッチメイキングチケットのライフサイクル状態。
-// 遷移: WAITING → MATCHING → MATCHED / TIMEOUT / CANCELLED
+// 遷移: WAITING → MATCHING → MATCHED / FAILED、WAITING → TIMEOUT / CANCELLED。
+// FAILED は、揃って確保したが MATCHED を書き込めなかった（トランザクションの衝突が解けなかった）状態。
+// TIMEOUT（60 秒待っても揃わなかった）とは原因が違うが、クライアントはどちらも match/request を出し直す。
 type TicketStatus string
 
 const (
@@ -28,6 +30,7 @@ const (
 	StatusMatched   TicketStatus = "MATCHED"   // セッション確定、接続情報あり
 	StatusTimeout   TicketStatus = "TIMEOUT"   // 60 秒経過で不成立
 	StatusCancelled TicketStatus = "CANCELLED" // クライアントがキャンセル
+	StatusFailed    TicketStatus = "FAILED"    // 確定の書き込みが衝突で失敗。出し直す
 )
 
 // ---------------------------------------------------------------------------
@@ -36,20 +39,22 @@ const (
 
 // Ticket は MatchmakingTickets テーブルの 1 項目（PK: ticketId）。
 type Ticket struct {
-	TicketID       string          `dynamodbav:"ticketId"       json:"ticketId"`
-	PlayerID       string          `dynamodbav:"playerId"       json:"playerId"`
-	QuestID        string          `dynamodbav:"questId"        json:"questId"`
-	PartyID        string          `dynamodbav:"partyId,omitempty" json:"partyId,omitempty"`
-	Status         TicketStatus    `dynamodbav:"status"         json:"status"`
-	Version        int             `dynamodbav:"version"        json:"version"` // 楽観ロック用
-	Region         string          `dynamodbav:"region"         json:"region"`
-	SoloAllowed    bool            `dynamodbav:"soloAllowed"    json:"soloAllowed"`
-	LatencyHint    int             `dynamodbav:"latencyHint,omitempty" json:"latencyHint,omitempty"` // ms
-	SessionID      string          `dynamodbav:"sessionId,omitempty"   json:"sessionId,omitempty"`
-	ConnectionInfo *ConnectionInfo `dynamodbav:"connectionInfo,omitempty" json:"connectionInfo,omitempty"`
-	CreatedAt      int64           `dynamodbav:"createdAt"      json:"createdAt"` // UnixTime ms
-	ExpiresAt      int64           `dynamodbav:"expiresAt"      json:"expiresAt"` // UnixTime ms
-	TTL            int64           `dynamodbav:"ttl"            json:"-"`         // UnixTime 秒（DynamoDB TTL 属性）
+	TicketID         string          `dynamodbav:"ticketId"       json:"ticketId"`
+	PlayerID         string          `dynamodbav:"playerId"       json:"playerId"`
+	QuestID          string          `dynamodbav:"questId"        json:"questId"`
+	PartyID          string          `dynamodbav:"partyId,omitempty" json:"partyId,omitempty"`
+	Status           TicketStatus    `dynamodbav:"status"         json:"status"`
+	Version          int             `dynamodbav:"version"        json:"version"` // 楽観ロック用
+	Region           string          `dynamodbav:"region"         json:"region"`
+	SoloAllowed      bool            `dynamodbav:"soloAllowed"    json:"soloAllowed"`
+	LatencyHint      int             `dynamodbav:"latencyHint,omitempty" json:"latencyHint,omitempty"` // ms
+	SessionID        string          `dynamodbav:"sessionId,omitempty"   json:"sessionId,omitempty"`
+	ConnectionInfo   *ConnectionInfo `dynamodbav:"connectionInfo,omitempty" json:"connectionInfo,omitempty"`
+	IdempotencyToken string          `dynamodbav:"idempotencyToken,omitempty" json:"-"`
+	CreatedAt        int64           `dynamodbav:"createdAt"      json:"createdAt"`                      // UnixTime ms
+	ExpiresAt        int64           `dynamodbav:"expiresAt"      json:"expiresAt"`                      // UnixTime ms
+	MatchingAt       int64           `dynamodbav:"matchingAt,omitempty"     json:"matchingAt,omitempty"` // UnixTime ms
+	TTL              int64           `dynamodbav:"ttl"            json:"-"`                              // UnixTime 秒（DynamoDB TTL 属性）
 }
 
 // Session は Sessions テーブルの 1 項目（PK: sessionId）。
@@ -70,6 +75,7 @@ type SessionStatus string
 const (
 	SessionActive SessionStatus = "ACTIVE" // 進行中
 	SessionEnded  SessionStatus = "ENDED"  // 終了済み
+	SessionFailed SessionStatus = "FAILED" // マッチの確定に失敗し、片付けたセッション
 )
 
 // Player は Players テーブルの 1 項目（PK: playerId）。

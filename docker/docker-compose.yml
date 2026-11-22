@@ -40,10 +40,15 @@ services:
       - mock-auth-gomod:/go/pkg/mod
       - mock-auth-gobuild:/root/.cache/go-build
 
+  jaeger:
+    image: jaegertracing/jaeger:2.22.0
+    container_name: raidync-jaeger
+    ports:
+      - "16686:16686"
+      - "4317:4317"
+      - "4318:4318"
+
 volumes:
   localstack-data:
   mock-auth-gomod:
   mock-auth-gobuild:
-    
-
-     

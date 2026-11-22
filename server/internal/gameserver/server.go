@@ -24,6 +24,7 @@ type Config struct {
 	QuestID         string   // ローカルモードの固定セッションのクエスト
 	Roster          []string // ローカルモードの参加許可プレイヤー
 	GameLiftEnabled bool     // true で GameLift がセッションを駆動（固定セッションを作らない）
+	SessionAPIURL   string   // /session/end を呼ぶ API のベース URL。空なら報告しない
 }
 
 // Server は UDP ゲームサーバー 1 プロセス。
@@ -33,7 +34,8 @@ type Server struct {
 }
 
 // New は設定に従って UDP をリッスンし、初期セッションを登録した Server を返す。
-func New(cfg Config) (*Server, error) {
+// hubOpts は Hub にそのまま渡す（セッション終了の通知先など）。
+func New(cfg Config, hubOpts ...game.HubOption) (*Server, error) {
 	udpAddr, err := net.ResolveUDPAddr("udp", cfg.BindAddr)
 	if err != nil {
 		return nil, err
@@ -43,7 +45,7 @@ func New(cfg Config) (*Server, error) {
 		return nil, err
 	}
 
-	hub := game.NewHub(&udpSender{conn: conn})
+	hub := game.NewHub(&udpSender{conn: conn}, hubOpts...)
 	// ローカルモードのみ固定セッションを登録する。
 	// GameLift モードでは OnStartGameSession コールバックで動的に作るのでここでは作らない。
 	if !cfg.GameLiftEnabled {
