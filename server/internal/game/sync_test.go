@@ -113,3 +113,44 @@ func TestHub_EndUnknownSessionIsNoop(t *testing.T) {
 	hub.End("ghost", 100)
 	assert.Equal(t, 0, hub.SessionCount(), "無い id では何も変わらない")
 }
+
+// fakeEndObserver は OnSessionEnd の呼び出しを記録するテスト用 SessionEndObserver。
+type fakeEndObserver struct {
+	calls []endCall
+}
+
+type endCall struct {
+	sessionID   string
+	reason      protocol.SessionEndReason
+	durationSec int
+}
+
+func (f *fakeEndObserver) OnSessionEnd(sessionID string, reason protocol.SessionEndReason, durationSec int) {
+	f.calls = append(f.calls, endCall{sessionID: sessionID, reason: reason, durationSec: durationSec})
+}
+
+func TestHub_NotifiesSessionEndAtTimeout(t *testing.T) {
+	obs := &fakeEndObserver{}
+	hub := NewHub(&fakeSender{}, WithSessionEndObserver(obs))
+	hub.Register(NewSession("sess-1", "quest-001", []string{"p1"}, 0))
+	require.NoError(t, hub.Route(moveMsg("sess-1", "p1", 1, protocol.Vector3{}, protocol.ActorIdle), addr(5001), maxSessionMs))
+
+	hub.Tick(maxSessionMs)
+
+	require.Len(t, obs.calls, 1)
+	assert.Equal(t, endCall{sessionID: "sess-1", reason: protocol.EndTimeout, durationSec: 1200}, obs.calls[0])
+}
+
+func TestHub_NotifiesSessionEndOnce(t *testing.T) {
+	obs := &fakeEndObserver{}
+	hub := NewHub(&fakeSender{}, WithSessionEndObserver(obs))
+	s := NewSession("sess-1", "quest-001", []string{"p1"}, 0)
+	hub.Register(s)
+
+	// Tick と End が同じセッションを続けて終わらせた場面を、endSession を 2 回呼んで作る
+	hub.endSession(s, protocol.EndAbandoned, 1_000)
+	hub.endSession(s, protocol.EndTimeout, 2_000)
+
+	require.Len(t, obs.calls, 1, "2 回目の終了では通知しない")
+	assert.Equal(t, protocol.EndAbandoned, obs.calls[0].reason)
+}

@@ -306,6 +306,13 @@ func (s *Session) PlayerCount() int {
 	return len(s.players)
 }
 
+// Duration はセッションを作ってから now までの経過時間を秒で返す（/session/end の durationSec に使う）。
+func (s *Session) Duration(now int64) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return int((now - s.createdAt) / 1000)
+}
+
 // Ended はセッションが終了済みかを返す。
 func (s *Session) Ended() bool {
 	s.mu.Lock()
