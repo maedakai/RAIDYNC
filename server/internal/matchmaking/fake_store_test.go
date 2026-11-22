@@ -14,7 +14,10 @@ type fakeStore struct {
 	sessions       map[string]*protocol.Session
 	claimErr       error // 設定時は ClaimTickets が常にこのエラーを返す（競合シミュレーション）
 	timeoutErr     error
-	markMatchedErr error // 設定時は MarkMatched が常にこのエラーを返す（送り直しても衝突した場合のシミュレーション）
+	markMatchedErr error  // 設定時は MarkMatched が常にこのエラーを返す（送り直しても衝突した場合のシミュレーション）
+	failSessionErr error  // 設定時は FailSession が常にこのエラーを返す（Sessions の更新が失敗した場合のシミュレーション）
+	markFailedErr  error  // 設定時は MarkFailed が常にこのエラーを返す（状態が分からない失敗のシミュレーション）
+	onMarkMatched  func() // 設定時は MarkMatched が markMatchedErr を返す直前に呼ぶ（書き込みが実は通っていた・救済で先に FAILED にされた場面を作る）
 }
 
 func newFakeStore() *fakeStore {
@@ -72,6 +75,9 @@ func (f *fakeStore) ClaimTickets(_ context.Context, tickets []protocol.Ticket, m
 
 func (f *fakeStore) MarkMatched(_ context.Context, tickets []protocol.Ticket, sessionID string, conn protocol.ConnectionInfo, playerSessions map[string]string) error {
 	if f.markMatchedErr != nil {
+		if f.onMarkMatched != nil {
+			f.onMarkMatched()
+		}
 		return f.markMatchedErr
 	}
 	for _, t := range tickets {
@@ -90,6 +96,9 @@ func (f *fakeStore) MarkMatched(_ context.Context, tickets []protocol.Ticket, se
 }
 
 func (f *fakeStore) MarkFailed(_ context.Context, tickets []protocol.Ticket) error {
+	if f.markFailedErr != nil {
+		return f.markFailedErr
+	}
 	for _, t := range tickets {
 		cur, ok := f.tickets[t.TicketID]
 		if !ok || cur.Status != protocol.StatusMatching || cur.Version != t.Version {
@@ -104,6 +113,16 @@ func (f *fakeStore) MarkFailed(_ context.Context, tickets []protocol.Ticket) err
 func (f *fakeStore) PutSession(_ context.Context, s protocol.Session) error {
 	sc := s
 	f.sessions[s.SessionID] = &sc
+	return nil
+}
+
+func (f *fakeStore) FailSession(_ context.Context, sessionID string, _ int64) error {
+	if f.failSessionErr != nil {
+		return f.failSessionErr
+	}
+	if s, ok := f.sessions[sessionID]; ok {
+		s.Status = protocol.SessionFailed
+	}
 	return nil
 }
 
@@ -122,8 +141,10 @@ func (f *fakeStore) TimeoutTicket(_ context.Context, ticketID string) error {
 // fakeSessionProvider は受け取った sessionId をそのまま返し、接続情報は固定の値を返す。
 // psid はプレイヤー毎に "ps-<playerID>" を採番する（本番の 1 プレイヤー 1 枠を模す）。
 type fakeSessionProvider struct {
-	conn  protocol.ConnectionInfo
-	calls int
+	conn     protocol.ConnectionInfo
+	calls    int
+	endedIDs []string // EndGameSession が呼ばれた sessionID の記録
+	endErr   error    // 設定時は EndGameSession がこのエラーを返す（記録はしてから返す）
 }
 
 func (f *fakeSessionProvider) CreateGameSession(_ context.Context, sessionID, _ string, playerIDs []string) (string, protocol.ConnectionInfo, map[string]string, error) {
@@ -136,7 +157,8 @@ func (f *fakeSessionProvider) CreateGameSession(_ context.Context, sessionID, _ 
 }
 
 func (f *fakeSessionProvider) EndGameSession(_ context.Context, sessionID string) error {
-	return nil
+	f.endedIDs = append(f.endedIDs, sessionID)
+	return f.endErr
 }
 
 func newFakeSessionProvider() *fakeSessionProvider {

@@ -75,6 +75,7 @@ type SessionStatus string
 const (
 	SessionActive SessionStatus = "ACTIVE" // 進行中
 	SessionEnded  SessionStatus = "ENDED"  // 終了済み
+	SessionFailed SessionStatus = "FAILED" // マッチの確定に失敗し、片付けたセッション
 )
 
 // Player は Players テーブルの 1 項目（PK: playerId）。

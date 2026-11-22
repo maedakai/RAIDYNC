@@ -173,7 +173,8 @@ func TestTryMatch_MarkMatchedConflictFails(t *testing.T) {
 	}
 	store.markMatchedErr = db.ErrTransactionConflict // 確保は成功したが、MATCHED の書き込みが衝突し続けた想定
 
-	m := newMatcherFor(store, newFakeSessionProvider(), 1500)
+	sessions := newFakeSessionProvider()
+	m := newMatcherFor(store, sessions, 1500)
 	got, err := m.TryMatch(context.Background(), "t1")
 	require.NoError(t, err)
 	assert.Equal(t, protocol.StatusFailed, got.Status)
@@ -182,6 +183,11 @@ func TestTryMatch_MarkMatchedConflictFails(t *testing.T) {
 	for _, id := range []string{"t1", "t2", "t3", "t4"} {
 		stored, _ := store.GetTicket(context.Background(), id)
 		assert.Equal(t, protocol.StatusFailed, stored.Status, id)
+	}
+	assert.Equal(t, []string{got.IdempotencyToken}, sessions.endedIDs)
+	require.Len(t, store.sessions, 1)
+	for _, s := range store.sessions {
+		assert.Equal(t, protocol.SessionFailed, s.Status, "片付けたので Failed になる")
 	}
 }
 
@@ -215,4 +221,108 @@ func TestTryMatch_PartyPreserved(t *testing.T) {
 func TestErrConflictIsDistinct(t *testing.T) {
 	assert.True(t, errors.Is(db.ErrConflict, db.ErrConflict))
 	assert.False(t, errors.Is(db.ErrConflict, ErrTicketNotFound))
+}
+
+// TestTryMatch_MarkMatchedLandedDespiteError は、MarkMatched がエラーを返したが書き込みは通っていた場合に、
+// 片付けをせず、読み直した MATCHED を本人に返すことを確認する。
+func TestTryMatch_MarkMatchedLandedDespiteError(t *testing.T) {
+	store := newFakeStore()
+	for i, id := range []string{"t1", "t2", "t3", "t4"} {
+		store.put(makeWaiting(id, "p"+id, "", int64(1000+i)))
+	}
+	store.markMatchedErr = errors.New("timeout") // 応答は失敗に見えた
+	store.onMarkMatched = func() {
+		// MarkMatched は実は通っていた: 4 枚とも MATCHED で version も進んでいる
+		for _, tk := range store.tickets {
+			tk.Status = protocol.StatusMatched
+			tk.Version++
+		}
+	}
+	sessions := newFakeSessionProvider()
+
+	m := newMatcherFor(store, sessions, 1500)
+	got, err := m.TryMatch(context.Background(), "t1")
+	require.NoError(t, err)
+
+	assert.Equal(t, protocol.StatusMatched, got.Status, "書き込みは通っていたので MATCHED")
+	assert.Empty(t, sessions.endedIDs, "MATCHED のセッションは終わらせない")
+	require.Len(t, store.sessions, 1)
+	for _, s := range store.sessions {
+		assert.Equal(t, protocol.SessionActive, s.Status, "片付けていないので ACTIVE のまま")
+	}
+}
+
+// TestTryMatch_MarkMatchedAfterRescue は、MarkMatched の前に救済でグループが FAILED にされていた場合に、
+// 片付けを救済した側に任せ、読み直した FAILED を本人に返すことを確認する。
+func TestTryMatch_MarkMatchedAfterRescue(t *testing.T) {
+	store := newFakeStore()
+	for i, id := range []string{"t1", "t2", "t3", "t4"} {
+		store.put(makeWaiting(id, "p"+id, "", int64(1000+i)))
+	}
+	store.markMatchedErr = db.ErrConflict
+	store.onMarkMatched = func() {
+		// 救済が先に走った: 4 枚とも FAILED で version も進んでいる
+		for _, tk := range store.tickets {
+			tk.Status = protocol.StatusFailed
+			tk.Version++
+		}
+	}
+	sessions := newFakeSessionProvider()
+
+	m := newMatcherFor(store, sessions, 1500)
+	got, err := m.TryMatch(context.Background(), "t1")
+	require.NoError(t, err)
+
+	assert.Equal(t, protocol.StatusFailed, got.Status, "救済で FAILED になっていた")
+	assert.Empty(t, sessions.endedIDs, "片付けは救済した側が担当する")
+	require.Len(t, store.sessions, 1)
+	for _, s := range store.sessions {
+		assert.Equal(t, protocol.SessionActive, s.Status, "この経路では片付けないので ACTIVE のまま")
+	}
+}
+
+// TestTryMatch_CleanupErrorsStillFail は、MarkFailed が通った後の片付け（EndGameSession / FailSession）が
+// 失敗しても、エラーを返さず本人に FAILED を返すことを確認する。
+func TestTryMatch_CleanupErrorsStillFail(t *testing.T) {
+	store := newFakeStore()
+	for i, id := range []string{"t1", "t2", "t3", "t4"} {
+		store.put(makeWaiting(id, "p"+id, "", int64(1000+i)))
+	}
+	store.markMatchedErr = db.ErrTransactionConflict
+	store.failSessionErr = errors.New("dynamodb unavailable")
+	sessions := newFakeSessionProvider()
+	sessions.endErr = errors.New("gamelift unavailable")
+
+	m := newMatcherFor(store, sessions, 1500)
+	got, err := m.TryMatch(context.Background(), "t1")
+	require.NoError(t, err, "片付けの失敗はログに残すだけ")
+
+	assert.Equal(t, protocol.StatusFailed, got.Status)
+	assert.Equal(t, []string{got.IdempotencyToken}, sessions.endedIDs, "終わらせようとはした")
+	require.Len(t, store.sessions, 1)
+	for _, s := range store.sessions {
+		assert.Equal(t, protocol.SessionActive, s.Status, "FailSession が失敗したので ACTIVE のまま")
+	}
+}
+
+// TestTryMatch_MarkFailedUnknownError は、MarkFailed が条件不一致以外のエラーになった場合に、
+// 状態が分からないので片付けず、エラーを返す（次のポーリングに任せる）ことを確認する。
+func TestTryMatch_MarkFailedUnknownError(t *testing.T) {
+	store := newFakeStore()
+	for i, id := range []string{"t1", "t2", "t3", "t4"} {
+		store.put(makeWaiting(id, "p"+id, "", int64(1000+i)))
+	}
+	store.markMatchedErr = db.ErrTransactionConflict
+	store.markFailedErr = errors.New("network error")
+	sessions := newFakeSessionProvider()
+
+	m := newMatcherFor(store, sessions, 1500)
+	_, err := m.TryMatch(context.Background(), "t1")
+	require.Error(t, err)
+
+	assert.Empty(t, sessions.endedIDs, "状態が分からないので片付けない")
+	require.Len(t, store.sessions, 1)
+	for _, s := range store.sessions {
+		assert.Equal(t, protocol.SessionActive, s.Status)
+	}
 }

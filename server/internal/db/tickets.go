@@ -152,6 +152,7 @@ func (c *Client) ClaimTickets(ctx context.Context, tickets []protocol.Ticket, ma
 // 接続情報を書き込む。接続情報は共通の conn に、各自の playerSessionId（playerSessions[playerId]）を
 // 差し込んだもの。1 人でも MATCHING でなければ誰も変わらない（一部だけ MATCHED を作らない）。
 // 衝突は transactWithRetry が送り直し、解けなければ ErrTransactionConflict を返す。
+// 1 人でも MATCHING でない・version が違う場合は ErrConflict を返す。
 func (c *Client) MarkMatched(ctx context.Context, tickets []protocol.Ticket, sessionID string, conn protocol.ConnectionInfo, playerSessions map[string]string) error {
 	writes := make([]ddbtypes.TransactWriteItem, 0, len(tickets))
 	for _, t := range tickets {
@@ -186,7 +187,8 @@ func (c *Client) MarkMatched(ctx context.Context, tickets []protocol.Ticket, ses
 }
 
 // MarkFailed は確保済み（MATCHING）のグループ全員を、1 つのトランザクションで FAILED に遷移する。
-// MarkMatched が ErrTransactionConflict で確定できなかったときに使う。条件と送り直しは MarkMatched と同じ。
+// MarkMatched が失敗したときに使う。条件と送り直し、返すエラーは MarkMatched と同じ。
+// 成功すれば、グループの誰も MATCHED になっていないことが確定する（片付けてよい根拠になる）。
 func (c *Client) MarkFailed(ctx context.Context, tickets []protocol.Ticket) error {
 	writes := make([]ddbtypes.TransactWriteItem, 0, len(tickets))
 	for _, t := range tickets {
@@ -265,6 +267,10 @@ func unmarshalTickets(items []map[string]ddbtypes.AttributeValue) ([]protocol.Ti
 // 同じ項目を処理中だったことを示すコード。SDK に定数が無いため文字列で持つ（綴りの誤りは静かに見逃しになる）。
 const cancellationReasonTransactionConflict = "TransactionConflict"
 
+// cancellationReasonConditionalCheckFailed は TransactionCanceledException の理由のうち、項目が条件式に
+// 合わなかったことを示すコード。綴りの扱いは cancellationReasonTransactionConflict と同じ。
+const cancellationReasonConditionalCheckFailed = "ConditionalCheckFailed"
+
 // isTransactionConflict は、トランザクションが別のトランザクションとの衝突で取り消されたかを判定する。
 // 少し待てば通る種類の失敗で、ConditionalCheckFailed（条件に合わない＝送り直しても通らない）とは区別する。
 // DynamoDB はトランザクション内の衝突を TransactionConflictException ではなく、
@@ -281,13 +287,27 @@ func isTransactionConflict(err error) bool {
 	return false
 }
 
+// isConditionFailed は、トランザクションが条件不一致（ConditionalCheckFailed）で取り消されたかを判定する。
+// 状態や version がすでに変わっていたことを示し、送り直しても通らない。
+func isConditionFailed(err error) bool {
+	var canceled *ddbtypes.TransactionCanceledException
+	if errors.As(err, &canceled) {
+		for _, r := range canceled.CancellationReasons {
+			if r.Code != nil && *r.Code == cancellationReasonConditionalCheckFailed {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // maxAttempts は transactWithRetry が送る回数の上限（最初の 1 回 + 送り直し 3 回）。
 const maxAttempts = 4
 
 // transactWithRetry は writes を 1 つのトランザクションで送り、衝突したときだけ送り直す。
 // 待つ時間は 50 → 100 → 200ms の指数バックオフ（相手のトランザクションは条件に合わず短時間で終わる）。
 // AWS SDK の自動リトライは TransactionConflict を対象にしていないため、ここで扱う。
-// 衝突以外のエラーはそのまま返し、最後まで衝突したら ErrTransactionConflict を返す。
+// 条件に合わなければ ErrConflict、最後まで衝突したら ErrTransactionConflict を返し、それ以外のエラーはそのまま返す。
 func (c *Client) transactWithRetry(ctx context.Context, writes []ddbtypes.TransactWriteItem) error {
 	_, err := c.ddb.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
 		TransactItems: writes,
@@ -302,11 +322,17 @@ func (c *Client) transactWithRetry(ctx context.Context, writes []ddbtypes.Transa
 				TransactItems: writes,
 			})
 		} else {
+			if isConditionFailed(err) {
+				return ErrConflict
+			}
 			return err
 		}
 	}
 	if isTransactionConflict(err) {
 		return ErrTransactionConflict
+	}
+	if isConditionFailed(err) {
+		return ErrConflict
 	}
 	return err
 }

@@ -5,6 +5,7 @@ package matchmaking
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"sort"
 	"time"
 
@@ -32,6 +33,7 @@ type Store interface {
 	MarkFailed(ctx context.Context, tickets []protocol.Ticket) error
 	PutSession(ctx context.Context, s protocol.Session) error
 	TimeoutTicket(ctx context.Context, ticketID string) error
+	FailSession(ctx context.Context, sessionID string, endedAt int64) error
 }
 
 // *db.Client が Store を満たすことをコンパイル時に保証する。
@@ -181,14 +183,31 @@ func (m *Matcher) finalize(ctx context.Context, self *protocol.Ticket, group []p
 	// 1 枚ずつ書くと途中で失敗したときに「一部だけ MATCHED」が残り、MATCHED を見た
 	// クライアントはポーリングをやめるので取り消せない。本人の playerSessionId は MarkMatched が配る。
 	if err := m.store.MarkMatched(ctx, group, sessionID, conn, playerSessions); err != nil {
-		if errors.Is(err, db.ErrTransactionConflict) {
-			if err := m.store.MarkFailed(ctx, group); err != nil {
-				return nil, err
+		ferr := m.store.MarkFailed(ctx, group)
+		if ferr == nil {
+			// MarkFailed が通った = 誰も MATCHED になっていないので、片付けてよい。
+			// 片付けの失敗はログに残して続ける（チケットはもう FAILED で、エラーを返しても送り直しにならない）。
+			if err := m.sessions.EndGameSession(ctx, sessionID); err != nil {
+				slog.ErrorContext(ctx, "end game session failed", "sessionId", sessionID, "error", err)
+			}
+			if err := m.store.FailSession(ctx, sessionID, m.nowMs()); err != nil {
+				slog.ErrorContext(ctx, "fail session record failed", "sessionId", sessionID, "error", err)
 			}
 			self.Status = protocol.StatusFailed
 			return self, nil
 		}
-		return nil, err
+		if errors.Is(ferr, db.ErrConflict) {
+			// 救済で FAILED にされたか、MarkMatched が実は通っていて MATCHED。片付けずに今の状態を返す。
+			cur, err := m.store.GetTicket(ctx, self.TicketID)
+			if err != nil {
+				return nil, err
+			}
+			if cur == nil {
+				return nil, ErrTicketNotFound
+			}
+			return cur, nil
+		}
+		return nil, ferr
 	}
 
 	selfConn := conn

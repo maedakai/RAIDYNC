@@ -59,6 +59,22 @@ func (c *Client) EndSession(ctx context.Context, sessionID string, endedAt int64
 	return err
 }
 
+// FailSession はセッションを FAILED に遷移し、片付けた時刻を endedAt に記録する。
+// マッチの確定に失敗し、ゲームセッションを終わらせたときに使う（ENDED と区別して残す）。
+func (c *Client) FailSession(ctx context.Context, sessionID string, endedAt int64) error {
+	_, err := c.ddb.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName:                aws.String(c.tables.Sessions),
+		Key:                      sessionKey(sessionID),
+		UpdateExpression:         aws.String("SET #s = :failed, endedAt = :t"),
+		ExpressionAttributeNames: map[string]string{"#s": "status"},
+		ExpressionAttributeValues: map[string]ddbtypes.AttributeValue{
+			":failed": &ddbtypes.AttributeValueMemberS{Value: string(protocol.SessionFailed)},
+			":t":      &ddbtypes.AttributeValueMemberN{Value: itoa64(endedAt)},
+		},
+	})
+	return err
+}
+
 func sessionKey(sessionID string) map[string]ddbtypes.AttributeValue {
 	return map[string]ddbtypes.AttributeValue{
 		"sessionId": &ddbtypes.AttributeValueMemberS{Value: sessionID},

@@ -206,7 +206,7 @@ func TestMarkMatched_NotAllMatching(t *testing.T) {
 	conn := protocol.ConnectionInfo{IPAddress: "127.0.0.1", Port: 7777}
 	err := c.MarkMatched(ctx, tickets, "sess-test", conn, playerSessions)
 	require.Error(t, err)
-	assert.False(t, errors.Is(err, db.ErrTransactionConflict), "expected a condition failure, not a transaction conflict: %v", err)
+	assert.ErrorIs(t, err, db.ErrConflict)
 
 	for i, tk := range tickets {
 		got, err := c.GetTicket(ctx, tk.TicketID)
@@ -299,7 +299,7 @@ func TestMarkMatched_LateAfterFailed(t *testing.T) {
 	// 遅れて届いた A の MarkMatched: 確保後の version のままなので弾かれる。送り直しの対象でもない。
 	err := c.MarkMatched(ctx, tickets, "sess-test", conn, playerSessions)
 	require.Error(t, err)
-	assert.False(t, errors.Is(err, db.ErrTransactionConflict), "expected a condition failure, not a transaction conflict: %v", err)
+	assert.ErrorIs(t, err, db.ErrConflict)
 	for _, tk := range tickets {
 		got, err := c.GetTicket(ctx, tk.TicketID)
 		require.NoError(t, err)
