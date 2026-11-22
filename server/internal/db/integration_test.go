@@ -385,3 +385,79 @@ func TestFailSession(t *testing.T) {
 		assert.Nil(t, got, "行が無ければ作らない（upsert しない）")
 	})
 }
+
+// TestEndSession は、ACTIVE のときだけ ENDED への遷移と履歴の追記がまとめて通り、
+// ACTIVE 以外では ErrConflict を返して何も書かない（履歴も残らない）ことを確認する。
+func TestEndSession(t *testing.T) {
+	c, ctx := setup(t)
+
+	// arrange は指定した状態のセッション行と、その 2 人分の履歴を用意する。
+	// プレイヤー ID は毎回新しく作り、ほかのテストや過去の実行の履歴と混ざらないようにする。
+	arrange := func(t *testing.T, status protocol.SessionStatus) (string, []protocol.MatchHistoryEntry, int64) {
+		t.Helper()
+		sessionID := uuid.NewString()
+		playerIDs := []string{"player-end-" + uuid.NewString(), "player-end-" + uuid.NewString()}
+		require.NoError(t, c.PutSession(ctx, protocol.Session{
+			SessionID: sessionID,
+			QuestID:   "quest-end-session",
+			PlayerIDs: playerIDs,
+			Status:    status,
+			CreatedAt: time.Now().UnixMilli(),
+		}))
+		endedAt := time.Now().UnixMilli()
+		entries := make([]protocol.MatchHistoryEntry, 0, len(playerIDs))
+		for _, pid := range playerIDs {
+			entries = append(entries, protocol.MatchHistoryEntry{
+				PlayerID:    pid,
+				Timestamp:   endedAt,
+				SessionID:   sessionID,
+				QuestID:     "quest-end-session",
+				Result:      protocol.ResultClear,
+				DurationSec: 600,
+			})
+		}
+		return sessionID, entries, endedAt
+	}
+
+	t.Run("active", func(t *testing.T) {
+		sessionID, entries, endedAt := arrange(t, protocol.SessionActive)
+
+		require.NoError(t, c.EndSession(ctx, sessionID, entries, endedAt))
+
+		got, err := c.GetSession(ctx, sessionID)
+		require.NoError(t, err)
+		require.NotNil(t, got)
+		assert.Equal(t, protocol.SessionEnded, got.Status)
+		assert.Equal(t, endedAt, got.EndedAt)
+		for _, e := range entries {
+			hist, err := c.QueryByPlayer(ctx, e.PlayerID, 10)
+			require.NoError(t, err)
+			require.Len(t, hist, 1, "1 人につき履歴が 1 件書かれる")
+			assert.Equal(t, sessionID, hist[0].SessionID)
+		}
+	})
+
+	t.Run("failed", func(t *testing.T) {
+		sessionID, entries, endedAt := arrange(t, protocol.SessionFailed)
+
+		err := c.EndSession(ctx, sessionID, entries, endedAt)
+		assert.ErrorIs(t, err, db.ErrConflict)
+
+		got, err := c.GetSession(ctx, sessionID)
+		require.NoError(t, err)
+		require.NotNil(t, got)
+		assert.Equal(t, protocol.SessionFailed, got.Status, "片付け済みの行は FAILED のまま")
+		for _, e := range entries {
+			hist, err := c.QueryByPlayer(ctx, e.PlayerID, 10)
+			require.NoError(t, err)
+			assert.Empty(t, hist, "遷移が通らなければ履歴も書かれない（全部か無しか）")
+		}
+	})
+
+	t.Run("ended", func(t *testing.T) {
+		sessionID, entries, endedAt := arrange(t, protocol.SessionEnded)
+
+		err := c.EndSession(ctx, sessionID, entries, endedAt)
+		assert.ErrorIs(t, err, db.ErrConflict, "二重の報告は弾く")
+	})
+}

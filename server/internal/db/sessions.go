@@ -45,19 +45,38 @@ func (c *Client) GetSession(ctx context.Context, sessionID string) (*protocol.Se
 	return &s, nil
 }
 
-// EndSession はセッションを ENDED に遷移し、終了時刻を記録する。
-func (c *Client) EndSession(ctx context.Context, sessionID string, endedAt int64) error {
-	_, err := c.ddb.UpdateItem(ctx, &dynamodb.UpdateItemInput{
-		TableName:                aws.String(c.tables.Sessions),
-		Key:                      sessionKey(sessionID),
-		UpdateExpression:         aws.String("SET #s = :ended, endedAt = :t"),
-		ExpressionAttributeNames: map[string]string{"#s": "status"},
-		ExpressionAttributeValues: map[string]ddbtypes.AttributeValue{
-			":ended": &ddbtypes.AttributeValueMemberS{Value: string(protocol.SessionEnded)},
-			":t":     &ddbtypes.AttributeValueMemberN{Value: itoa64(endedAt)},
+// EndSession はセッションを ENDED に遷移し、プレイヤー全員分のマッチ履歴を、1 つのトランザクションで書く。
+// 遷移は ACTIVE のときだけ行う。ENDED（二重の報告）や FAILED（片付け済み）なら ErrConflict を返し、履歴も書かない。
+// 途中で落ちても何も書かれないため、報告し直せばやり直せる。
+func (c *Client) EndSession(ctx context.Context, sessionID string, entries []protocol.MatchHistoryEntry, endedAt int64) error {
+	writes := make([]ddbtypes.TransactWriteItem, 0, len(entries)+1)
+	writes = append(writes, ddbtypes.TransactWriteItem{
+		Update: &ddbtypes.Update{
+			TableName:                aws.String(c.tables.Sessions),
+			Key:                      sessionKey(sessionID),
+			UpdateExpression:         aws.String("SET #s = :ended, endedAt = :t"),
+			ConditionExpression:      aws.String("#s = :active"),
+			ExpressionAttributeNames: map[string]string{"#s": "status"},
+			ExpressionAttributeValues: map[string]ddbtypes.AttributeValue{
+				":active": &ddbtypes.AttributeValueMemberS{Value: string(protocol.SessionActive)},
+				":ended":  &ddbtypes.AttributeValueMemberS{Value: string(protocol.SessionEnded)},
+				":t":      &ddbtypes.AttributeValueMemberN{Value: itoa64(endedAt)},
+			},
 		},
 	})
-	return err
+	for _, e := range entries {
+		item, err := attributevalue.MarshalMap(e)
+		if err != nil {
+			return fmt.Errorf("marshal history entry: %w", err)
+		}
+		writes = append(writes, ddbtypes.TransactWriteItem{
+			Put: &ddbtypes.Put{
+				TableName: aws.String(c.tables.MatchHistory),
+				Item:      item,
+			},
+		})
+	}
+	return c.transactWithRetry(ctx, writes)
 }
 
 // FailSession はセッションを FAILED に遷移し、片付けた時刻を endedAt に記録する。
