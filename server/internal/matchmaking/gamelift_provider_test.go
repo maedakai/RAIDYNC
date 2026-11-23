@@ -72,7 +72,7 @@ func TestGameLiftProvider_CreateGameSession(t *testing.T) {
 	}
 	p := NewGameLiftProvider(fake, "fleet-123", "custom-raidync-local", "ap-northeast-1")
 
-	sessionID, conn, psids, err := p.CreateGameSession(context.Background(), "tok-1", "quest-rathalos", []string{"p1", "p2"})
+	sessionID, conn, psids, err := p.CreateGameSession(context.Background(), "tok-1", "quest-001", []string{"p1", "p2"})
 	require.NoError(t, err)
 
 	// 出力: 共通接続先（psid 空）＋ プレイヤー毎の psid
@@ -86,7 +86,7 @@ func TestGameLiftProvider_CreateGameSession(t *testing.T) {
 	require.NotNil(t, fake.gsIn)
 	assert.Equal(t, "fleet-123", aws.ToString(fake.gsIn.FleetId))
 	assert.Equal(t, "custom-raidync-local", aws.ToString(fake.gsIn.Location))
-	assert.Equal(t, map[string]string{"questId": "quest-rathalos", "playerIds": "p1,p2"}, gamePropsToMap(fake.gsIn.GameProperties))
+	assert.Equal(t, map[string]string{"questId": "quest-001", "playerIds": "p1,p2"}, gamePropsToMap(fake.gsIn.GameProperties))
 	assert.Equal(t, "tok-1", aws.ToString(fake.gsIn.IdempotencyToken))
 	// CreatePlayerSessions に roster がそのまま渡ること
 	require.NotNil(t, fake.psIn)
