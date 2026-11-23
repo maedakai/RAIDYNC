@@ -1,0 +1,69 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="350" viewBox="0 0 720 350" role="img" aria-labelledby="t d">
+<title id="t">上限に対する使用率</title>
+<desc id="d">Lambda 同時実行、API Gateway RPS、GSI 書き込みの、1,000 VU 実測と 4,000 VU 推定の上限比</desc>
+<style>
+  svg { font-family: system-ui, -apple-system, 'Segoe UI', 'Hiragino Sans', 'Yu Gothic UI', Meiryo, sans-serif; }
+  .surface { fill: #fcfcfb; }
+  .t1 { fill: #0b0b0b; }
+  .t2 { fill: #52514e; }
+  .muted { fill: #898781; }
+  .grid { stroke: #e1e0d9; stroke-width: 1; }
+  .axis { stroke: #c3c2b7; stroke-width: 1; }
+  .ref { stroke: #52514e; stroke-width: 1.5; }
+  .s1 { fill: #2a78d6; } .s1l { stroke: #2a78d6; }
+  .s2 { fill: #eb6834; } .s2l { stroke: #eb6834; }
+  .ring { stroke: #fcfcfb; stroke-width: 2; }
+  @media (prefers-color-scheme: dark) {
+    .surface { fill: #1a1a19; }
+    .t1 { fill: #ffffff; }
+    .t2 { fill: #c3c2b7; }
+    .grid { stroke: #2c2c2a; }
+    .axis { stroke: #383835; }
+    .ref { stroke: #c3c2b7; }
+    .s1 { fill: #3987e5; } .s1l { stroke: #3987e5; }
+    .s2 { fill: #d95926; } .s2l { stroke: #d95926; }
+    .ring { stroke: #1a1a19; }
+  }
+</style>
+<rect class="surface" width="720" height="350" rx="8"/>
+<text x="24.0" y="34.0" class="t1" font-size="16" text-anchor="start" font-weight="600">上限に対する使用率（1,000 VU 実測と 4,000 VU 推定）</text>
+<text x="24.0" y="54.0" class="t2" font-size="12" text-anchor="start" font-weight="400">4,000 VU では GSI の書き込みだけが 1 パーティションキーの上限を超える見込み</text>
+<rect class="s1" x="24" y="64" width="12" height="12" rx="2"/>
+<text x="42.0" y="75.0" class="t2" font-size="12" text-anchor="start" font-weight="400">1,000 VU 実測</text>
+<rect class="s2" x="129" y="64" width="12" height="12" rx="2"/>
+<text x="147.0" y="75.0" class="t2" font-size="12" text-anchor="start" font-weight="400">4,000 VU 推定（×4）</text>
+<line class="grid" x1="190.0" x2="190.0" y1="104" y2="296"/>
+<text x="190.0" y="312.0" class="muted" font-size="11" text-anchor="middle" font-weight="400">0%</text>
+<line class="grid" x1="278.0" x2="278.0" y1="104" y2="296"/>
+<text x="278.0" y="312.0" class="muted" font-size="11" text-anchor="middle" font-weight="400">50%</text>
+<line class="grid" x1="366.0" x2="366.0" y1="104" y2="296"/>
+<text x="366.0" y="312.0" class="muted" font-size="11" text-anchor="middle" font-weight="400">100%</text>
+<line class="grid" x1="454.0" x2="454.0" y1="104" y2="296"/>
+<text x="454.0" y="312.0" class="muted" font-size="11" text-anchor="middle" font-weight="400">150%</text>
+<line class="grid" x1="542.0" x2="542.0" y1="104" y2="296"/>
+<text x="542.0" y="312.0" class="muted" font-size="11" text-anchor="middle" font-weight="400">200%</text>
+<line class="grid" x1="630.0" x2="630.0" y1="104" y2="296"/>
+<text x="630.0" y="312.0" class="muted" font-size="11" text-anchor="middle" font-weight="400">250%</text>
+<text x="178.0" y="142.0" class="t1" font-size="12" text-anchor="end" font-weight="600">Lambda 同時実行</text>
+<text x="178.0" y="158.0" class="muted" font-size="11" text-anchor="end" font-weight="400">上限 1,000</text>
+<path class="s1" d="M190.0,120.0 H194.3 Q198.3,120.0 198.3,124.0 V134.0 Q198.3,138.0 194.3,138.0 H190.0 Z"/>
+<text x="204.3" y="133.0" class="t1" font-size="11" text-anchor="start" font-weight="600">5%（47）</text>
+<path class="s2" d="M190.0,142.0 H219.1 Q223.1,142.0 223.1,146.0 V156.0 Q223.1,160.0 219.1,160.0 H190.0 Z"/>
+<text x="229.1" y="155.0" class="t1" font-size="11" text-anchor="start" font-weight="600">19%（188）</text>
+<text x="178.0" y="204.0" class="t1" font-size="12" text-anchor="end" font-weight="600">API Gateway（RPS）</text>
+<text x="178.0" y="220.0" class="muted" font-size="11" text-anchor="end" font-weight="400">上限 10,000</text>
+<path class="s1" d="M190.0,182.0 H194.5 Q198.5,182.0 198.5,186.0 V196.0 Q198.5,200.0 194.5,200.0 H190.0 Z"/>
+<text x="204.5" y="195.0" class="t1" font-size="11" text-anchor="start" font-weight="600">5%（486）</text>
+<path class="s2" d="M190.0,204.0 H220.2 Q224.2,204.0 224.2,208.0 V218.0 Q224.2,222.0 220.2,222.0 H190.0 Z"/>
+<text x="230.2" y="217.0" class="t1" font-size="11" text-anchor="start" font-weight="600">19%（1,943）</text>
+<text x="178.0" y="266.0" class="t1" font-size="12" text-anchor="end" font-weight="600">GSI 書き込み（WCU/秒）</text>
+<text x="178.0" y="282.0" class="muted" font-size="11" text-anchor="end" font-weight="400">上限 1,000</text>
+<path class="s1" d="M190.0,244.0 H281.7 Q285.7,244.0 285.7,248.0 V258.0 Q285.7,262.0 281.7,262.0 H190.0 Z"/>
+<text x="291.7" y="257.0" class="t1" font-size="11" text-anchor="start" font-weight="600">54%（544）</text>
+<path class="s2" d="M190.0,266.0 H568.9 Q572.9,266.0 572.9,270.0 V280.0 Q572.9,284.0 568.9,284.0 H190.0 Z"/>
+<text x="578.9" y="279.0" class="t1" font-size="11" text-anchor="start" font-weight="600">218%（2,176）</text>
+<line class="ref" x1="366.0" x2="366.0" y1="100" y2="298"/>
+<text x="370.0" y="98.0" class="t2" font-size="11" text-anchor="start" font-weight="400">上限（100%）</text>
+<line class="axis" x1="190" x2="190" y1="104" y2="296"/>
+<text x="24.0" y="336.0" class="muted" font-size="11" text-anchor="start" font-weight="400">1,000 VU は最も負荷の高い 1 分間の値。4,000 VU は単純に 4 倍した推定（実測していない）。</text>
+</svg>

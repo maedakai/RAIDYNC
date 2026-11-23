@@ -25,6 +25,8 @@ IAM ユーザーを作る前に、ルートで最低限これだけ済ませて�
 
 ## ステップ1: 権限ポリシーを作成
 
+> **AWS dev 環境（`terraform/environments/dev`）をデプロイする場合**は、下のポリシーではなく [`terraform/bootstrap/raidync-cli-deploy-policy.json`](../terraform/bootstrap/raidync-cli-deploy-policy.json) を貼り付ける。中の `<ACCOUNT_ID>` は自分の AWS アカウント ID に置き換える。下のポリシーは GameLift Anywhere の検証だけに絞った、最初の版。
+
 ポートフォリオとしては**最小権限**が好印象なので、`gamelift:*` ではなくスコープしたカスタムポリシーを作る。
 
 1. IAM コンソール → 左メニュー **ポリシー** → **ポリシーの作成**
