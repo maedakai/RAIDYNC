@@ -149,17 +149,22 @@ k6 は全員が同じ `questId` で並ぶため、GSI `questId-status-index` へ
 ## 9. 実行方法
 
 ```bash
+TF="terraform -chdir=terraform/environments/dev"
+export COGNITO_USER_POOL_ID=$($TF output -raw cognito_user_pool_id)
+export LOAD_TEST_PASSWORD='<プールのポリシーを満たすパスワード>'   # リポジトリには書かない
+
 # テストユーザーを作る（冪等。既存のユーザーはパスワードだけ再設定）
 ./scripts/create-load-test-users.sh 1000
 
 # 実行
-k6 run -e VUS=1000 -e API_URL="$(terraform -chdir=terraform/environments/dev output -raw api_invoke_url)" tests/load/load-test-large.js
+k6 run -e VUS=1000 -e API_URL="$($TF output -raw api_invoke_url)"   -e COGNITO_CLIENT_ID="$($TF output -raw cognito_client_id)" -e PASSWORD="$LOAD_TEST_PASSWORD"   tests/load/load-test-large.js
 
 # マッチの正しさを確かめる
 cd server && go run ./cmd/sessions -questID <questId> -matched <MATCHED の数>
 ```
 
-- 環境変数: `VUS`（4 の倍数、既定 4）、`ITERATIONS`（既定 20）、`PERIOD`（既定 0.1）
+- 環境変数: `API_URL`・`COGNITO_CLIENT_ID`・`PASSWORD`（必須）、`VUS`（4 の倍数、既定 4）、`ITERATIONS`（既定 20）、`PERIOD`（既定 0.1）
+- 終わったらテストユーザーは `./scripts/cleanup-load-test-users.sh` で消せる（同じ `COGNITO_USER_POOL_ID` を設定して実行）
 - 1,000 VU では k6 のメモリが約 2 GB になる
 
 ### グラフの作り直し方

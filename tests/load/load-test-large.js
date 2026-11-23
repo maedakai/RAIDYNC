@@ -4,9 +4,11 @@ import exec from 'k6/execution';
 import{Rate} from 'k6/metrics';
 
 const VUS =  Number(__ENV.VUS || 4);
-// テストユーザー共通のパスワード。プールのポリシー（8 文字以上・大文字・小文字・数字・記号）を満たす値にする。
-// scripts/create-load-test-users.sh が設定した値で、InitiateAuth のログインに使う。変えるときは両方を揃える。
-const PASSWORD = 'LoadTest#2026';
+// テストユーザー共通のパスワード。scripts/create-load-test-users.sh に LOAD_TEST_PASSWORD で渡した値と同じにする。
+// リポジトリに書かないため、環境変数で渡す（-e PASSWORD=...）。
+const PASSWORD = __ENV.PASSWORD;
+// ログインに使う Cognito のアプリクライアント ID（terraform output -raw cognito_client_id）。
+const CLIENT_ID = __ENV.COGNITO_CLIENT_ID;
 // テストユーザーのメールアドレスの先頭に付ける固定の文字列（k6run+<連番>@example.com）。
 // ユーザーは scripts/create-load-test-users.sh で一度だけ作って使い回す（毎回作ると Cognito の MAU が増えるため）。
 // 作成スクリプトと掃除スクリプト（cleanup-load-test-users.sh）も同じ値を使うので、変えるときは揃える。
@@ -42,6 +44,9 @@ export function setup() {
     if(!API_URL){
         throw new Error('API_URL environment variable is not set');
     }
+    if(!PASSWORD || !CLIENT_ID){
+        throw new Error('PASSWORD and COGNITO_CLIENT_ID environment variables must be set');
+    }
     // 4 人組でマッチするので、4 の倍数でないと全体のチケット数が割り切れない
     if(VUS%4!==0){
         throw new Error(`VUS is not a Multiples of 4 (got ${VUS})`)
@@ -55,7 +60,7 @@ export function setup() {
             const username = `${PREFIX}${i}@example.com`;
             const body = JSON.stringify({
                 AuthFlow: 'USER_PASSWORD_AUTH',
-                ClientId: '2i3d508aqfla13dmksip64s5sv',
+                ClientId: CLIENT_ID,
                 AuthParameters: {
                     USERNAME: username,
                     PASSWORD: PASSWORD
