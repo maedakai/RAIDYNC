@@ -1,0 +1,141 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="860" height="540" viewBox="0 0 860 540" role="img" aria-labelledby="t d">
+<title id="t">1,000 VU 実行中の 1 分ごとの推移</title>
+<desc id="d">API リクエスト数、Lambda 同時実行数、API 応答時間 p95、マッチ待ち時間 p50/p95 の 5 分間の推移</desc>
+<style>
+  svg { font-family: system-ui, -apple-system, 'Segoe UI', 'Hiragino Sans', 'Yu Gothic UI', Meiryo, sans-serif; }
+  .surface { fill: #fcfcfb; }
+  .t1 { fill: #0b0b0b; }
+  .t2 { fill: #52514e; }
+  .muted { fill: #898781; }
+  .grid { stroke: #e1e0d9; stroke-width: 1; }
+  .axis { stroke: #c3c2b7; stroke-width: 1; }
+  .ref { stroke: #52514e; stroke-width: 1.5; }
+  .s1 { fill: #2a78d6; } .s1l { stroke: #2a78d6; }
+  .s2 { fill: #eb6834; } .s2l { stroke: #eb6834; }
+  .ring { stroke: #fcfcfb; stroke-width: 2; }
+  @media (prefers-color-scheme: dark) {
+    .surface { fill: #1a1a19; }
+    .t1 { fill: #ffffff; }
+    .t2 { fill: #c3c2b7; }
+    .grid { stroke: #2c2c2a; }
+    .axis { stroke: #383835; }
+    .ref { stroke: #c3c2b7; }
+    .s1 { fill: #3987e5; } .s1l { stroke: #3987e5; }
+    .s2 { fill: #d95926; } .s2l { stroke: #d95926; }
+    .ring { stroke: #1a1a19; }
+  }
+</style>
+<rect class="surface" width="860" height="540" rx="8"/>
+<text x="24.0" y="34.0" class="t1" font-size="16" text-anchor="start" font-weight="600">1,000 VU 実行中の 1 分ごとの推移（2026-11-20 JST）</text>
+<text x="24.0" y="54.0" class="t2" font-size="12" text-anchor="start" font-weight="400">負荷が最も高い 00:10 に待ち時間が最も伸びる一方、API の応答時間は横ばい</text>
+<text x="24.0" y="90.0" class="t1" font-size="13" text-anchor="start" font-weight="600">API リクエスト数（件/分）</text>
+<line class="grid" x1="76" x2="384" y1="258.0" y2="258.0"/>
+<text x="70.0" y="262.0" class="muted" font-size="11" text-anchor="end" font-weight="400">0</text>
+<line class="grid" x1="76" x2="384" y1="221.0" y2="221.0"/>
+<text x="70.0" y="225.0" class="muted" font-size="11" text-anchor="end" font-weight="400">10,000</text>
+<line class="grid" x1="76" x2="384" y1="184.0" y2="184.0"/>
+<text x="70.0" y="188.0" class="muted" font-size="11" text-anchor="end" font-weight="400">20,000</text>
+<line class="grid" x1="76" x2="384" y1="147.0" y2="147.0"/>
+<text x="70.0" y="151.0" class="muted" font-size="11" text-anchor="end" font-weight="400">30,000</text>
+<line class="grid" x1="76" x2="384" y1="110.0" y2="110.0"/>
+<text x="70.0" y="114.0" class="muted" font-size="11" text-anchor="end" font-weight="400">40,000</text>
+<line class="axis" x1="76" x2="384" y1="258" y2="258"/>
+<text x="88.0" y="274.0" class="muted" font-size="11" text-anchor="middle" font-weight="400">00:08</text>
+<text x="159.0" y="274.0" class="muted" font-size="11" text-anchor="middle" font-weight="400">00:09</text>
+<text x="230.0" y="274.0" class="muted" font-size="11" text-anchor="middle" font-weight="400">00:10</text>
+<text x="301.0" y="274.0" class="muted" font-size="11" text-anchor="middle" font-weight="400">00:11</text>
+<text x="372.0" y="274.0" class="muted" font-size="11" text-anchor="middle" font-weight="400">00:12</text>
+<polyline class="s1l" points="88.0,242.8 159.0,171.4 230.0,150.2 301.0,201.1 372.0,256.7" fill="none" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<circle class="s1 ring" cx="88.0" cy="242.8" r="4"><title>00:08 リクエスト数: 4,105.0</title></circle>
+<circle class="s1 ring" cx="159.0" cy="171.4" r="4"><title>00:09 リクエスト数: 23,402.0</title></circle>
+<circle class="s1 ring" cx="230.0" cy="150.2" r="4"><title>00:10 リクエスト数: 29,139.0</title></circle>
+<circle class="s1 ring" cx="301.0" cy="201.1" r="4"><title>00:11 リクエスト数: 15,371.0</title></circle>
+<circle class="s1 ring" cx="372.0" cy="256.7" r="4"><title>00:12 リクエスト数: 351.0</title></circle>
+<text x="230.0" y="141.2" class="t1" font-size="11" text-anchor="middle" font-weight="600">29,139</text>
+<text x="436.0" y="90.0" class="t1" font-size="13" text-anchor="start" font-weight="600">Lambda 同時実行数（1 分間の最大）</text>
+<line class="grid" x1="488" x2="796" y1="258.0" y2="258.0"/>
+<text x="482.0" y="262.0" class="muted" font-size="11" text-anchor="end" font-weight="400">0</text>
+<line class="grid" x1="488" x2="796" y1="228.4" y2="228.4"/>
+<text x="482.0" y="232.4" class="muted" font-size="11" text-anchor="end" font-weight="400">10</text>
+<line class="grid" x1="488" x2="796" y1="198.8" y2="198.8"/>
+<text x="482.0" y="202.8" class="muted" font-size="11" text-anchor="end" font-weight="400">20</text>
+<line class="grid" x1="488" x2="796" y1="169.2" y2="169.2"/>
+<text x="482.0" y="173.2" class="muted" font-size="11" text-anchor="end" font-weight="400">30</text>
+<line class="grid" x1="488" x2="796" y1="139.6" y2="139.6"/>
+<text x="482.0" y="143.6" class="muted" font-size="11" text-anchor="end" font-weight="400">40</text>
+<line class="grid" x1="488" x2="796" y1="110.0" y2="110.0"/>
+<text x="482.0" y="114.0" class="muted" font-size="11" text-anchor="end" font-weight="400">50</text>
+<line class="axis" x1="488" x2="796" y1="258" y2="258"/>
+<text x="500.0" y="274.0" class="muted" font-size="11" text-anchor="middle" font-weight="400">00:08</text>
+<text x="571.0" y="274.0" class="muted" font-size="11" text-anchor="middle" font-weight="400">00:09</text>
+<text x="642.0" y="274.0" class="muted" font-size="11" text-anchor="middle" font-weight="400">00:10</text>
+<text x="713.0" y="274.0" class="muted" font-size="11" text-anchor="middle" font-weight="400">00:11</text>
+<text x="784.0" y="274.0" class="muted" font-size="11" text-anchor="middle" font-weight="400">00:12</text>
+<polyline class="s1l" points="500.0,181.0 571.0,133.7 642.0,118.9 713.0,151.4 784.0,237.3" fill="none" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<circle class="s1 ring" cx="500.0" cy="181.0" r="4"><title>00:08 同時実行数: 26.0</title></circle>
+<circle class="s1 ring" cx="571.0" cy="133.7" r="4"><title>00:09 同時実行数: 42.0</title></circle>
+<circle class="s1 ring" cx="642.0" cy="118.9" r="4"><title>00:10 同時実行数: 47.0</title></circle>
+<circle class="s1 ring" cx="713.0" cy="151.4" r="4"><title>00:11 同時実行数: 36.0</title></circle>
+<circle class="s1 ring" cx="784.0" cy="237.3" r="4"><title>00:12 同時実行数: 7.0</title></circle>
+<text x="642.0" y="109.9" class="t1" font-size="11" text-anchor="middle" font-weight="600">47</text>
+<text x="24.0" y="318.0" class="t1" font-size="13" text-anchor="start" font-weight="600">API の応答時間 p95（ms）</text>
+<line class="grid" x1="76" x2="384" y1="486.0" y2="486.0"/>
+<text x="70.0" y="490.0" class="muted" font-size="11" text-anchor="end" font-weight="400">0</text>
+<line class="grid" x1="76" x2="384" y1="456.4" y2="456.4"/>
+<text x="70.0" y="460.4" class="muted" font-size="11" text-anchor="end" font-weight="400">25</text>
+<line class="grid" x1="76" x2="384" y1="426.8" y2="426.8"/>
+<text x="70.0" y="430.8" class="muted" font-size="11" text-anchor="end" font-weight="400">50</text>
+<line class="grid" x1="76" x2="384" y1="397.2" y2="397.2"/>
+<text x="70.0" y="401.2" class="muted" font-size="11" text-anchor="end" font-weight="400">75</text>
+<line class="grid" x1="76" x2="384" y1="367.6" y2="367.6"/>
+<text x="70.0" y="371.6" class="muted" font-size="11" text-anchor="end" font-weight="400">100</text>
+<line class="grid" x1="76" x2="384" y1="338.0" y2="338.0"/>
+<text x="70.0" y="342.0" class="muted" font-size="11" text-anchor="end" font-weight="400">125</text>
+<line class="axis" x1="76" x2="384" y1="486" y2="486"/>
+<text x="88.0" y="502.0" class="muted" font-size="11" text-anchor="middle" font-weight="400">00:08</text>
+<text x="159.0" y="502.0" class="muted" font-size="11" text-anchor="middle" font-weight="400">00:09</text>
+<text x="230.0" y="502.0" class="muted" font-size="11" text-anchor="middle" font-weight="400">00:10</text>
+<text x="301.0" y="502.0" class="muted" font-size="11" text-anchor="middle" font-weight="400">00:11</text>
+<text x="372.0" y="502.0" class="muted" font-size="11" text-anchor="middle" font-weight="400">00:12</text>
+<polyline class="s1l" points="88.0,349.6 159.0,350.9 230.0,350.8 301.0,355.7 372.0,374.2" fill="none" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<circle class="s1 ring" cx="88.0" cy="349.6" r="4"><title>00:08 p95: 115.2</title></circle>
+<circle class="s1 ring" cx="159.0" cy="350.9" r="4"><title>00:09 p95: 114.1</title></circle>
+<circle class="s1 ring" cx="230.0" cy="350.8" r="4"><title>00:10 p95: 114.2</title></circle>
+<circle class="s1 ring" cx="301.0" cy="355.7" r="4"><title>00:11 p95: 110.1</title></circle>
+<circle class="s1 ring" cx="372.0" cy="374.2" r="4"><title>00:12 p95: 94.4</title></circle>
+<text x="88.0" y="340.6" class="t1" font-size="11" text-anchor="middle" font-weight="600">115</text>
+<text x="436.0" y="318.0" class="t1" font-size="13" text-anchor="start" font-weight="600">マッチ成立までの待ち時間（秒）</text>
+<line class="grid" x1="488" x2="796" y1="486.0" y2="486.0"/>
+<text x="482.0" y="490.0" class="muted" font-size="11" text-anchor="end" font-weight="400">0</text>
+<line class="grid" x1="488" x2="796" y1="436.7" y2="436.7"/>
+<text x="482.0" y="440.7" class="muted" font-size="11" text-anchor="end" font-weight="400">20</text>
+<line class="grid" x1="488" x2="796" y1="387.3" y2="387.3"/>
+<text x="482.0" y="391.3" class="muted" font-size="11" text-anchor="end" font-weight="400">40</text>
+<line class="grid" x1="488" x2="796" y1="338.0" y2="338.0"/>
+<text x="482.0" y="342.0" class="muted" font-size="11" text-anchor="end" font-weight="400">60</text>
+<line class="axis" x1="488" x2="796" y1="486" y2="486"/>
+<text x="500.0" y="502.0" class="muted" font-size="11" text-anchor="middle" font-weight="400">00:08</text>
+<text x="571.0" y="502.0" class="muted" font-size="11" text-anchor="middle" font-weight="400">00:09</text>
+<text x="642.0" y="502.0" class="muted" font-size="11" text-anchor="middle" font-weight="400">00:10</text>
+<text x="713.0" y="502.0" class="muted" font-size="11" text-anchor="middle" font-weight="400">00:11</text>
+<text x="784.0" y="502.0" class="muted" font-size="11" text-anchor="middle" font-weight="400">00:12</text>
+<line class="s1l" x1="686" x2="700" y1="314" y2="314" stroke-width="2" stroke-linecap="round"/>
+<text x="704.0" y="318.0" class="t2" font-size="11" text-anchor="start" font-weight="400">p50</text>
+<line class="s2l" x1="742" x2="756" y1="314" y2="314" stroke-width="2" stroke-linecap="round"/>
+<text x="760.0" y="318.0" class="t2" font-size="11" text-anchor="start" font-weight="400">p95</text>
+<polyline class="s1l" points="500.0,480.5 571.0,466.7 642.0,450.9 713.0,464.9 784.0,480.7" fill="none" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<circle class="s1 ring" cx="500.0" cy="480.5" r="4"><title>00:08 p50: 2.2</title></circle>
+<circle class="s1 ring" cx="571.0" cy="466.7" r="4"><title>00:09 p50: 7.8</title></circle>
+<circle class="s1 ring" cx="642.0" cy="450.9" r="4"><title>00:10 p50: 14.2</title></circle>
+<circle class="s1 ring" cx="713.0" cy="464.9" r="4"><title>00:11 p50: 8.6</title></circle>
+<circle class="s1 ring" cx="784.0" cy="480.7" r="4"><title>00:12 p50: 2.1</title></circle>
+<text x="642.0" y="441.9" class="t1" font-size="11" text-anchor="middle" font-weight="600">14</text>
+<polyline class="s2l" points="500.0,465.2 571.0,416.8 642.0,367.0 713.0,377.0 784.0,480.6" fill="none" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<circle class="s2 ring" cx="500.0" cy="465.2" r="4"><title>00:08 p95: 8.4</title></circle>
+<circle class="s2 ring" cx="571.0" cy="416.8" r="4"><title>00:09 p95: 28.0</title></circle>
+<circle class="s2 ring" cx="642.0" cy="367.0" r="4"><title>00:10 p95: 48.2</title></circle>
+<circle class="s2 ring" cx="713.0" cy="377.0" r="4"><title>00:11 p95: 44.2</title></circle>
+<circle class="s2 ring" cx="784.0" cy="480.6" r="4"><title>00:12 p95: 2.2</title></circle>
+<text x="642.0" y="358.0" class="t1" font-size="11" text-anchor="middle" font-weight="600">48</text>
+<text x="24.0" y="524.0" class="muted" font-size="11" text-anchor="start" font-weight="400">出典: CloudWatch（1 分粒度）。待ち時間は 4 人で成立したセッションの MatchWaitTime。</text>
+</svg>
