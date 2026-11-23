@@ -186,7 +186,7 @@ go test -tags integration ./internal/db/...
 
 > 費用がかかります。GameLift フリートは置いているだけで時間課金されるので、検証が終わったら必ず消してください。
 
-1. **デプロイ用の IAM ユーザーを作る。** 必要な権限は [`terraform/bootstrap/raidync-cli-deploy-policy.json`](terraform/bootstrap/raidync-cli-deploy-policy.json) にあります。手順は [IAM ユーザーの作成](docs/aws-iam-user-setup.md) を参照してください
+1. **デプロイ用の IAM ユーザーを作る。** 必要な権限は [`terraform/bootstrap/raidync-cli-deploy-policy.json`](terraform/bootstrap/raidync-cli-deploy-policy.json) にあります。中の `<ACCOUNT_ID>` を自分の AWS アカウント ID に置き換えてから、IAM のポリシーとして作成してください。手順は [IAM ユーザーの作成](docs/aws-iam-user-setup.md) を参照してください
 2. **Lambda をビルドする**（arm64 の `bootstrap` を `build/lambda/` に出力）
 
    ```bash

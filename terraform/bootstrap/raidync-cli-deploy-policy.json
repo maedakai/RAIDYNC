@@ -36,8 +36,8 @@
       "Effect": "Allow",
       "Action": "s3:*",
       "Resource": [
-        "arn:aws:s3:::raidync-dev-gamelift-build-444952542001-*",
-        "arn:aws:s3:::raidync-dev-gamelift-build-444952542001-*/*"
+        "arn:aws:s3:::raidync-dev-gamelift-build-<ACCOUNT_ID>-*",
+        "arn:aws:s3:::raidync-dev-gamelift-build-<ACCOUNT_ID>-*/*"
       ]
     },
     {
@@ -60,7 +60,7 @@
         "iam:ListAttachedRolePolicies",
         "iam:ListInstanceProfilesForRole"
       ],
-      "Resource": "arn:aws:iam::444952542001:role/raidync-dev-*"
+      "Resource": "arn:aws:iam::<ACCOUNT_ID>:role/raidync-dev-*"
     },
     {
       "Sid": "Route53ForLatencyRouting",
@@ -109,9 +109,9 @@
       "Effect": "Allow",
       "Action": "iam:CreateServiceLinkedRole",
       "Resource": [
-        "arn:aws:iam::444952542001:role/aws-service-role/replication.dynamodb.amazonaws.com/AWSServiceRoleForDynamoDBReplication",
-        "arn:aws:iam::444952542001:role/aws-service-role/ops.apigateway.amazonaws.com/AWSServiceRoleForAPIGateway",
-        "arn:aws:iam::444952542001:role/aws-service-role/application-signals.cloudwatch.amazonaws.com/AWSServiceRoleForCloudWatchApplicationSignals"
+        "arn:aws:iam::<ACCOUNT_ID>:role/aws-service-role/replication.dynamodb.amazonaws.com/AWSServiceRoleForDynamoDBReplication",
+        "arn:aws:iam::<ACCOUNT_ID>:role/aws-service-role/ops.apigateway.amazonaws.com/AWSServiceRoleForAPIGateway",
+        "arn:aws:iam::<ACCOUNT_ID>:role/aws-service-role/application-signals.cloudwatch.amazonaws.com/AWSServiceRoleForCloudWatchApplicationSignals"
       ],
       "Condition": {
         "StringEquals": {
@@ -138,7 +138,7 @@
         "iam:UntagPolicy",
         "iam:ListPolicyTags"
       ],
-      "Resource": "arn:aws:iam::444952542001:policy/raidync-dev-*"
+      "Resource": "arn:aws:iam::<ACCOUNT_ID>:policy/raidync-dev-*"
     },
     {
       "Sid": "TransactionSearchApplicationSignals",
@@ -150,13 +150,13 @@
       "Sid": "TransactionSearchApplicationSignalsServiceLinkedRole",
       "Effect": "Allow",
       "Action": "iam:GetRole",
-      "Resource": "arn:aws:iam::444952542001:role/aws-service-role/application-signals.cloudwatch.amazonaws.com/AWSServiceRoleForCloudWatchApplicationSignals"
+      "Resource": "arn:aws:iam::<ACCOUNT_ID>:role/aws-service-role/application-signals.cloudwatch.amazonaws.com/AWSServiceRoleForCloudWatchApplicationSignals"
     },
     {
       "Sid": "TransactionSearchCloudTrailChannel",
       "Effect": "Allow",
       "Action": "cloudtrail:CreateServiceLinkedChannel",
-      "Resource": "arn:aws:cloudtrail:*:444952542001:channel/aws-service-channel/application-signals/*"
+      "Resource": "arn:aws:cloudtrail:*:<ACCOUNT_ID>:channel/aws-service-channel/application-signals/*"
     },
     {
       "Sid": "SelfInspectionForTroubleshooting",
@@ -171,8 +171,8 @@
         "iam:SimulatePrincipalPolicy"
       ],
       "Resource": [
-        "arn:aws:iam::444952542001:user/raidync-cli",
-        "arn:aws:iam::444952542001:policy/raidync-cli-deploy"
+        "arn:aws:iam::<ACCOUNT_ID>:user/raidync-cli",
+        "arn:aws:iam::<ACCOUNT_ID>:policy/raidync-cli-deploy"
       ]
     },
     {

@@ -163,7 +163,7 @@ docker compose -f docker/docker-compose.yml down
 > GameLift Managed EC2 フリートは **ACTIVE な間ずっとインスタンス時間課金**される唯一のリソース（プレイヤー 0 でも課金）。
 > E2E が終わったら**必ず**削除すること。他リソース（DynamoDB/Lambda/API GW/Cognito/S3）は実質従量課金なので、最優先で止めるべきはフリート。
 >
-> リージョンは `ap-northeast-1`、対象は `raidync-dev-fleet`（S3 バケットは `raidync-dev-gamelift-build-444952542001`）。
+> リージョンは `ap-northeast-1`、対象は `raidync-dev-fleet`（S3 バケットは `raidync-dev-gamelift-build-<ACCOUNT_ID>`）。
 
 ## 方法A：Terraform で環境ごと destroy（推奨）
 
@@ -190,7 +190,7 @@ Terraform を使わず GUI で今回のフリートを手動削除する場合�
 4. 確認ダイアログでフリート名を入力 → **Delete**。ステータスが **DELETING** に変わる。
 5. 数分待ち、一覧から消える（＝インスタンス終了・課金停止）まで確認する。
 6. （任意）**Builds** から `raidync-dev-gameserver` も削除。
-7. **S3** コンソール → `raidync-dev-gamelift-build-444952542001` を空にして削除（Build zip が残っていると微少だが課金対象）。
+7. **S3** コンソール → `raidync-dev-gamelift-build-<ACCOUNT_ID>` を空にして削除（Build zip が残っていると微少だが課金対象）。
 
 > GUI でフリートだけ消すと Terraform state には「まだ在る」と記録が残る。次に方法Aを使うときは `terraform destroy` が「既に無い」を検知して整合するが、混乱を避けるため**GUI 削除後は state を捨てる（未 apply からやり直す）か、`terraform refresh` で同期する**こと。
 
@@ -207,7 +207,7 @@ aws gamelift describe-fleet-attributes --region ap-northeast-1 `
 aws gamelift delete-fleet --fleet-id <上で得た FleetId> --region ap-northeast-1
 
 # 3. Build 配布バケットを中身ごと削除
-aws s3 rb s3://raidync-dev-gamelift-build-444952542001 --force
+aws s3 rb s3://raidync-dev-gamelift-build-<ACCOUNT_ID> --force
 ```
 
 ## 削除後の独立検証（必須）
