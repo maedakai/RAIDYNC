@@ -9,16 +9,18 @@
 # 作成後にパスワードの設定で止まり、仮のパスワード（FORCE_CHANGE_PASSWORD）のまま残った人も次の実行で直る。
 #
 # 使い方:
+#   export COGNITO_USER_POOL_ID=$(terraform -chdir=terraform/environments/dev output -raw cognito_user_pool_id)
+#   export LOAD_TEST_PASSWORD='<プールのポリシーを満たすパスワード>'   # リポジトリには書かない
 #   ./scripts/create-load-test-users.sh [人数]   # 省略時は 4 人。k6 の VUS 以上にする
 #
-# ⚠ PREFIX・PASSWORD は load-test-large.js と同じ値にすること。消すときは
+# ⚠ PREFIX は load-test-large.js と同じ値、LOAD_TEST_PASSWORD は k6 に渡す値と同じにすること。消すときは
 #   scripts/cleanup-load-test-users.sh を使う（同じ PREFIX の前方一致で選ぶ）。
 set -euo pipefail
 
-POOL_ID='ap-northeast-1_u6Y87N8S1'
+POOL_ID="${COGNITO_USER_POOL_ID:?COGNITO_USER_POOL_ID を設定してください（terraform output -raw cognito_user_pool_id）}"
 # Cognito の --filter は完全一致（=）と前方一致（^=）だけなので、固定の文字列はメールの先頭に置く。
 PREFIX='k6run+'
-PASSWORD='LoadTest#2026'
+PASSWORD="${LOAD_TEST_PASSWORD:?LOAD_TEST_PASSWORD を設定してください}"
 COUNT="${1:-4}"
 
 for ((i=0; i<$COUNT; i++)); do
