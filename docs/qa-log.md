@@ -301,6 +301,7 @@ A. 状態の食い違いは大半が**エラーにならない**よう設計さ�
 - **500（ユーザー非起因）**: GameLift／DynamoDB の失敗（フリート容量不足、IP 未確定など）
 
 **注意点**: `ClaimTickets` 成功後に `finalize` が失敗すると補償処理が無く、グループ全員のチケットが **MATCHING のまま残る**。以降のポーリングはパススルーで MATCHING を返し続け、TTL 削除後は 404 になる。GameLift 側にセッションが作られていれば孤児になる。
+> **Phase 6 で解消。** MATCHED への更新が失敗したら `MarkFailed` で FAILED にしてセッションを終了させ、MATCHING のまま 40 秒経ったチケットは次のポーリングが `rescue` で救済する。衝突は `transactWithRetry` で送り直す。詳細は [ADR-0001](adr/0001-optimistic-lock-matchmaking.md)。
 
 ### Q. グループ候補の一人が既に MATCHED だったらどうなる?
 A. 「チケット」が MATCHED か「プレイヤー」が MATCHED かで結果が違う。
