@@ -157,7 +157,7 @@ $env:OTEL_EXPORTER_OTLP_INSECURE = "true"
 既定ではソロで即マッチし、UDP で移動を 10 回送ってから送信をやめます。約 10 秒後にゲームサーバーがセッションの終了を報告し、履歴に記録されます。最後に次の行が出れば成功です。
 
 ```
-client: history found session=... quest=quest-rathalos result=ABANDONED duration=11s
+client: history found session=... quest=quest-001 result=ABANDONED duration=11s
 client: E2E completed
 ```
 
