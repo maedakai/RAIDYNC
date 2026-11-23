@@ -3236,7 +3236,7 @@ k6 run -q --vus 1 --iterations 1 --no-thresholds tests/load/load-test-large.js
 **本番の正しさに関わる 3 つだけ直し、ほかは手を加えない（2026-11-20）。**
 
 - **直す**: ゲームサーバーが `/session/end` を呼ばない（Sessions が ACTIVE のまま溜まり MatchHistory も書かれない）／マッチ確定が FAILED になったとき、先に作ったゲームセッションと Sessions レコードが残る／Lambda が `ClaimTickets` の後に止まると、チケットが MATCHING のまま残る
-- **ポートフォリオで補う**: GSI のホットキー、一斉接続（バースト）、GameLift の UDP 負荷。`docs/load-test-results.md` §7 に既知の限界・未検証として書いてある
+- **ポートフォリオで補う**: GSI のホットキー、一斉接続（バースト）、GameLift の UDP 負荷。`docs/load-test-results.md` §8 に既知の限界・未検証として書いてある
 - **スキップ**: GameLift のセカンダリ（us-east-1）での実機 E2E。フリートの起動に費用がかかり、同じ構成を ap-northeast-1 で確認済みのため
 - **手を加えない**: 確保の競合と finalize の直列書き込み（1,000 VU で問題なし）、`internal/handlers` のテスト、`build-lambdas.sh` の全再作成、IAM の index 権限の付けすぎ、`gofmt` の残り 1 件
 
@@ -3362,4 +3362,4 @@ k6 run -q --vus 1 --iterations 1 --no-thresholds tests/load/load-test-large.js
 **費用がかかるため見送った（2026-11-23）。**
 
 - GameLift フリートはこのプロジェクトで唯一の時間課金リソースで、スケーリングを確かめるには、負荷をかけたまま複数台を起動し続ける必要がある
-- スケーリングの設定（spec の最小 1・最大 20）は Terraform に入れていない。k6 の負荷テストは Lambda のスタブで行っていて、GameLift の UDP 側の負荷は測っていない（`docs/load-test-results.md` §7 の既知の限界）
+- スケーリングの設定（spec の最小 1・最大 20）は Terraform に入れていない。k6 の負荷テストは Lambda のスタブで行っていて、GameLift の UDP 側の負荷は測っていない（`docs/load-test-results.md` §8 の既知の限界）
