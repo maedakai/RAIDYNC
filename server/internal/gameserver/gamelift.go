@@ -154,7 +154,7 @@ func (b *GameLiftBridge) onHealthCheck() bool { return true }
 // 取り出す純関数。SDK の型に依存するが副作用がないのでユニットテスト可能。
 //
 // GameProperties の想定:
-//   - questId       : "quest-rathalos"
+//   - questId       : "quest-001"
 //   - playerIds     : "p1,p2,p3,p4"（カンマ区切り。roster=参加許可 playerId）
 //   - playerSessions : "p1=psess-1,p2=psess-2"（任意。Accept/RemovePlayerSession 用の
 //     playerId→playerSessionId。実 PlayerSession 発行(G2)まではローカルで空になり得る）

@@ -95,7 +95,7 @@ cd C:\work\RAIDYNC
 | フラグ | 既定 | 説明 |
 |---|---|---|
 | `-email` / `-password` | `player1@example.com` / `password123` | ログイン資格情報 |
-| `-quest` | `quest-rathalos` | マッチ対象クエスト |
+| `-quest` | `quest-001` | マッチ対象クエスト |
 | `-solo` | `true` | 単独で即マッチ成立させる |
 | `-moves` | `10` | 送る PLAYER_MOVE 数 |
 
@@ -111,7 +111,7 @@ client: <- SESSION_STATE seq=1 players=1 self.health=100
 client: play done sent=10 moves +1 action, received=N SESSION_STATE
 client: waiting for session end report…
 ...（送信をやめてから約 10 秒）
-client: history found session=... quest=quest-rathalos result=ABANDONED duration=11s
+client: history found session=... quest=quest-001 result=ABANDONED duration=11s
 client: E2E completed
 ```
 

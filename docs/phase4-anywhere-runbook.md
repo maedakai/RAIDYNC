@@ -168,7 +168,7 @@ GameLift mode: ready, waiting for game sessions      ← ProcessReady 成功
 cd C:\work\RAIDYNC
 @'
 [
-  {"Key":"questId","Value":"quest-rathalos"},
+  {"Key":"questId","Value":"quest-001"},
   {"Key":"playerIds","Value":"p1,p2"}
 ]
 '@ | Set-Content -Encoding ascii .\bin\gameprops.json
@@ -188,7 +188,7 @@ aws gamelift create-game-session `
 ターミナルA（gameserver）に以下が出れば **OnStartGameSession が発火・roster 登録成功**（末尾 `psids=0` は手動配置で psid 対応表が空のため。後述スコープ参照）:
 
 ```
-game session started: <gameSessionId> (quest=quest-rathalos roster=[p1 p2] psids=0)
+game session started: <gameSessionId> (quest=quest-001 roster=[p1 p2] psids=0)
 ```
 
 これで **「マッチ成立 → GameLift がセッション配置 → サーバの OnStartGameSession」** の本物の経路が通ったことになる（配置指示だけ手動）。

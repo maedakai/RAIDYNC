@@ -92,7 +92,7 @@ func parseFlags() config {
 	flag.StringVar(&cfg.email, "email", "player1@example.com", "login email")
 	flag.StringVar(&cfg.password, "password", "password123", "login password")
 	flag.StringVar(&cfg.token, "token", "", "事前取得済み JWT を直接使う（設定時は mock-auth を迂回）。AWS dev E2E で実 Cognito の id_token を渡す用")
-	flag.StringVar(&cfg.questID, "quest", "quest-rathalos", "quest id to matchmake for")
+	flag.StringVar(&cfg.questID, "quest", "quest-001", "quest id to matchmake for")
 	flag.BoolVar(&cfg.soloAllowed, "solo", true, "allow immediate solo match (single-client E2E)")
 	flag.IntVar(&cfg.moves, "moves", 10, "number of PLAYER_MOVE packets to send during play")
 	flag.Parse()
