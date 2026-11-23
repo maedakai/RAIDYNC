@@ -7,6 +7,7 @@
 # 対象はメールアドレスが PREFIX で始まるユーザーだけで、一覧を表示して確認してから消す。
 #
 # 使い方:
+#   export COGNITO_USER_POOL_ID=$(terraform -chdir=terraform/environments/dev output -raw cognito_user_pool_id)
 #   ./scripts/cleanup-load-test-users.sh
 #
 # ⚠ PREFIX は load-test-large.js の PREFIX と同じ値にすること。食い違うと k6 のユーザーが
@@ -16,7 +17,7 @@
 #   合わず admin-delete-user が失敗するため、受け取る側で tr -d '\r' で消している。
 set -euo pipefail
 
-POOL_ID='ap-northeast-1_u6Y87N8S1'
+POOL_ID="${COGNITO_USER_POOL_ID:?COGNITO_USER_POOL_ID を設定してください（terraform output -raw cognito_user_pool_id）}"
 # Cognito の --filter は完全一致（=）と前方一致（^=）だけなので、固定の文字列はメールの先頭に置く。
 PREFIX='k6run+'
 # 一覧を取得
